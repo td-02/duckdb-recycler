@@ -8,7 +8,7 @@
 #
 # Needs data/imdb.duckdb: python3 ./scripts/download-imdb.py
 
-require waddle
+require recycler
 
 # The IMDB database is 2.7GB, downloaded locally and never committed, so it
 # does not exist in CI. Without this guard the test fails there and the build
