@@ -8,3 +8,12 @@ test/python/__pycache__/
 .Rhistory
 /data
 __pycache__/
+
+# Build artifacts
+*.duckdb
+*.duckdb.wal
+recycler_ext.tar.gz
+.cache/
+
+# Claude session outputs
+Claude outputs/
