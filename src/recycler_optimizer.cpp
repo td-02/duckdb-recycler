@@ -136,17 +136,11 @@ static void WalkAndRecycle(unique_ptr<LogicalOperator> &op,
         // Fresh table index for the replacement scan.
         idx_t new_idx = optimizer.binder.GenerateTableIndex();
 
-        // Identity column-id mapping (0 … n-1).
-        vector<column_t> col_ids;
-        col_ids.reserve(col_types.size());
-        for (idx_t i = 0; i < col_types.size(); i++) { col_ids.push_back(i); }
-
         // Wrap shared_ptr<ColumnDataCollection> in an optionally_owned_ptr
         // (no copy; the cache keeps the data alive via the shared_ptr).
         auto new_op = make_uniq<LogicalColumnDataGet>(
             new_idx, col_types,
             optionally_owned_ptr<ColumnDataCollection>(cached->collection));
-        new_op->SetColumnIds(col_ids);
         new_op->ResolveOperatorTypes();
 
         // Register old→new binding rewrites for the post-walk pass.
