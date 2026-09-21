@@ -35,7 +35,7 @@ static void CollectTableNames(const LogicalOperator &op,
     if (op.type == LogicalOperatorType::LOGICAL_GET) {
         auto &get = op.Cast<LogicalGet>();
         string name = get.GetName();
-        table_map[get.table_index] = name;
+        table_map[get.table_index.index] = name;
     }
     for (auto &child : op.children) {
         CollectTableNames(*child, table_map);
@@ -49,23 +49,23 @@ static void CollectJoinConditions(const LogicalOperator &op,
         op.type == LogicalOperatorType::LOGICAL_DELIM_JOIN) {
         auto &join = op.Cast<LogicalComparisonJoin>();
         for (auto &cond : join.conditions) {
-            if (cond.left && cond.right &&
-                cond.left->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
-                cond.right->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+            if (cond.IsComparison() &&
+                cond.GetLHS().GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
+                cond.GetRHS().GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
 
-                auto &lref = cond.left->Cast<BoundColumnRefExpression>();
-                auto &rref = cond.right->Cast<BoundColumnRefExpression>();
+                auto &lref = cond.GetLHS().Cast<BoundColumnRefExpression>();
+                auto &rref = cond.GetRHS().Cast<BoundColumnRefExpression>();
 
-                auto lit = table_map.find(lref.binding.table_index);
-                auto rit = table_map.find(rref.binding.table_index);
+                auto lit = table_map.find(lref.Binding().table_index.index);
+                auto rit = table_map.find(rref.Binding().table_index.index);
 
                 string ltable = (lit != table_map.end()) ? lit->second
-                                                          : "t" + to_string(lref.binding.table_index);
+                                                          : "t" + to_string(lref.Binding().table_index.index);
                 string rtable = (rit != table_map.end()) ? rit->second
-                                                          : "t" + to_string(rref.binding.table_index);
+                                                          : "t" + to_string(rref.Binding().table_index.index);
 
-                string lcol = ltable + "." + to_string(lref.binding.column_index);
-                string rcol = rtable + "." + to_string(rref.binding.column_index);
+                string lcol = ltable + "." + to_string(lref.Binding().column_index.GetIndex());
+                string rcol = rtable + "." + to_string(rref.Binding().column_index.GetIndex());
 
                 if (lcol > rcol) { swap(lcol, rcol); }
                 conditions.insert(lcol + "=" + rcol);
@@ -134,7 +134,7 @@ static void WalkAndRecycle(unique_ptr<LogicalOperator> &op,
         auto col_types    = op->types;
 
         // Fresh table index for the replacement scan.
-        idx_t new_idx = optimizer.binder.GenerateTableIndex();
+        TableIndex new_idx = optimizer.binder.GenerateTableIndex();
 
         // Wrap shared_ptr<ColumnDataCollection> in an optionally_owned_ptr
         // (no copy; the cache keeps the data alive via the shared_ptr).
@@ -145,11 +145,7 @@ static void WalkAndRecycle(unique_ptr<LogicalOperator> &op,
 
         // Register old→new binding rewrites for the post-walk pass.
         auto new_bindings = new_op->GetColumnBindings();
-        // Register old→new binding rewrites.
-        D_ASSERT(old_bindings.size() == new_bindings.size());
-        for (idx_t i = 0; i < old_bindings.size(); i++) {
-            replacer.replacement_bindings.emplace_back(old_bindings[i], new_bindings[i]);
-        }
+        replacer.AddReplacements(old_bindings, new_bindings);
 
         op = std::move(new_op);
         // ───────────────────────────────────────────────────────────────────

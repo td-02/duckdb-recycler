@@ -23,7 +23,7 @@ vector<ColumnBinding> LogicalCacheWrite::GetColumnBindings() {
     return children[0]->GetColumnBindings();
 }
 
-vector<idx_t> LogicalCacheWrite::GetTableIndex() const {
+vector<TableIndex> LogicalCacheWrite::GetTableIndex() const {
     D_ASSERT(!children.empty());
     return children[0]->GetTableIndex();
 }

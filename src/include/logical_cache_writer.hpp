@@ -29,7 +29,7 @@ public:
 
     // Transparent forwarding to the child join ----------------------------------------
     vector<ColumnBinding> GetColumnBindings() override;
-    vector<idx_t>         GetTableIndex() const override;
+    vector<TableIndex>    GetTableIndex() const override;
     string GetName() const override;
 
 protected:
