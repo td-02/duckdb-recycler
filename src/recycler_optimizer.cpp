@@ -57,14 +57,18 @@ static void WalkAndRecycle(unique_ptr<LogicalOperator> &op,
         auto old_bindings = op->GetColumnBindings();
         auto col_types    = op->types;
 
-        TableIndex new_idx = optimizer.binder.GenerateTableIndex();
+        idx_t new_idx = optimizer.binder.GenerateTableIndex();
         // optionally_owned_ptr: non-owning reference is safe because
         // the cache holds the shared_ptr keeping the collection alive.
         auto new_op = make_uniq<LogicalColumnDataGet>(
             new_idx, col_types,
             optionally_owned_ptr<ColumnDataCollection>(cached->collection));
         new_op->ResolveOperatorTypes();
-        replacer.AddReplacements(old_bindings, new_op->GetColumnBindings());
+        auto new_bindings = new_op->GetColumnBindings();
+        D_ASSERT(old_bindings.size() == new_bindings.size());
+        for (idx_t i = 0; i < old_bindings.size(); i++) {
+            replacer.replacement_bindings.emplace_back(old_bindings[i], new_bindings[i]);
+        }
         op = std::move(new_op);
         return;
     }
