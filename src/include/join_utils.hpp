@@ -15,7 +15,7 @@
 
 namespace duckdb {
 
-// key type: idx_t matching get.table_index.index and binding.table_index.index
+// key type: idx_t matching get.table_index and binding.table_index
 using TableMap = std::unordered_map<idx_t, string>;
 
 //! True for join operator types we recognise (matches original IsJoinNode).
@@ -25,12 +25,12 @@ inline bool IsJoinNode(LogicalOperatorType type) {
            type == LogicalOperatorType::LOGICAL_ANY_JOIN;
 }
 
-//! Walk subtree, populate table_map with { table_index.index → name }.
+//! Walk subtree, populate table_map with { table_index → name }.
 void CollectTableNames(const LogicalOperator &op, TableMap &table_map);
 
 //! Walk subtree, append canonical "tbl.col_idx=tbl.col_idx" strings.
 //! Falls back to "t<idx>" for bindings not found in table_map.
-//! Guards on cond.IsComparison() and BOUND_COLUMN_REF on both sides.
+//! Guards on cond.comparison being a comparison type and BOUND_COLUMN_REF on both sides.
 void CollectJoinConditions(const LogicalOperator &op,
                            const TableMap &table_map,
                            std::set<string> &conditions);
