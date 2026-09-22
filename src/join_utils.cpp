@@ -5,6 +5,8 @@
 //==-------------------------------------------------------------------==//
 #include "join_utils.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/table_filter.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 
 #include <algorithm>
 #include <sstream>
@@ -15,8 +17,13 @@ namespace duckdb {
 void CollectTableNames(const LogicalOperator &op, TableMap &table_map) {
     if (op.type == LogicalOperatorType::LOGICAL_GET) {
         const auto &get = op.Cast<LogicalGet>();
-        // table_index is a plain idx_t (v1.5.5 API), matching original line 38.
-        table_map[get.table_index] = get.GetName();
+        // get.GetName() returns the *scan function* name (e.g. "SEQ_SCAN")
+        // in this DuckDB version, not the table -- every table would
+        // collapse to the same string. GetTable() gives the actual
+        // catalog entry; fall back to "t<idx>" if it's a table function
+        // with no catalog entry (e.g. read_csv).
+        auto table = get.GetTable();
+        table_map[get.table_index] = table ? table->name : "t" + to_string(get.table_index);
     }
     for (const auto &child : op.children) {
         CollectTableNames(*child, table_map);
@@ -78,8 +85,35 @@ void CollectJoinConditions(const LogicalOperator &op,
     }
 }
 
+// ── CollectFilters ─────────────────────────────────────────────────
+// Two joins over the same tables with the same join condition can still
+// scan entirely different rows: a WHERE clause on either side is pushed
+// down into LogicalGet::table_filters (invisible to CollectJoinConditions),
+// or -- if it can't be pushed down -- survives as a LOGICAL_FILTER above
+// the join. Both must be part of the cache key, or a cache hit can return
+// another query's rows.
+static void CollectFilters(const LogicalOperator &op, const TableMap &table_map,
+                           std::set<string> &filters) {
+    if (op.type == LogicalOperatorType::LOGICAL_GET) {
+        const auto &get = op.Cast<LogicalGet>();
+        auto tit = table_map.find(get.table_index);
+        string tname = (tit != table_map.end()) ? tit->second : "t" + to_string(get.table_index);
+        for (const auto &entry : get.table_filters.filters) {
+            string col_label = to_string(entry.first);
+            filters.insert(tname + "#" + col_label + ":" + entry.second->ToString(col_label));
+        }
+    } else if (op.type == LogicalOperatorType::LOGICAL_FILTER) {
+        for (const auto &expr : op.expressions) {
+            filters.insert("filter:" + expr->ToString());
+        }
+    }
+    for (const auto &child : op.children) {
+        CollectFilters(*child, table_map, filters);
+    }
+}
+
 // ── ComputeJoinSkeleton ───────────────────────────────────────────
-string ComputeJoinSkeleton(const LogicalOperator &op,
+string ComputeJoinSkeleton(LogicalOperator &op,
                            ClientContext & /*context*/) {
     TableMap table_map;
     CollectTableNames(op, table_map);
@@ -90,12 +124,29 @@ string ComputeJoinSkeleton(const LogicalOperator &op,
     std::set<string> conditions;
     CollectJoinConditions(op, table_map, conditions);
 
-    // Key format exactly matches original lines 94-99.
+    std::set<string> filters;
+    CollectFilters(op, table_map, filters);
+
+    // Output columns, in order: two joins with identical tables/conditions/
+    // filters can still be asked for a different set (or order) of columns,
+    // and a cache hit substitutes a LogicalColumnDataGet whose columns are
+    // matched to the caller's bindings *positionally* -- so the exact,
+    // ordered column identity has to be part of the key, not just a set.
+    std::ostringstream cols;
+    for (const auto &binding : op.GetColumnBindings()) {
+        auto it = table_map.find(binding.table_index);
+        string tname = (it != table_map.end()) ? it->second : "t" + to_string(binding.table_index);
+        cols << tname << "." << binding.column_index << ",";
+    }
+
     std::ostringstream sig;
     sig << "tables:";
     for (const auto &t : tables)    { sig << t << ","; }
     sig << "|joins:";
     for (const auto &c : conditions){ sig << c << ","; }
+    sig << "|filters:";
+    for (const auto &f : filters)   { sig << f << ","; }
+    sig << "|cols:" << cols.str();
     return sig.str();
 }
 
