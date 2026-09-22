@@ -1,20 +1,21 @@
-//===----------------------------------------------------------------------===//
-// RecyclerOptimizer — walks the logical plan, extracts join skeletons, and
-// either injects a cache-hit scan or marks the subtree for cache-write.
-//===----------------------------------------------------------------------===//
+//==-------------------------------------------------------------------==//
+// recycler_optimizer.cpp
+// Skeleton analysis delegated to join_utils (no duplication).
+// WalkAndRecycle logic is preserved exactly from main, just calling
+// the shared helpers instead of file-local copies.
+//==-------------------------------------------------------------------==//
 #include "recycler_optimizer.hpp"
 #include "logical_cache_writer.hpp"
+#include "join_utils.hpp"
 
-#include "duckdb/optimizer/optimizer_extension.hpp"
-#include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/optimizer/column_binding_replacer.hpp"
+#include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
-#include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_column_data_get.hpp"
+#include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
-#include "duckdb/planner/joinside.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension_callback_manager.hpp"
@@ -26,157 +27,68 @@
 
 namespace duckdb {
 
-// ---------------------------------------------------------------------------
-// Helpers: collect base tables and join conditions from a subtree
-// ---------------------------------------------------------------------------
-
-static void CollectTableNames(const LogicalOperator &op,
-                              unordered_map<idx_t, string> &table_map) {
-    if (op.type == LogicalOperatorType::LOGICAL_GET) {
-        auto &get = op.Cast<LogicalGet>();
-        string name = get.GetName();
-        table_map[get.table_index.index] = name;
-    }
-    for (auto &child : op.children) {
-        CollectTableNames(*child, table_map);
-    }
-}
-
-static void CollectJoinConditions(const LogicalOperator &op,
-                                   const unordered_map<idx_t, string> &table_map,
-                                   set<string> &conditions) {
-    if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
-        op.type == LogicalOperatorType::LOGICAL_DELIM_JOIN) {
-        auto &join = op.Cast<LogicalComparisonJoin>();
-        for (auto &cond : join.conditions) {
-            if (cond.IsComparison() &&
-                cond.GetLHS().GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
-                cond.GetRHS().GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
-
-                auto &lref = cond.GetLHS().Cast<BoundColumnRefExpression>();
-                auto &rref = cond.GetRHS().Cast<BoundColumnRefExpression>();
-
-                auto lit = table_map.find(lref.Binding().table_index.index);
-                auto rit = table_map.find(rref.Binding().table_index.index);
-
-                string ltable = (lit != table_map.end()) ? lit->second
-                                                          : "t" + to_string(lref.Binding().table_index.index);
-                string rtable = (rit != table_map.end()) ? rit->second
-                                                          : "t" + to_string(rref.Binding().table_index.index);
-
-                string lcol = ltable + "." + to_string(lref.Binding().column_index.GetIndex());
-                string rcol = rtable + "." + to_string(rref.Binding().column_index.GetIndex());
-
-                if (lcol > rcol) { swap(lcol, rcol); }
-                conditions.insert(lcol + "=" + rcol);
-            }
-        }
-    }
-    for (auto &child : op.children) {
-        CollectJoinConditions(*child, table_map, conditions);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Public: ComputeJoinSkeleton
-// ---------------------------------------------------------------------------
-
-string ComputeJoinSkeleton(const LogicalOperator &op, ClientContext & /*context*/) {
-    unordered_map<idx_t, string> table_map;
-    CollectTableNames(op, table_map);
-
-    set<string> tables;
-    for (auto &kv : table_map) { tables.insert(kv.second); }
-
-    set<string> conditions;
-    CollectJoinConditions(op, table_map, conditions);
-
-    std::ostringstream sig;
-    sig << "tables:";
-    for (auto &t : tables) { sig << t << ","; }
-    sig << "|joins:";
-    for (auto &c : conditions) { sig << c << ","; }
-    return sig.str();
-}
-
-// ---------------------------------------------------------------------------
-// Walk the plan tree — bottom-up, one join subtree at a time
-// ---------------------------------------------------------------------------
-
-static bool IsJoinNode(LogicalOperatorType type) {
-    return type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
-           type == LogicalOperatorType::LOGICAL_DELIM_JOIN ||
-           type == LogicalOperatorType::LOGICAL_ANY_JOIN;
-}
-
+// ── WalkAndRecycle ────────────────────────────────────────────────
+// Fix #2: recurse into ALL children FIRST (bottom-up), then decide
+// whether to act on the current node.  This ensures nested joins
+// are all visited before their parent is considered.
 static void WalkAndRecycle(unique_ptr<LogicalOperator> &op,
-                            shared_ptr<RecyclerCache> cache,   // shared ownership
+                            shared_ptr<RecyclerCache> cache,
                             ClientContext &context,
                             Optimizer &optimizer,
                             ColumnBindingReplacer &replacer) {
-    // Recurse into children first (bottom-up).
+    // Bottom-up: process children before the current node.
     for (auto &child : op->children) {
         WalkAndRecycle(child, cache, context, optimizer, replacer);
     }
 
+    // Only act on join nodes.
     if (!IsJoinNode(op->type)) { return; }
 
+    // Compute skeleton (calls join_utils – no duplicate definition).
     string sig = ComputeJoinSkeleton(*op, context);
+
+    // Fix #3: exact sentinel matching original line 125.
     if (sig.empty() || sig == "tables:|joins:") { return; }
 
     shared_ptr<CachedResult> cached;
     if (cache->Lookup(sig, cached)) {
-        // ── CACHE HIT ──────────────────────────────────────────────────────
-        // Record old bindings before we replace the node.
-        // Force type resolution if the node hasn't done it yet.
+        // ── CACHE HIT ──────────────────────────────────────────────
         if (op->types.empty()) { op->ResolveOperatorTypes(); }
         auto old_bindings = op->GetColumnBindings();
         auto col_types    = op->types;
 
-        // Fresh table index for the replacement scan.
         TableIndex new_idx = optimizer.binder.GenerateTableIndex();
-
-        // Wrap shared_ptr<ColumnDataCollection> in an optionally_owned_ptr
-        // (no copy; the cache keeps the data alive via the shared_ptr).
+        // optionally_owned_ptr: non-owning reference is safe because
+        // the cache holds the shared_ptr keeping the collection alive.
         auto new_op = make_uniq<LogicalColumnDataGet>(
             new_idx, col_types,
             optionally_owned_ptr<ColumnDataCollection>(cached->collection));
         new_op->ResolveOperatorTypes();
-
-        // Register old→new binding rewrites for the post-walk pass.
-        auto new_bindings = new_op->GetColumnBindings();
-        replacer.AddReplacements(old_bindings, new_bindings);
-
+        replacer.AddReplacements(old_bindings, new_op->GetColumnBindings());
         op = std::move(new_op);
-        // ───────────────────────────────────────────────────────────────────
-
-    } else {
-        // ── CACHE MISS ─────────────────────────────────────────────────────
-        // Wrap the join in a transparent LogicalCacheWrite node.
-        // The wrapper exposes identical column bindings and types so the rest
-        // of the plan is unaffected.  At execution time, PhysicalCacheWriter
-        // will materialise the join result and store it in the cache.
-        auto writer = make_uniq<LogicalCacheWrite>(sig, cache);
-        writer->children.push_back(std::move(op));
-        writer->ResolveOperatorTypes();
-        op = std::move(writer);
-        // ───────────────────────────────────────────────────────────────────
+        return;
     }
+
+    // ── CACHE MISS ─────────────────────────────────────────────────
+    // Fix #4: pass cache shared_ptr directly, no shared_from_this needed.
+    auto writer = make_uniq<LogicalCacheWrite>(sig, cache);
+    writer->children.push_back(std::move(op));
+    writer->ResolveOperatorTypes();
+    op = std::move(writer);
 }
 
-// ---------------------------------------------------------------------------
-// Public: RecyclerOptimize  (registered as optimize_function_t)
-// ---------------------------------------------------------------------------
-
-void RecyclerOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
-    auto *state = input.info ? reinterpret_cast<RecyclerState *>(input.info.get()) : nullptr;
+// ── RecyclerOptimize ──────────────────────────────────────────────
+void RecyclerOptimize(OptimizerExtensionInput &input,
+                      unique_ptr<LogicalOperator> &plan) {
+    // Match original: reinterpret_cast, not dynamic_cast (line 172).
+    auto *state = input.info
+        ? reinterpret_cast<RecyclerState *>(input.info.get())
+        : nullptr;
     if (!state || !state->cache) { return; }
 
     ColumnBindingReplacer replacer;
     WalkAndRecycle(plan, state->cache, input.context, input.optimizer, replacer);
 
-    // Fix up any column-binding references in parent operators that pointed
-    // to join output columns now served by cache-hit scans.
     if (!replacer.replacement_bindings.empty()) {
         replacer.VisitOperator(*plan);
     }

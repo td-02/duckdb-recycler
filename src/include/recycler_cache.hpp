@@ -6,10 +6,11 @@
 #include <atomic>
 #include <mutex>
 #include <unordered_map>
+#include <string>
 
 namespace duckdb {
 
-//! A single cached join result — stores the materialised rows as a ColumnDataCollection.
+//! A single cached join result.
 struct CachedResult {
     shared_ptr<ColumnDataCollection> collection; //!< the cached rows
     vector<LogicalType>              types;       //!< column types
@@ -19,24 +20,28 @@ struct CachedResult {
 //! Thread-safe in-memory cache: join-skeleton-key → CachedResult.
 class RecyclerCache {
 public:
+    RecyclerCache() = default;
+    RecyclerCache(const RecyclerCache &) = delete;
+    RecyclerCache &operator=(const RecyclerCache &) = delete;
+
     //! Returns true and sets result_out when the key is in cache.
     bool Lookup(const string &key, shared_ptr<CachedResult> &result_out);
 
     //! Stores a result under key.  Overwrites any existing entry.
     void Store(const string &key, shared_ptr<CachedResult> result);
 
-    //! Human-readable hit/miss/store statistics.
+    //! Human-readable statistics (hits/misses/stores survive Clear()).
     string Stats() const;
 
-    //! Evict all entries.
+    //! Evict all entries.  Counters are NOT reset (matches original).
     void Clear();
 
     //! Number of cached entries.
     idx_t Size() const;
 
 private:
-    mutable mutex                                         cache_lock;
-    unordered_map<string, shared_ptr<CachedResult>>       entries;
+    mutable std::mutex                               cache_lock;
+    std::unordered_map<string, shared_ptr<CachedResult>> entries;
     std::atomic<uint64_t> hits   {0};
     std::atomic<uint64_t> misses {0};
     std::atomic<uint64_t> stores {0};
