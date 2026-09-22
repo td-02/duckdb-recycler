@@ -1,8 +1,8 @@
 #define DUCKDB_EXTENSION_MAIN
 
-//===----------------------------------------------------------------------===//
-// RecyclerExtension — entry point registered with DuckDB
-//===----------------------------------------------------------------------===//
+//==-------------------------------------------------------------------==//
+// recycler_extension.cpp  – entry point registered with DuckDB
+//==-------------------------------------------------------------------==//
 #include "recycler_extension.hpp"
 #include "recycler_optimizer.hpp"   // RecyclerState, RecyclerOptimize
 
@@ -14,10 +14,9 @@
 
 namespace duckdb {
 
-// ---------------------------------------------------------------------------
-// PRAGMA recycler_stats() — print cache statistics
-// ---------------------------------------------------------------------------
-static void RecyclerStatsPragma(ClientContext &context, const FunctionParameters & /*params*/) {
+// ── PRAGMA recycler_stats ─────────────────────────────────────────
+static void RecyclerStatsPragma(ClientContext &context,
+                                 const FunctionParameters & /*params*/) {
     for (auto &ext : OptimizerExtension::Iterate(context)) {
         if (!ext.optimizer_info) { continue; }
         auto *state = dynamic_cast<RecyclerState *>(ext.optimizer_info.get());
@@ -29,10 +28,9 @@ static void RecyclerStatsPragma(ClientContext &context, const FunctionParameters
     Printer::Print("recycler: not loaded");
 }
 
-// ---------------------------------------------------------------------------
-// PRAGMA recycler_clear() — flush the cache
-// ---------------------------------------------------------------------------
-static void RecyclerClearPragma(ClientContext &context, const FunctionParameters & /*params*/) {
+// ── PRAGMA recycler_clear ─────────────────────────────────────────
+static void RecyclerClearPragma(ClientContext &context,
+                                 const FunctionParameters & /*params*/) {
     for (auto &ext : OptimizerExtension::Iterate(context)) {
         if (!ext.optimizer_info) { continue; }
         auto *state = dynamic_cast<RecyclerState *>(ext.optimizer_info.get());
@@ -42,13 +40,11 @@ static void RecyclerClearPragma(ClientContext &context, const FunctionParameters
             return;
         }
     }
+    Printer::Print("recycler: not loaded");
 }
 
-// ---------------------------------------------------------------------------
-// LoadInternal — called by DuckDB when the extension is loaded
-// ---------------------------------------------------------------------------
+// ── LoadInternal ──────────────────────────────────────────────────
 static void LoadInternal(ExtensionLoader &loader) {
-    // 1. Create the shared cache and attach it to an optimizer extension.
     auto state = make_shared_ptr<RecyclerState>();
 
     OptimizerExtension opt_ext;
@@ -58,26 +54,18 @@ static void LoadInternal(ExtensionLoader &loader) {
     auto &db = loader.GetDatabaseInstance();
     ExtensionCallbackManager::Get(db).Register(std::move(opt_ext));
 
-    // 2. Register PRAGMA recycler_stats
-    PragmaFunction stats_pragma =
-        PragmaFunction::PragmaStatement("recycler_stats", RecyclerStatsPragma);
-    loader.RegisterFunction(std::move(stats_pragma));
-
-    // 3. Register PRAGMA recycler_clear
-    PragmaFunction clear_pragma =
-        PragmaFunction::PragmaStatement("recycler_clear", RecyclerClearPragma);
-    loader.RegisterFunction(std::move(clear_pragma));
+    loader.RegisterFunction(
+        PragmaFunction::PragmaStatement("recycler_stats", RecyclerStatsPragma));
+    loader.RegisterFunction(
+        PragmaFunction::PragmaStatement("recycler_clear", RecyclerClearPragma));
 }
 
-// ---------------------------------------------------------------------------
-// Extension entry points
-// ---------------------------------------------------------------------------
-void RecyclerExtension::Load(ExtensionLoader &loader) {
-    LoadInternal(loader);
-}
+void RecyclerExtension::Load(ExtensionLoader &loader) { LoadInternal(loader); }
 
 } // namespace duckdb
 
+// Fix #6: DUCKDB_CPP_EXTENSION_ENTRY already emits extern "C" linkage
+// internally – do NOT wrap it in another extern "C" { } block.
 DUCKDB_CPP_EXTENSION_ENTRY(recycler, loader) {
     duckdb::LoadInternal(loader);
 }

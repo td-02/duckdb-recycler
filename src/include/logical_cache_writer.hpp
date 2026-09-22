@@ -1,12 +1,8 @@
 #pragma once
-//===----------------------------------------------------------------------===//
-// LogicalCacheWrite — a transparent wrapper inserted around a join subtree on
-// a cache miss.  It delegates all column-binding and type information to its
-// single child (the original join) so the rest of the plan is unaffected.
-// Its CreatePlan() generates the child's physical plan and wraps it with a
-// PhysicalCacheWriter that materialises the results into the cache.
-//===----------------------------------------------------------------------===//
-
+//==-------------------------------------------------------------------==//
+// LogicalCacheWrite – transparent wrapper inserted around a join subtree
+// on a cache miss.  Its CreatePlan() produces a PhysicalCacheWriter.
+//==-------------------------------------------------------------------==//
 #include "recycler_cache.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
 
@@ -23,11 +19,13 @@ public:
     //! Shared reference to the database-level cache.
     shared_ptr<RecyclerCache> cache;
 
-    // LogicalExtensionOperator interface ------------------------------------------
-    PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override;
+    // LogicalExtensionOperator interface
+    PhysicalOperator &CreatePlan(ClientContext &context,
+                                 PhysicalPlanGenerator &planner) override;
+    // Fix: exact name from main ("recycler_cache_write", not "cache_write")
     string GetExtensionName() const override;
 
-    // Transparent forwarding to the child join ----------------------------------------
+    // Transparent forwarding to the child join
     vector<ColumnBinding> GetColumnBindings() override;
     vector<TableIndex>    GetTableIndex() const override;
     string GetName() const override;
