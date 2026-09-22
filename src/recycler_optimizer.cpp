@@ -31,15 +31,36 @@ namespace duckdb {
 // Fix #2: recurse into ALL children FIRST (bottom-up), then decide
 // whether to act on the current node.  This ensures nested joins
 // are all visited before their parent is considered.
+//
+// `inside_delim_join`: a LOGICAL_DELIM_JOIN implements a *correlated*
+// subquery via duplicate-elimination pipeline wiring (MetaPipeline's
+// delim_join_dependencies): the physical plan built for its children is
+// paired at execution time with a matching delim-scan dependency entry.
+// Materializing (or cache-hit-substituting) anything at or below a
+// delim join replaces that structure with a plain LogicalColumnDataGet
+// that never registers as that dependency, so an unrelated delim-scan
+// later looks up a missing entry and dereferences an invalid iterator --
+// this crashes deterministically on any query with a correlated
+// EXISTS/IN subquery, even with an empty cache. Correlated subtrees also
+// aren't safely cacheable in the first place: their result depends on
+// the outer row, not just their own tables/filters/columns.
 static void WalkAndRecycle(unique_ptr<LogicalOperator> &op,
                             shared_ptr<RecyclerCache> cache,
                             ClientContext &context,
                             Optimizer &optimizer,
-                            ColumnBindingReplacer &replacer) {
+                            ColumnBindingReplacer &replacer,
+                            bool inside_delim_join) {
+    bool child_inside_delim_join =
+        inside_delim_join || op->type == LogicalOperatorType::LOGICAL_DELIM_JOIN;
+
     // Bottom-up: process children before the current node.
     for (auto &child : op->children) {
-        WalkAndRecycle(child, cache, context, optimizer, replacer);
+        WalkAndRecycle(child, cache, context, optimizer, replacer, child_inside_delim_join);
     }
+
+    // Never cache the delim join itself either -- it's the correlated
+    // structure, not a plain equi-join, regardless of what IsJoinNode says.
+    if (inside_delim_join || op->type == LogicalOperatorType::LOGICAL_DELIM_JOIN) { return; }
 
     // Only act on join nodes.
     if (!IsJoinNode(op->type)) { return; }
@@ -47,8 +68,10 @@ static void WalkAndRecycle(unique_ptr<LogicalOperator> &op,
     // Compute skeleton (calls join_utils – no duplicate definition).
     string sig = ComputeJoinSkeleton(*op, context);
 
-    // Fix #3: exact sentinel matching original line 125.
-    if (sig.empty() || sig == "tables:|joins:") { return; }
+    // Fix #3: skip subtrees with no real tables (e.g. CTE-ref self-joins),
+    // recognisable by an empty "tables:" segment regardless of what the
+    // (now richer) rest of the signature contains.
+    if (sig.empty() || sig.rfind("tables:|", 0) == 0) { return; }
 
     shared_ptr<CachedResult> cached;
     if (cache->Lookup(sig, cached)) {
@@ -91,7 +114,7 @@ void RecyclerOptimize(OptimizerExtensionInput &input,
     if (!state || !state->cache) { return; }
 
     ColumnBindingReplacer replacer;
-    WalkAndRecycle(plan, state->cache, input.context, input.optimizer, replacer);
+    WalkAndRecycle(plan, state->cache, input.context, input.optimizer, replacer, /*inside_delim_join=*/false);
 
     if (!replacer.replacement_bindings.empty()) {
         replacer.VisitOperator(*plan);

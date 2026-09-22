@@ -35,8 +35,15 @@ void CollectJoinConditions(const LogicalOperator &op,
                            const TableMap &table_map,
                            std::set<string> &conditions);
 
-//! Returns "tables:t1,t2,...|joins:c1,c2,..." exactly as the original.
-//! Returns the sentinel "tables:|joins:" when the subtree has no tables.
-string ComputeJoinSkeleton(const LogicalOperator &op, ClientContext &context);
+//! Returns "tables:t1,t2,...|joins:c1,c2,...|filters:f1,f2,...|cols:c1,c2,...".
+//! filters covers pushed-down LogicalGet::table_filters and any residual
+//! LOGICAL_FILTER nodes in the subtree; cols is the *ordered* output column
+//! identity of op itself. Both are part of the key: two joins can share the
+//! same tables and join condition while scanning different rows (different
+//! WHERE filters) or exposing a different projection, and a cache hit
+//! substitutes cached columns into the caller's plan positionally.
+//! Returns the sentinel "tables:|joins:|filters:|cols:" when the subtree has
+//! no tables (WalkAndRecycle treats this as "nothing to cache").
+string ComputeJoinSkeleton(LogicalOperator &op, ClientContext &context);
 
 } // namespace duckdb
