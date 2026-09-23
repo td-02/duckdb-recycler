@@ -132,11 +132,27 @@ string ComputeJoinSkeleton(LogicalOperator &op,
     // and a cache hit substitutes a LogicalColumnDataGet whose columns are
     // matched to the caller's bindings *positionally* -- so the exact,
     // ordered column identity has to be part of the key, not just a set.
+    //
+    // The type is part of that identity too: a binding whose table_index
+    // isn't in table_map (e.g. it comes from a previous cache substitution,
+    // a projection, or any non-LogicalGet source) falls back to "t<idx>",
+    // and table_index values are assigned incrementally per query -- two
+    // genuinely different columns can land on the same fallback name by
+    // coincidence. Without the type in the key, a resulting false cache hit
+    // doesn't just return wrong data, it can crash: ColumnBindingReplacer
+    // rebinds by (old binding -> new binding) and throws an internal error
+    // ("inequal types") when the substituted column's type doesn't match
+    // what every other reference to that binding expects.
+    if (op.types.empty()) { op.ResolveOperatorTypes(); }
+    auto column_bindings = op.GetColumnBindings();
     std::ostringstream cols;
-    for (const auto &binding : op.GetColumnBindings()) {
+    for (idx_t i = 0; i < column_bindings.size(); i++) {
+        const auto &binding = column_bindings[i];
         auto it = table_map.find(binding.table_index);
         string tname = (it != table_map.end()) ? it->second : "t" + to_string(binding.table_index);
-        cols << tname << "." << binding.column_index << ",";
+        cols << tname << "." << binding.column_index;
+        if (i < op.types.size()) { cols << ":" << op.types[i].ToString(); }
+        cols << ",";
     }
 
     std::ostringstream sig;

@@ -35,13 +35,18 @@ void CollectJoinConditions(const LogicalOperator &op,
                            const TableMap &table_map,
                            std::set<string> &conditions);
 
-//! Returns "tables:t1,t2,...|joins:c1,c2,...|filters:f1,f2,...|cols:c1,c2,...".
+//! Returns "tables:t1,t2,...|joins:c1,c2,...|filters:f1,f2,...|cols:c1:T1,c2:T2,...".
 //! filters covers pushed-down LogicalGet::table_filters and any residual
-//! LOGICAL_FILTER nodes in the subtree; cols is the *ordered* output column
-//! identity of op itself. Both are part of the key: two joins can share the
-//! same tables and join condition while scanning different rows (different
-//! WHERE filters) or exposing a different projection, and a cache hit
-//! substitutes cached columns into the caller's plan positionally.
+//! LOGICAL_FILTER nodes in the subtree; cols is the *ordered*, *typed*
+//! output column identity of op itself. All three are part of the key: two
+//! joins can share the same tables and join condition while scanning
+//! different rows (different WHERE filters), exposing a different
+//! projection, or -- for a column whose table_index falls back to "t<idx>"
+//! (not a real LogicalGet, e.g. from a prior substitution) -- coincidentally
+//! reusing that fallback name for an unrelated, differently-typed column.
+//! A cache hit substitutes cached columns into the caller's plan
+//! positionally, so any of these mismatches is not just wrong data but can
+//! throw ("Failed to bind column reference ...: inequal types").
 //! Returns the sentinel "tables:|joins:|filters:|cols:" when the subtree has
 //! no tables (WalkAndRecycle treats this as "nothing to cache").
 string ComputeJoinSkeleton(LogicalOperator &op, ClientContext &context);
