@@ -40,15 +40,18 @@ void CollectJoinConditions(const LogicalOperator &op,
 //! LOGICAL_FILTER nodes in the subtree; cols is the *ordered*, *typed*
 //! output column identity of op itself. All three are part of the key: two
 //! joins can share the same tables and join condition while scanning
-//! different rows (different WHERE filters), exposing a different
-//! projection, or -- for a column whose table_index falls back to "t<idx>"
-//! (not a real LogicalGet, e.g. from a prior substitution) -- coincidentally
-//! reusing that fallback name for an unrelated, differently-typed column.
-//! A cache hit substitutes cached columns into the caller's plan
-//! positionally, so any of these mismatches is not just wrong data but can
+//! different rows (different WHERE filters) or exposing a different
+//! projection. A cache hit substitutes cached columns into the caller's
+//! plan positionally, so getting this wrong isn't just wrong data -- it can
 //! throw ("Failed to bind column reference ...: inequal types").
-//! Returns the sentinel "tables:|joins:|filters:|cols:" when the subtree has
-//! no tables (WalkAndRecycle treats this as "nothing to cache").
+//! Returns the sentinel "tables:|joins:|filters:|cols:" (WalkAndRecycle
+//! treats this as "nothing to cache") when the subtree has no tables, or
+//! when any output column's table_index isn't a real LogicalGet reachable
+//! from this subtree (e.g. it comes from a prior cache substitution, a CTE
+//! ref, or a table function with no catalog entry): table_index is just a
+//! per-query sequential integer there, so trusting a "t<idx>" fallback name
+//! as a cache key risks two unrelated, same-typed columns coincidentally
+//! matching and silently swapping data.
 string ComputeJoinSkeleton(LogicalOperator &op, ClientContext &context);
 
 } // namespace duckdb
