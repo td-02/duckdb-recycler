@@ -132,11 +132,29 @@ string ComputeJoinSkeleton(LogicalOperator &op,
     // and a cache hit substitutes a LogicalColumnDataGet whose columns are
     // matched to the caller's bindings *positionally* -- so the exact,
     // ordered column identity has to be part of the key, not just a set.
+    //
+    // The type is part of that identity too: a binding whose table_index
+    // isn't in table_map (e.g. it comes from a previous cache substitution,
+    // a projection, or any non-LogicalGet source) falls back to "t<idx>",
+    // and table_index values are assigned incrementally per query -- two
+    // genuinely different columns can land on the same fallback name by
+    // coincidence. A type mismatch on such a collision throws ("inequal
+    // types") rather than just returning wrong data -- but a coincidental
+    // match of BOTH the fallback name AND the type is still possible (two
+    // unrelated VARCHAR columns, say), and would silently substitute the
+    // wrong column's data. Rather than trust an untraceable identity at
+    // all, decline to cache the subtree the moment any output column
+    // doesn't trace back to a real table.
+    if (op.types.empty()) { op.ResolveOperatorTypes(); }
+    auto column_bindings = op.GetColumnBindings();
     std::ostringstream cols;
-    for (const auto &binding : op.GetColumnBindings()) {
+    for (idx_t i = 0; i < column_bindings.size(); i++) {
+        const auto &binding = column_bindings[i];
         auto it = table_map.find(binding.table_index);
-        string tname = (it != table_map.end()) ? it->second : "t" + to_string(binding.table_index);
-        cols << tname << "." << binding.column_index << ",";
+        if (it == table_map.end()) { return "tables:|joins:|filters:|cols:"; }
+        cols << it->second << "." << binding.column_index;
+        if (i < op.types.size()) { cols << ":" << op.types[i].ToString(); }
+        cols << ",";
     }
 
     std::ostringstream sig;
