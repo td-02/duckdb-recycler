@@ -145,3 +145,35 @@ Please don't rename your extension, as this will (potentially) break the grader.
 Something went wrong while the script tried to push the changes to the repository. Perhaps you have not configured your GitHub credentials or your token has expired / lack permissions.  
 **Solution**: Push manually to your repository. Make sure you have a GitHub token that allows workflows execution.
 
+
+## The query recycler (this repository's extension)
+
+The extension keeps the template's `waddle` scalar function and adds a query recycler that runs as an
+optimizer extension with two hooks (`src/recycler_hooks.cpp`):
+
+* **Pre-optimize** (bound plan, before any built-in optimizer). The plan gets a canonical structural
+  signature (`src/recycler_signature.cpp`: table indexes renumbered in pre-order, every operator and
+  expression field rendered, IN-list constants hashed, unknown constructs refused). A match against an
+  earlier *whole result* replaces the plan with a `RECYCLER_SCAN`; a nested query block equal to an
+  earlier whole query (e.g. `SELECT * FROM (<earlier query>) d WHERE ...`) is replaced the same way,
+  before filter pushdown can rewrite it.
+* **Post-optimize** (after all built-in optimizers). Joins, aggregates, DISTINCTs and CTE definitions are
+  candidate subtrees; the whole `DELIM_JOIN` of a correlated `EXISTS` is treated as one unit. Exact hits are
+  replaced by a `RECYCLER_SCAN`; admissible misses (estimated input >= `recycler_min_input_rows`, output
+  at most half the input, size caps, speculation only for small estimates or repeats) are wrapped in a
+  `RECYCLER_MATERIALIZE` that stores the result while re-emitting it, one per root-to-leaf path. The
+  complete query result is stored too, in the order it was produced.
+
+Correctness rules: results are keyed on the exact bound/optimized structure including types; subtrees with
+volatile functions, parameters, table functions, LIMIT without ORDER BY, runtime (dynamic) filters owned
+outside the subtree, or references into a delim join's other side are never cached; any statement that
+modifies data or the catalog clears the cache, and nothing is cached or served inside a transaction that
+has written. Cached collections are buffer-managed and bounded by `recycler_budget_mb` with
+benefit-density eviction.
+
+Settings: `recycler_enabled`, `recycler_whole_result`, `recycler_blocks`, `recycler_subtrees`,
+`recycler_budget_mb`, `recycler_entry_cap_mb`, `recycler_entry_cap_rows`, `recycler_min_input_rows`,
+`recycler_speculate_mb`. Introspection: `SELECT * FROM recycler_stats()`, `SELECT * FROM recycler_entries()`,
+`PRAGMA recycler_clear`. Tests: `test/sql/recycler/`. Differential check against vanilla over the whole
+workload in several orders: `python3 ./scripts/recycler_diff.py`. The design and roadmap are in
+`docs/SOLUTION_PLAN.md`.

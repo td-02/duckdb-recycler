@@ -1,45 +1,159 @@
 #include "recycler_cache.hpp"
-#include <sstream>
 
 namespace duckdb {
 
-bool RecyclerCache::Lookup(const string &key,
-                           shared_ptr<CachedResult> &result_out) {
-    std::lock_guard<std::mutex> lk(cache_lock);
-    auto it = entries.find(key);
-    if (it == entries.end()) { ++misses; return false; }
-    ++hits;
-    result_out = it->second;
-    return true;
+const char *RecyclerEntryKindName(RecyclerEntryKind kind) {
+	switch (kind) {
+	case RecyclerEntryKind::WHOLE_RESULT:
+		return "whole_result";
+	case RecyclerEntryKind::SUBTREE:
+		return "subtree";
+	default:
+		return "unknown";
+	}
 }
 
-void RecyclerCache::Store(const string &key,
-                          shared_ptr<CachedResult> result) {
-    std::lock_guard<std::mutex> lk(cache_lock);
-    entries[key] = std::move(result);
-    ++stores;
+double CachedEntry::Benefit() const {
+	double saved = est_input_rows > rows ? double(est_input_rows - rows) : 1.0;
+	double reuse = 1.0 + double(hits.load());
+	return saved * reuse / double(MaxValue<idx_t>(bytes, 1));
 }
 
-string RecyclerCache::Stats() const {
-    std::lock_guard<std::mutex> lk(cache_lock);
-    std::ostringstream os;
-    os << "RecyclerCache entries=" << entries.size()
-       << " hits="   << hits.load()
-       << " misses=" << misses.load()
-       << " stores=" << stores.load();
-    return os.str();
+RecyclerCache::EntryMap &RecyclerCache::Map(RecyclerEntryKind kind) {
+	return kind == RecyclerEntryKind::WHOLE_RESULT ? whole : subtrees;
+}
+
+idx_t RecyclerCache::NextSequence() {
+	return ++sequence;
+}
+
+shared_ptr<CachedEntry> RecyclerCache::Lookup(RecyclerEntryKind kind, const SigHash &hash,
+                                              const std::function<string()> &render_canonical) {
+	shared_ptr<CachedEntry> candidate;
+	{
+		std::lock_guard<std::mutex> guard(lock);
+		auto &map = Map(kind);
+		auto entry = map.find(hash);
+		if (entry == map.end()) {
+			stats.misses++;
+			return nullptr;
+		}
+		candidate = entry->second;
+	}
+	// confirm the match outside of the lock (rendering walks the plan)
+	auto canonical = render_canonical();
+	if (canonical != candidate->canonical) {
+		stats.hash_collisions++;
+		stats.misses++;
+		return nullptr;
+	}
+	candidate->hits++;
+	candidate->last_used = NextSequence();
+	return candidate;
+}
+
+shared_ptr<CachedEntry> RecyclerCache::PickVictim() const {
+	shared_ptr<CachedEntry> victim;
+	for (auto *map : {&whole, &subtrees}) {
+		for (auto &entry : *map) {
+			auto &candidate = entry.second;
+			if (!victim || candidate->Benefit() < victim->Benefit() ||
+			    (candidate->Benefit() == victim->Benefit() && candidate->last_used < victim->last_used)) {
+				victim = candidate;
+			}
+		}
+	}
+	return victim;
+}
+
+bool RecyclerCache::Store(shared_ptr<CachedEntry> entry, idx_t budget_bytes) {
+	std::lock_guard<std::mutex> guard(lock);
+	auto &map = Map(entry->kind);
+	if (map.find(entry->hash) != map.end()) {
+		// never overwrite: a running query may reference the existing collection through the plan
+		stats.store_rejected++;
+		return false;
+	}
+	if (entry->bytes > budget_bytes) {
+		stats.store_rejected++;
+		return false;
+	}
+	while (total_bytes + entry->bytes > budget_bytes) {
+		auto victim = PickVictim();
+		if (!victim) {
+			break;
+		}
+		if (victim->Benefit() > entry->Benefit()) {
+			// the cache is full of more valuable results
+			stats.store_rejected++;
+			return false;
+		}
+		Map(victim->kind).erase(victim->hash);
+		total_bytes -= MinValue<idx_t>(total_bytes, victim->bytes);
+		stats.evictions++;
+	}
+	entry->last_used = NextSequence();
+	total_bytes += entry->bytes;
+	map[entry->hash] = entry;
+	if (entry->kind == RecyclerEntryKind::WHOLE_RESULT) {
+		stats.whole_stores++;
+	} else {
+		stats.subtree_stores++;
+	}
+	return true;
 }
 
 void RecyclerCache::Clear() {
-    std::lock_guard<std::mutex> lk(cache_lock);
-    entries.clear();
-    // Counters intentionally NOT reset: recycler_stats remains meaningful
-    // after recycler_clear (matches original behaviour).
+	std::lock_guard<std::mutex> guard(lock);
+	whole.clear();
+	subtrees.clear();
+	seen.clear();
+	too_big.clear();
+	total_bytes = 0;
+	stats.clears++;
 }
 
-idx_t RecyclerCache::Size() const {
-    std::lock_guard<std::mutex> lk(cache_lock);
-    return static_cast<idx_t>(entries.size());
+idx_t RecyclerCache::NoteSeen(const SigHash &hash) {
+	std::lock_guard<std::mutex> guard(lock);
+	return ++seen[hash];
+}
+
+idx_t RecyclerCache::Seen(const SigHash &hash) const {
+	std::lock_guard<std::mutex> guard(lock);
+	auto entry = seen.find(hash);
+	return entry == seen.end() ? 0 : entry->second;
+}
+
+void RecyclerCache::NoteTooBig(const SigHash &hash) {
+	std::lock_guard<std::mutex> guard(lock);
+	too_big.insert(hash);
+	stats.too_big++;
+}
+
+bool RecyclerCache::IsTooBig(const SigHash &hash) const {
+	std::lock_guard<std::mutex> guard(lock);
+	return too_big.find(hash) != too_big.end();
+}
+
+idx_t RecyclerCache::TotalBytes() const {
+	std::lock_guard<std::mutex> guard(lock);
+	return total_bytes;
+}
+
+idx_t RecyclerCache::EntryCount() const {
+	std::lock_guard<std::mutex> guard(lock);
+	return whole.size() + subtrees.size();
+}
+
+vector<shared_ptr<CachedEntry>> RecyclerCache::Entries() const {
+	std::lock_guard<std::mutex> guard(lock);
+	vector<shared_ptr<CachedEntry>> result;
+	for (auto *map : {&whole, &subtrees}) {
+		for (auto &entry : *map) {
+			result.push_back(entry.second);
+		}
+	}
+	return result;
 }
 
 } // namespace duckdb

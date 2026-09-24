@@ -1,0 +1,231 @@
+//===----------------------------------------------------------------------===//
+// recycler_functions.cpp - registration, settings, and introspection functions
+//===----------------------------------------------------------------------===//
+#include "recycler_state.hpp"
+
+#include "duckdb/function/pragma_function.hpp"
+#include "duckdb/function/table_function.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/main/config.hpp"
+#include "duckdb/main/connection_manager.hpp"
+#include "duckdb/main/database.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/main/extension_callback_manager.hpp"
+#include "duckdb/optimizer/optimizer_extension.hpp"
+#include "duckdb/planner/extension_callback.hpp"
+
+namespace duckdb {
+
+optional_ptr<RecyclerState> GetRecyclerState(ClientContext &context) {
+	for (auto &ext : OptimizerExtension::Iterate(context)) {
+		if (!ext.optimizer_info) {
+			continue;
+		}
+		auto state = dynamic_cast<RecyclerState *>(ext.optimizer_info.get());
+		if (state) {
+			return state;
+		}
+	}
+	return nullptr;
+}
+
+//===----------------------------------------------------------------------===//
+// Shutdown ordering
+//===----------------------------------------------------------------------===//
+// Cached ColumnDataCollections are buffer-managed. DatabaseInstance destroys the buffer manager before the
+// DBConfig that (transitively) owns this cache, so the collections must be released while the last connection
+// closes.
+class RecyclerShutdownCallback : public ExtensionCallback {
+public:
+	explicit RecyclerShutdownCallback(shared_ptr<RecyclerCache> cache_p) : cache(std::move(cache_p)) {
+	}
+
+	void OnConnectionClosed(ClientContext &context) override {
+		auto &db = DatabaseInstance::GetDatabase(context);
+		if (db.GetConnectionManager().GetConnectionCount() <= 1) {
+			cache->Clear();
+		}
+	}
+
+private:
+	shared_ptr<RecyclerCache> cache;
+};
+
+//===----------------------------------------------------------------------===//
+// recycler_stats()
+//===----------------------------------------------------------------------===//
+struct RecyclerStatsGlobalState : public GlobalTableFunctionState {
+	vector<std::pair<string, int64_t>> rows;
+	idx_t offset = 0;
+};
+
+static unique_ptr<FunctionData> RecyclerStatsBind(ClientContext &context, TableFunctionBindInput &input,
+                                                  vector<LogicalType> &return_types, vector<string> &names) {
+	names.emplace_back("name");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("value");
+	return_types.emplace_back(LogicalType::BIGINT);
+	return nullptr;
+}
+
+static unique_ptr<GlobalTableFunctionState> RecyclerStatsInit(ClientContext &context, TableFunctionInitInput &input) {
+	auto result = make_uniq<RecyclerStatsGlobalState>();
+	auto state = GetRecyclerState(context);
+	if (state) {
+		auto &cache = *state->cache;
+		auto &s = cache.stats;
+		auto add = [&](const char *name, uint64_t value) {
+			result->rows.emplace_back(name, int64_t(value));
+		};
+		add("entries", cache.EntryCount());
+		add("bytes", cache.TotalBytes());
+		add("pre_calls", s.pre_calls);
+		add("post_calls", s.post_calls);
+		add("whole_hits", s.whole_hits);
+		add("block_hits", s.block_hits);
+		add("subtree_hits", s.subtree_hits);
+		add("misses", s.misses);
+		add("whole_stores", s.whole_stores);
+		add("subtree_stores", s.subtree_stores);
+		add("writes_planned", s.writes_planned);
+		add("store_rejected", s.store_rejected);
+		add("too_big", s.too_big);
+		add("evictions", s.evictions);
+		add("hash_collisions", s.hash_collisions);
+		add("clears", s.clears);
+		add("pre_ns", s.pre_ns);
+		add("post_ns", s.post_ns);
+		add("skip_not_query", s.skip_not_query);
+		add("skip_modifying", s.skip_modifying);
+		add("skip_not_read", s.skip_not_read);
+		add("skip_disabled", s.skip_disabled);
+		add("skip_modified_databases", s.skip_modified_databases);
+		add("skip_write_transaction", s.skip_write_transaction);
+		add("skip_analyze_failed", s.skip_analyze_failed);
+		add("root_not_cacheable", s.root_not_cacheable);
+	}
+	return std::move(result);
+}
+
+static void RecyclerStatsFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &data = data_p.global_state->Cast<RecyclerStatsGlobalState>();
+	idx_t count = 0;
+	while (data.offset < data.rows.size() && count < STANDARD_VECTOR_SIZE) {
+		auto &row = data.rows[data.offset++];
+		output.SetValue(0, count, Value(row.first));
+		output.SetValue(1, count, Value::BIGINT(row.second));
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
+//===----------------------------------------------------------------------===//
+// recycler_entries()
+//===----------------------------------------------------------------------===//
+struct RecyclerEntriesGlobalState : public GlobalTableFunctionState {
+	vector<shared_ptr<CachedEntry>> entries;
+	idx_t offset = 0;
+};
+
+static unique_ptr<FunctionData> RecyclerEntriesBind(ClientContext &context, TableFunctionBindInput &input,
+                                                    vector<LogicalType> &return_types, vector<string> &names) {
+	names.emplace_back("kind");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("key");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("rows");
+	return_types.emplace_back(LogicalType::BIGINT);
+	names.emplace_back("bytes");
+	return_types.emplace_back(LogicalType::BIGINT);
+	names.emplace_back("hits");
+	return_types.emplace_back(LogicalType::BIGINT);
+	names.emplace_back("ordered");
+	return_types.emplace_back(LogicalType::BOOLEAN);
+	names.emplace_back("est_input_rows");
+	return_types.emplace_back(LogicalType::BIGINT);
+	return nullptr;
+}
+
+static unique_ptr<GlobalTableFunctionState> RecyclerEntriesInit(ClientContext &context,
+                                                                TableFunctionInitInput &input) {
+	auto result = make_uniq<RecyclerEntriesGlobalState>();
+	auto state = GetRecyclerState(context);
+	if (state) {
+		result->entries = state->cache->Entries();
+	}
+	return std::move(result);
+}
+
+static void RecyclerEntriesFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &data = data_p.global_state->Cast<RecyclerEntriesGlobalState>();
+	idx_t count = 0;
+	while (data.offset < data.entries.size() && count < STANDARD_VECTOR_SIZE) {
+		auto &entry = *data.entries[data.offset++];
+		output.SetValue(0, count, Value(RecyclerEntryKindName(entry.kind)));
+		output.SetValue(1, count, Value(entry.hash.ToString()));
+		output.SetValue(2, count, Value::BIGINT(int64_t(entry.rows)));
+		output.SetValue(3, count, Value::BIGINT(int64_t(entry.bytes)));
+		output.SetValue(4, count, Value::BIGINT(int64_t(entry.hits.load())));
+		output.SetValue(5, count, Value::BOOLEAN(entry.ordered));
+		output.SetValue(6, count, Value::BIGINT(int64_t(entry.est_input_rows)));
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
+//===----------------------------------------------------------------------===//
+// PRAGMA recycler_clear
+//===----------------------------------------------------------------------===//
+static void RecyclerClearPragma(ClientContext &context, const FunctionParameters &parameters) {
+	auto state = GetRecyclerState(context);
+	if (state) {
+		state->cache->Clear();
+	}
+}
+
+//===----------------------------------------------------------------------===//
+// Registration
+//===----------------------------------------------------------------------===//
+void LoadRecycler(ExtensionLoader &loader) {
+	auto state = make_shared_ptr<RecyclerState>();
+
+	OptimizerExtension optimizer_extension;
+	optimizer_extension.pre_optimize_function = RecyclerPreOptimize;
+	optimizer_extension.optimize_function = RecyclerOptimize;
+	optimizer_extension.optimizer_info = state;
+
+	auto &db = loader.GetDatabaseInstance();
+	ExtensionCallbackManager::Get(db).Register(std::move(optimizer_extension));
+	ExtensionCallbackManager::Get(db).Register(make_shared_ptr<RecyclerShutdownCallback>(state->cache));
+
+	auto &config = DBConfig::GetConfig(db);
+	RecyclerSettings defaults;
+	config.AddExtensionOption("recycler_enabled", "Enable query recycling", LogicalType::BOOLEAN,
+	                          Value::BOOLEAN(defaults.enabled));
+	config.AddExtensionOption("recycler_whole_result", "Cache and serve complete query results",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(defaults.whole_result));
+	config.AddExtensionOption("recycler_blocks", "Serve nested query blocks from cached query results",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(defaults.blocks));
+	config.AddExtensionOption("recycler_subtrees", "Cache and reuse intermediate results of optimized plans",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(defaults.subtrees));
+	config.AddExtensionOption("recycler_budget_mb", "Memory budget of the recycler cache in MB", LogicalType::BIGINT,
+	                          Value::BIGINT(int64_t(defaults.budget_bytes / (1024 * 1024))));
+	config.AddExtensionOption("recycler_entry_cap_mb", "Largest cache entry in MB", LogicalType::BIGINT,
+	                          Value::BIGINT(int64_t(defaults.entry_cap_bytes / (1024 * 1024))));
+	config.AddExtensionOption("recycler_entry_cap_rows", "Largest cache entry in rows", LogicalType::BIGINT,
+	                          Value::BIGINT(int64_t(defaults.entry_cap_rows)));
+	config.AddExtensionOption("recycler_min_input_rows",
+	                          "Minimum estimated rows scanned by a subtree before it is worth caching",
+	                          LogicalType::BIGINT, Value::BIGINT(int64_t(defaults.min_input_rows)));
+	config.AddExtensionOption("recycler_speculate_mb",
+	                          "Largest estimated result (MB) materialized on first sight, before a repeat is seen",
+	                          LogicalType::BIGINT, Value::BIGINT(int64_t(defaults.speculate_bytes / (1024 * 1024))));
+
+	loader.RegisterFunction(TableFunction("recycler_stats", {}, RecyclerStatsFunction, RecyclerStatsBind,
+	                                      RecyclerStatsInit));
+	loader.RegisterFunction(TableFunction("recycler_entries", {}, RecyclerEntriesFunction, RecyclerEntriesBind,
+	                                      RecyclerEntriesInit));
+	loader.RegisterFunction(PragmaFunction::PragmaStatement("recycler_clear", RecyclerClearPragma));
+}
+
+} // namespace duckdb
