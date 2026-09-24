@@ -8,13 +8,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 include_directories(src/include)
 
 set(EXTENSION_SOURCES
-    src/waddle_extension.cpp       # template scalar function (keeps entry-point)
-    src/join_utils.cpp             # single definition of skeleton helpers
-    src/recycler_cache.cpp         # thread-safe result cache
-    src/logical_cache_writer.cpp   # logical plan wrapper on cache miss
-    src/physical_cache_writer.cpp  # execution-time materialiser + re-emitter
-    src/recycler_optimizer.cpp     # optimizer pass
-    src/recycler_extension.cpp     # extension entry point + pragma handlers
+    src/waddle_extension.cpp       # extension entry point (template scalar function + LoadRecycler)
+    src/recycler_signature.cpp     # canonical structural signatures of plan subtrees
+    src/recycler_cache.cpp         # bounded, benefit-ordered cache of materialized results
+    src/recycler_operators.cpp     # RecyclerScan (hit) and RecyclerMaterialize (miss) operators
+    src/recycler_hooks.cpp         # pre-/post-optimizer passes: matching, admission, rewrites
+    src/recycler_functions.cpp     # settings, recycler_stats()/recycler_entries(), PRAGMA recycler_clear
 )
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})

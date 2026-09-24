@@ -1,7 +1,7 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "waddle_extension.hpp"
-#include "recycler_extension.hpp"
+#include "recycler_state.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/function/scalar_function.hpp"
@@ -17,20 +17,13 @@ inline void WaddleScalarFun(DataChunk &args, ExpressionState &state, Vector &res
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
-	// Register a scalar function
+	// the template's scalar function (kept: test/sql/waddle.test exercises it)
 	auto waddle_scalar_function =
 	    ScalarFunction("waddle", {LogicalType::VARCHAR}, LogicalType::VARCHAR, WaddleScalarFun);
-
 	loader.RegisterFunction(waddle_scalar_function);
 
-	// The extension this repo actually builds: registers the recycler
-	// optimizer pass and its PRAGMAs. RecyclerExtension::Load() was
-	// otherwise unreachable -- its own DUCKDB_CPP_EXTENSION_ENTRY(recycler,
-	// ...) generates a "recycler_duckdb_cpp_init" symbol, but this build is
-	// registered under the name "waddle" (see extension_config.cmake), so
-	// only "waddle_duckdb_cpp_init" (this file's entry point) is ever
-	// called by DuckDB's static-extension bootstrap.
-	RecyclerExtension::Load(loader);
+	// the query recycler: optimizer hooks, settings, recycler_stats()/recycler_entries(), PRAGMA recycler_clear
+	LoadRecycler(loader);
 }
 
 void WaddleExtension::Load(ExtensionLoader &loader) {
