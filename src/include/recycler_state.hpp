@@ -18,6 +18,26 @@ struct RecyclerState : public OptimizerExtensionInfo {
 	shared_ptr<RecyclerCache> cache;
 };
 
+//! A write keyed on the pre-optimize plan that the pre hook requests and the post hook plants
+struct PendingWrite {
+	bool requested = false;
+	SigHash hash;
+	string canonical;
+	idx_t est_input_rows = 0;
+
+	void Request(const SigHash &hash_p, string canonical_p, idx_t est_input_rows_p) {
+		requested = true;
+		hash = hash_p;
+		canonical = std::move(canonical_p);
+		est_input_rows = est_input_rows_p;
+	}
+	void Reset() {
+		requested = false;
+		canonical.clear();
+		est_input_rows = 0;
+	}
+};
+
 //! Per-connection state carrying information from the pre-optimize hook to the post-optimize hook.
 //! Only touched by the optimizer hooks of its own connection, which run one statement at a time.
 struct RecyclerClientState : public ClientContextState {
@@ -26,17 +46,15 @@ struct RecyclerClientState : public ClientContextState {
 	//! Settings are re-read only after a SET/RESET/PRAGMA statement ran on this connection
 	bool settings_loaded = false;
 	RecyclerSettings settings;
-	//! Whole-result write requested by the pre hook (a miss on an admissible query)
-	bool has_pending_whole = false;
-	SigHash whole_hash;
-	string whole_canonical;
-	idx_t whole_est_input_rows = 0;
+	//! The complete result (a miss on an admissible query)
+	PendingWrite whole;
+	//! The complete ordered result a root LIMIT/OFFSET cuts its page from (a miss on a paginated query)
+	PendingWrite page_source;
 
 	void Reset() {
 		active = false;
-		has_pending_whole = false;
-		whole_canonical.clear();
-		whole_est_input_rows = 0;
+		whole.Reset();
+		page_source.Reset();
 	}
 };
 

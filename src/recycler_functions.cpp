@@ -91,6 +91,7 @@ static unique_ptr<GlobalTableFunctionState> RecyclerStatsInit(ClientContext &con
 		add("blocks_planted", s.blocks_planted);
 		add("block_stores", s.block_stores);
 		add("subsumption_hits", s.subsumption_hits);
+		add("pagination_hits", s.pagination_hits);
 		add("store_rejected", s.store_rejected);
 		add("too_big", s.too_big);
 		add("evictions", s.evictions);
@@ -214,6 +215,9 @@ void LoadRecycler(ExtensionLoader &loader) {
 	config.AddExtensionOption("recycler_subsumption",
 	                          "Reuse cached SPJ blocks for narrower predicates and column subsets (predicate subsumption)",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(defaults.subsumption));
+	config.AddExtensionOption("recycler_pagination",
+	                          "Cache the complete ordered result of a LIMIT/OFFSET query and serve later pages from it",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(defaults.pagination));
 	config.AddExtensionOption("recycler_budget_mb", "Memory budget of the recycler cache in MB", LogicalType::BIGINT,
 	                          Value::BIGINT(int64_t(defaults.budget_bytes / (1024 * 1024))));
 	config.AddExtensionOption("recycler_entry_cap_mb", "Largest cache entry in MB", LogicalType::BIGINT,
