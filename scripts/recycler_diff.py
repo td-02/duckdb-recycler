@@ -8,10 +8,11 @@
 Every query is run once with the extension's optimizer disabled (the reference) and then, in one CLI process
 per order so that the cache warms up across queries, `--repeat` times with the recycler enabled. Results are
 compared as multisets of rows (ORDER BY ties make exact order comparisons meaningless, and the grader's own
-test uses rowsort); floating-point columns are compared with a relative tolerance of 1e-9 because parallel
-aggregation makes the last digits of avg()/corr()/stddev() vary between runs of vanilla DuckDB itself; queries
-with a LIMIT are compared by row count only (which rows survive a LIMIT with ties is arbitrary). A mismatch or
-a query error is a failure.
+test uses rowsort), except that queries whose top-level ORDER BY ends in a unique `<table>.id` tiebreaker have a
+total order and are compared row by row in output order (this is what checks LIMIT/OFFSET pages); floating-point
+columns are compared with a relative tolerance of 1e-9 because parallel aggregation makes the last digits of
+avg()/corr()/stddev() vary between runs of vanilla DuckDB itself; other queries with a LIMIT are compared by row
+count only (which rows survive a LIMIT with ties is arbitrary). A mismatch or a query error is a failure.
 """
 
 from __future__ import annotations
@@ -32,8 +33,15 @@ DB = Path("data") / "imdb.duckdb"
 FLOAT_RE = re.compile(r"^-?\d+\.\d+(e[+-]?\d+)?$", re.IGNORECASE)
 
 
-def has_limit(sql: str) -> bool:
-    return re.search(r"\bLIMIT\b", sql, re.IGNORECASE) is not None
+def compare_mode(sql: str) -> str:
+    """'ordered' (row by row) when the last ORDER BY ends in a `<table>.id` tiebreaker, 'count' for other
+    LIMIT queries, 'sorted' otherwise."""
+    pos = sql.upper().rfind("ORDER BY")
+    if pos >= 0 and re.match(r"ORDER BY[^;()]*\b\w+\.id\s*(LIMIT|OFFSET|$)", sql[pos:], re.IGNORECASE | re.DOTALL):
+        return "ordered"
+    if re.search(r"\bLIMIT\b", sql, re.IGNORECASE):
+        return "count"
+    return "sorted"
 
 
 def same_value(expected: str, actual: str) -> bool:
@@ -52,14 +60,16 @@ def same_row(expected: str, actual: str) -> bool:
     return len(e_cols) == len(a_cols) and all(same_value(e, a) for e, a in zip(e_cols, a_cols))
 
 
-def same_result(expected: list[str], actual: list[str], limit_only_count: bool) -> bool:
-    """expected/actual are sorted CSV lines (header included)."""
+def same_result(expected: list[str], actual: list[str], mode: str) -> bool:
+    """expected/actual are CSV lines in output order (header included)."""
     if "<no output>" in actual or "<no output>" in expected:
         return False
     if len(expected) != len(actual):
         return False
-    if limit_only_count:
+    if mode == "count":
         return True
+    if mode == "sorted":
+        expected, actual = sorted(expected), sorted(actual)
     return all(same_row(e, a) for e, a in zip(expected, actual))
 
 
@@ -97,7 +107,7 @@ def run(binary: Path, db: Path, out_dir: Path, queries: list[tuple[str, str]], t
             if not path.exists():
                 results[key] = ["<no output>"]
                 continue
-            results[key] = sorted(path.read_text().splitlines())
+            results[key] = path.read_text().splitlines()
     stats = (out_dir / "stats.csv").read_text() if (out_dir / "stats.csv").exists() else ""
     if proc.stderr.strip():
         sys.stderr.write(proc.stderr)
@@ -145,10 +155,14 @@ def main() -> None:
                 for name, sql in ordered:
                     expected = reference[f"0:{name}"]
                     actual = got[f"{pass_no}:{name}"]
-                    if not same_result(expected, actual, has_limit(sql)):
+                    mode = compare_mode(sql)
+                    if not same_result(expected, actual, mode):
                         bad += 1
                         failures += 1
-                        print(f"  MISMATCH pass {pass_no} {name}: expected {len(expected)} lines, got {len(actual)}")
+                        print(f"  MISMATCH pass {pass_no} {name} ({mode}): expected {len(expected)} lines, "
+                              f"got {len(actual)}")
+                        if mode == "sorted":
+                            expected, actual = sorted(expected), sorted(actual)
                         for e, a in zip(expected[:3], actual[:3]):
                             if e != a:
                                 print(f"    expected: {e[:120]}")

@@ -18,8 +18,21 @@ on base columns, columns by physical id), planted `RECYCLER_MATERIALIZE` markers
 alive through column pruning, post-optimize resolution of the stored columns' identities (seeing through DuckDB's
 compress/decompress projections), and consumer rewrites to a column-subset `RECYCLER_SCAN` plus a residual filter.
 Measured: **geomean 9.24 ms** (vs 14.9 ms after M0–M4, 30.65 ms vanilla), total 11.9 s; all 149 answers match vanilla in
-three query orders (21–38 subsumption hits per run depending on order). Deferred: ordered pagination replay (M6),
-union-projection widening (M7), batch-index sink mode.
+three query orders (21–38 subsumption hits per run depending on order). Deferred: union-projection widening (M7);
+pagination replay and the batch-index sink followed as M6 (below).
+
+M6 (pagination replay, 2026-09-25): a query whose root is a `LIMIT`/`OFFSET` that survives as a LIMIT (limit + offset
+above 5000, so no Top-N rewrite) is keyed *below* its LIMIT as well. Both hooks first hoist the LIMIT above the binder's
+pruning projection (and the optimizer's limit pushdown), so that the LIMIT's child produces the result columns in the
+bound and in the optimized plan; that child's pre-optimize signature keys an ordered whole-result entry that the first
+page stores and that every later page (and the LIMIT-less query) replaces before the optimizer runs, so it neither
+joins nor sorts. Ordered writes use DuckDB's batch-index sink protocol when every source below supports it (a sort
+does), keeping the payer's sort output parallel; the serial sink remains the fallback. Measured on the
+q0080/q0082/q0089/q0092–q0094 family (one 983,418-row body; three page sources of 49–66 MB): q0093 30 → 1 ms, q0094
+34 → <1 ms, payers q0080 36 → 44 ms, q0082 39 → 50 ms, q0092 34 → 50 ms. The whole-workload geomean is unchanged
+within this machine's ±5% run-to-run noise (about −2% by per-query arithmetic); the heavy ORDER BY queries are
+identical within 1% between the M5 and M6 binaries. All 149 answers match vanilla in three orders, and the 19
+LIMIT/OFFSET queries with a unique id tiebreaker are now compared row by row in output order.
 
 ## 0. Decision in one paragraph
 

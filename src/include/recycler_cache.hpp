@@ -60,6 +60,7 @@ struct RecyclerSettings {
 	bool blocks = true;
 	bool subtrees = true;
 	bool subsumption = true;
+	bool pagination = true;
 	idx_t budget_bytes = 2000ULL * 1024 * 1024;
 	idx_t entry_cap_bytes = 256ULL * 1024 * 1024;
 	idx_t entry_cap_rows = 4000000;
@@ -85,6 +86,7 @@ struct RecyclerStats {
 	std::atomic<uint64_t> blocks_planted {0};
 	std::atomic<uint64_t> block_stores {0};
 	std::atomic<uint64_t> subsumption_hits {0};
+	std::atomic<uint64_t> pagination_hits {0};
 	std::atomic<uint64_t> clears {0};
 	std::atomic<uint64_t> pre_ns {0};
 	std::atomic<uint64_t> post_ns {0};

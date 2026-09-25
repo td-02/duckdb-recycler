@@ -10,6 +10,9 @@
 //  * LogicalRecyclerMaterialize / PhysicalRecyclerMaterialize: a cache miss.
 //    A sink+source wrapper that stores its child's output in a collection,
 //    publishes it to the cache in Finalize and re-emits it to its parent.
+//    Unordered results are written by a parallel sink. Ordered results keep
+//    their order either through DuckDB's batch-index protocol (parallel, when
+//    the source supports it, as a sort does) or through a serial sink.
 //===----------------------------------------------------------------------===//
 #include "recycler_cache.hpp"
 #include "duckdb/execution/physical_operator.hpp"
@@ -132,11 +135,14 @@ class PhysicalRecyclerMaterialize : public PhysicalOperator {
 public:
 	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::INVALID;
 
+	//! `use_batch_index`: an ordered write that tags rows with the source's batch index and is parallel
 	PhysicalRecyclerMaterialize(PhysicalPlan &physical_plan, vector<LogicalType> types, idx_t estimated_cardinality,
-	                            RecyclerWriteSpec spec, shared_ptr<RecyclerCache> cache, PhysicalOperator &child);
+	                            RecyclerWriteSpec spec, shared_ptr<RecyclerCache> cache, PhysicalOperator &child,
+	                            bool use_batch_index);
 
 	RecyclerWriteSpec spec;
 	shared_ptr<RecyclerCache> cache;
+	bool use_batch_index;
 
 public:
 	string GetName() const override;
@@ -147,7 +153,10 @@ public:
 		return true;
 	}
 	bool ParallelSink() const override {
-		return !spec.ordered;
+		return !spec.ordered || use_batch_index;
+	}
+	OperatorPartitionInfo RequiredPartitionInfo() const override {
+		return use_batch_index ? OperatorPartitionInfo::BatchIndex() : OperatorPartitionInfo::NoPartitionInfo();
 	}
 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
 	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override;

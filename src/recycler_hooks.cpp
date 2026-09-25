@@ -6,8 +6,11 @@
 //     whole plan with a RecyclerScan; miss -> remember the key for the post hook
 //   * nested-block hit: a sub-query block equals an earlier whole query
 //     (before filter pushdown rewrites it) -> replace the block
+//   * pagination hit: the ordered result below a root LIMIT/OFFSET was stored
+//     by an earlier page -> replace everything under the LIMIT
 // Post-optimize (after all built-in optimizers):
-//   * whole-result write: wrap the root in an ordered RecyclerMaterialize
+//   * whole-result write: wrap the root in an ordered RecyclerMaterialize;
+//     for a paginated query also its child (the complete ordered result)
 //   * subtree cache: top-down, one materialization per root-to-leaf path,
 //     exact hits replace subtrees, admissible misses get a RecyclerMaterialize
 //===----------------------------------------------------------------------===//
@@ -32,6 +35,7 @@
 #include "duckdb/planner/operator/logical_explain.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/operator/logical_limit.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 
 #include <algorithm>
@@ -69,6 +73,7 @@ RecyclerSettings LoadRecyclerSettings(ClientContext &context) {
 	s.blocks = GetBoolSetting(context, "recycler_blocks", s.blocks);
 	s.subtrees = GetBoolSetting(context, "recycler_subtrees", s.subtrees);
 	s.subsumption = GetBoolSetting(context, "recycler_subsumption", s.subsumption);
+	s.pagination = GetBoolSetting(context, "recycler_pagination", s.pagination);
 	s.budget_bytes = GetIntSetting(context, "recycler_budget_mb", s.budget_bytes / (1024 * 1024)) * 1024 * 1024;
 	s.entry_cap_bytes =
 	    GetIntSetting(context, "recycler_entry_cap_mb", s.entry_cap_bytes / (1024 * 1024)) * 1024 * 1024;
@@ -225,6 +230,68 @@ static void WrapMaterialize(unique_ptr<LogicalOperator> &slot, RecyclerWriteSpec
 static bool IsRecyclerOperator(const LogicalOperator &op) {
 	return op.type == LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR &&
 	       (dynamic_cast<const LogicalRecyclerScan *>(&op) || dynamic_cast<const LogicalRecyclerMaterialize *>(&op));
+}
+
+//===----------------------------------------------------------------------===//
+// Pagination: the ordered result a root LIMIT/OFFSET cuts its page from
+//===----------------------------------------------------------------------===//
+//! A LIMIT the optimizer may keep as a LIMIT over a sort. Top-N takes every constant limit of at most 5000 rows
+//! including the offset (TopN::CanOptimize), and only what stays a LIMIT pages through a sorted result.
+static bool IsPaginationLimit(const LogicalLimit &limit) {
+	auto limit_type = limit.limit_val.Type();
+	auto offset_type = limit.offset_val.Type();
+	bool constant_or_unset = (limit_type == LimitNodeType::CONSTANT_VALUE || limit_type == LimitNodeType::UNSET) &&
+	                         (offset_type == LimitNodeType::CONSTANT_VALUE || offset_type == LimitNodeType::UNSET);
+	if (!constant_or_unset) {
+		return false;
+	}
+	if (limit_type == LimitNodeType::UNSET) {
+		// OFFSET without LIMIT is never rewritten to a Top-N
+		return offset_type == LimitNodeType::CONSTANT_VALUE;
+	}
+	idx_t total = limit.limit_val.GetConstantValue();
+	if (offset_type == LimitNodeType::CONSTANT_VALUE) {
+		total += limit.offset_val.GetConstantValue();
+	}
+	return total > 5000;
+}
+
+//! Move a root LIMIT above the projections placed over it (the binder's pruning of ORDER BY columns, the
+//! optimizer's limit pushdown): PROJECTION* -> LIMIT -> X becomes LIMIT -> PROJECTION* -> X, so that the LIMIT's
+//! child produces the query's result columns in both the bound and the optimized plan. A row-wise projection and a
+//! positional limit commute unless the projection evaluates volatile functions (random(), nextval()), whose number
+//! of evaluations is observable. True when the root is a pagination LIMIT afterwards; the caller resolves types.
+static bool HoistPaginationLimit(unique_ptr<LogicalOperator> &root_slot) {
+	auto limit_slot = &root_slot;
+	while ((*limit_slot)->type == LogicalOperatorType::LOGICAL_PROJECTION && (*limit_slot)->children.size() == 1) {
+		for (auto &expr : (*limit_slot)->expressions) {
+			if (expr->IsVolatile()) {
+				return false;
+			}
+		}
+		limit_slot = &(*limit_slot)->children[0];
+	}
+	if ((*limit_slot)->type != LogicalOperatorType::LOGICAL_LIMIT ||
+	    !IsPaginationLimit((*limit_slot)->Cast<LogicalLimit>())) {
+		return false;
+	}
+	if (limit_slot != &root_slot) {
+		auto limit = std::move(*limit_slot);
+		*limit_slot = std::move(limit->children[0]);
+		limit->children[0] = std::move(root_slot);
+		root_slot = std::move(limit);
+	}
+	return true;
+}
+
+//! Estimated rows of a page source: those of the first operator under its projections (a projection moved by limit
+//! pushdown still carries the LIMIT's estimate)
+static idx_t EstimatePageSourceRows(ClientContext &context, LogicalOperator &page) {
+	auto op = &page;
+	while (op->type == LogicalOperatorType::LOGICAL_PROJECTION && op->children.size() == 1) {
+		op = op->children[0].get();
+	}
+	return op->EstimateCardinality(context);
 }
 
 //===----------------------------------------------------------------------===//
@@ -650,13 +717,13 @@ void RecyclerPreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOpera
 		cache.stats.skip_not_query++;
 		return;
 	}
-	auto &root = **root_slot;
-	if (IsModifyingRoot(root.type)) {
+	auto root_type = (*root_slot)->type;
+	if (IsModifyingRoot(root_type)) {
 		cache.stats.skip_modifying++;
 		cache.Clear();
 		return;
 	}
-	if (!IsReadRoot(root.type)) {
+	if (!IsReadRoot(root_type)) {
 		cache.stats.skip_not_read++;
 		return;
 	}
@@ -685,6 +752,10 @@ void RecyclerPreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOpera
 	// with preserve_insertion_order the order of an unordered query's rows is observable, so only results that
 	// were stored in a defined order may be served
 	bool preserve_order = Settings::Get<PreserveInsertionOrderSetting>(context);
+	// a paginated query is keyed and served below its LIMIT, which is first hoisted above the binder's pruning
+	// projection so that its child produces the result columns
+	bool paginated = settings.pagination && HoistPaginationLimit(*root_slot);
+	auto &root = **root_slot;
 
 	PlanSignatures sig(context);
 	try {
@@ -713,10 +784,24 @@ void RecyclerPreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOpera
 		// observable row order, and a serial sink would run the whole pipeline on one thread: neither is acceptable
 		bool writable = root_info.ordered || !preserve_order;
 		if (writable && root_info.est_leaf_rows >= settings.min_input_rows) {
-			client->has_pending_whole = true;
-			client->whole_hash = root_info.hash;
-			client->whole_canonical = sig.Render(root);
-			client->whole_est_input_rows = root_info.est_leaf_rows;
+			client->whole.Request(root_info.hash, sig.Render(root), root_info.est_leaf_rows);
+		}
+	}
+	if (paginated) {
+		// the page source is the complete ordered result the LIMIT/OFFSET cuts its page from, stored as the whole
+		// result of the query without its LIMIT: any later page, and the LIMIT-less query, is served from it
+		auto &page_slot = root.children[0];
+		auto &page_info = sig.Get(*page_slot);
+		if (page_info.Cacheable() && page_info.ordered && page_info.est_leaf_rows >= settings.min_input_rows) {
+			auto entry = cache.Lookup(RecyclerEntryKind::WHOLE_RESULT, page_info.hash,
+			                          [&]() { return sig.Render(*page_slot); });
+			ColumnBindingReplacer replacer;
+			if (entry && entry->ordered && SubstituteScan(page_slot, entry, true, input.optimizer.binder, replacer)) {
+				replacer.VisitOperator(*plan);
+				cache.stats.pagination_hits++;
+			} else if (!cache.IsTooBig(page_info.hash)) {
+				client->page_source.Request(page_info.hash, sig.Render(*page_slot), page_info.est_leaf_rows);
+			}
 		}
 	}
 	if (settings.blocks) {
@@ -922,6 +1007,9 @@ void RecyclerOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator
 		return;
 	}
 	cache->stats.post_calls++;
+	// the optimizer may have pushed the LIMIT of a paginated query below a projection again, or turned it into a
+	// Top-N (then there is no page source to store)
+	bool paginated = client->page_source.requested && HoistPaginationLimit(*root_slot);
 
 	// planted block markers learn which base columns their (now pruned and reordered) child produces
 	BlockFinalizer finalizer;
@@ -945,7 +1033,36 @@ void RecyclerOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator
 		}
 	}
 
-	if (settings.whole_result && client->has_pending_whole && !cache->IsTooBig(client->whole_hash)) {
+	if (paginated && !cache->IsTooBig(client->page_source.hash)) {
+		auto &page_slot = (*root_slot)->children[0];
+		// a scan here means the page was served at the pre hook
+		if (!IsRecyclerOperator(*page_slot)) {
+			auto &page_info = sig.Get(*page_slot);
+			bool admissible = page_info.Cacheable() && page_info.ordered;
+			if (admissible) {
+				// a paginated result is the one whole result that different statements reuse, so it gets the
+				// subtree caps rather than the whole-result cap
+				auto est_out = EstimatePageSourceRows(context, *page_slot);
+				admissible = est_out <= settings.entry_cap_rows &&
+				             est_out * RecyclerEstimateRowWidth(page_slot->types) <= settings.entry_cap_bytes;
+			}
+			if (admissible) {
+				RecyclerWriteSpec spec;
+				spec.kind = RecyclerEntryKind::WHOLE_RESULT;
+				spec.hash = client->page_source.hash;
+				spec.canonical = std::move(client->page_source.canonical);
+				spec.ordered = true;
+				spec.est_input_rows = client->page_source.est_input_rows;
+				spec.cap_rows = settings.entry_cap_rows;
+				spec.cap_bytes = settings.entry_cap_bytes;
+				spec.budget_bytes = settings.budget_bytes;
+				cache->stats.writes_planned++;
+				WrapMaterialize(page_slot, std::move(spec), cache);
+			}
+		}
+	}
+
+	if (settings.whole_result && client->whole.requested && !cache->IsTooBig(client->whole.hash)) {
 		auto &root = **root_slot;
 		bool admissible = !root_info.refused && !root_info.nondeterministic && !root_info.unresolved_delim_get;
 		if (admissible) {
@@ -960,12 +1077,12 @@ void RecyclerOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator
 		if (admissible) {
 			RecyclerWriteSpec spec;
 			spec.kind = RecyclerEntryKind::WHOLE_RESULT;
-			spec.hash = client->whole_hash;
-			spec.canonical = std::move(client->whole_canonical);
-			// an ordered result is written by a serial sink (only the sort's output stage is serialized) and
-			// replayed in that order; anything else is written and replayed in parallel
+			spec.hash = client->whole.hash;
+			spec.canonical = std::move(client->whole.canonical);
+			// an ordered result is written in its order (in parallel when the source hands out batch indexes,
+			// else by a serial sink) and replayed in that order; anything else is written and replayed in parallel
 			spec.ordered = root_info.ordered;
-			spec.est_input_rows = client->whole_est_input_rows;
+			spec.est_input_rows = client->whole.est_input_rows;
 			spec.cap_rows = MinValue<idx_t>(settings.whole_cap_rows, settings.entry_cap_rows);
 			spec.cap_bytes = settings.entry_cap_bytes;
 			spec.budget_bytes = settings.budget_bytes;

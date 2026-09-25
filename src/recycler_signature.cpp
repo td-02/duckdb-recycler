@@ -874,9 +874,15 @@ void PlanSignatures::Compute(LogicalOperator &op) {
 	case LogicalOperatorType::LOGICAL_CHUNK_GET:
 	case LogicalOperatorType::LOGICAL_EXPRESSION_GET:
 	case LogicalOperatorType::LOGICAL_DUMMY_SCAN:
-	case LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR:
 		info.est_leaf_rows += op.EstimateCardinality(context);
 		break;
+	case LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR: {
+		info.est_leaf_rows += op.EstimateCardinality(context);
+		// a scan of an ordered entry replays it in the stored order
+		auto scan = dynamic_cast<const LogicalRecyclerScan *>(&op);
+		info.ordered = scan && scan->ordered;
+		break;
+	}
 	case LogicalOperatorType::LOGICAL_DELIM_GET:
 		info.delim_gets++;
 		info.unresolved_delim_get = true;
