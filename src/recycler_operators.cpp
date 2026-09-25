@@ -14,12 +14,21 @@ namespace duckdb {
 //===----------------------------------------------------------------------===//
 class RecyclerScanGlobalState : public GlobalSourceState {
 public:
-	RecyclerScanGlobalState(const ColumnDataCollection &collection, bool ordered)
+	//! `column_ids` empty = scan all columns
+	RecyclerScanGlobalState(const ColumnDataCollection &collection, bool ordered, const vector<column_t> &column_ids)
 	    : ordered(ordered), max_threads(ordered ? 1 : MaxValue<idx_t>(collection.ChunkCount(), 1)) {
 		if (ordered) {
-			collection.InitializeScan(sequential_state);
+			if (column_ids.empty()) {
+				collection.InitializeScan(sequential_state);
+			} else {
+				collection.InitializeScan(sequential_state, column_ids);
+			}
 		} else {
-			collection.InitializeScan(parallel_state);
+			if (column_ids.empty()) {
+				collection.InitializeScan(parallel_state);
+			} else {
+				collection.InitializeScan(parallel_state, column_ids);
+			}
 		}
 	}
 
@@ -54,15 +63,21 @@ static SourceResultType ScanCollection(const ColumnDataCollection &collection, D
 // LogicalRecyclerScan
 //===----------------------------------------------------------------------===//
 LogicalRecyclerScan::LogicalRecyclerScan(idx_t table_index, vector<LogicalType> types_p, shared_ptr<CachedEntry> entry_p,
-                                         bool ordered)
+                                         bool ordered, vector<column_t> column_ids_p)
     : LogicalExtensionOperator(), table_index(table_index), scan_types(std::move(types_p)), entry(std::move(entry_p)),
-      ordered(ordered) {
+      ordered(ordered), column_ids(std::move(column_ids_p)) {
+	if (column_ids.empty()) {
+		for (idx_t i = 0; i < scan_types.size(); i++) {
+			column_ids.push_back(i);
+		}
+	}
+	D_ASSERT(column_ids.size() == scan_types.size());
 	SetEstimatedCardinality(entry->rows);
 }
 
 PhysicalOperator &LogicalRecyclerScan::CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) {
 	D_ASSERT(children.empty());
-	return planner.Make<PhysicalRecyclerScan>(types, entry->rows, entry, ordered);
+	return planner.Make<PhysicalRecyclerScan>(types, entry->rows, entry, ordered, column_ids);
 }
 
 string LogicalRecyclerScan::GetExtensionName() const {
@@ -79,6 +94,7 @@ InsertionOrderPreservingMap<string> LogicalRecyclerScan::ParamsToString() const 
 	result["Key"] = entry->hash.ToString();
 	result["Rows"] = to_string(entry->rows);
 	result["Ordered"] = ordered ? "true" : "false";
+	result["Columns"] = to_string(column_ids.size()) + "/" + to_string(entry->types.size());
 	return result;
 }
 
@@ -91,7 +107,7 @@ vector<idx_t> LogicalRecyclerScan::GetTableIndex() const {
 }
 
 unique_ptr<LogicalOperator> LogicalRecyclerScan::Copy(ClientContext &context) const {
-	auto result = make_uniq<LogicalRecyclerScan>(table_index, scan_types, entry, ordered);
+	auto result = make_uniq<LogicalRecyclerScan>(table_index, scan_types, entry, ordered, column_ids);
 	result->types = types;
 	return std::move(result);
 }
@@ -108,9 +124,10 @@ void LogicalRecyclerScan::ResolveTypes() {
 // PhysicalRecyclerScan
 //===----------------------------------------------------------------------===//
 PhysicalRecyclerScan::PhysicalRecyclerScan(PhysicalPlan &physical_plan, vector<LogicalType> types_p,
-                                           idx_t estimated_cardinality, shared_ptr<CachedEntry> entry_p, bool ordered)
+                                           idx_t estimated_cardinality, shared_ptr<CachedEntry> entry_p, bool ordered,
+                                           vector<column_t> column_ids_p)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types_p), estimated_cardinality),
-      entry(std::move(entry_p)), ordered(ordered) {
+      entry(std::move(entry_p)), ordered(ordered), column_ids(std::move(column_ids_p)) {
 }
 
 string PhysicalRecyclerScan::GetName() const {
@@ -127,7 +144,7 @@ InsertionOrderPreservingMap<string> PhysicalRecyclerScan::ParamsToString() const
 }
 
 unique_ptr<GlobalSourceState> PhysicalRecyclerScan::GetGlobalSourceState(ClientContext &context) const {
-	return make_uniq<RecyclerScanGlobalState>(*entry->data, ordered);
+	return make_uniq<RecyclerScanGlobalState>(*entry->data, ordered, column_ids);
 }
 
 unique_ptr<LocalSourceState> PhysicalRecyclerScan::GetLocalSourceState(ExecutionContext &context,
@@ -188,6 +205,9 @@ vector<idx_t> LogicalRecyclerMaterialize::GetTableIndex() const {
 
 unique_ptr<LogicalOperator> LogicalRecyclerMaterialize::Copy(ClientContext &context) const {
 	auto result = make_uniq<LogicalRecyclerMaterialize>(spec, cache, children[0]->Copy(context));
+	for (auto &expr : expressions) {
+		result->expressions.push_back(expr->Copy());
+	}
 	result->types = types;
 	return std::move(result);
 }
@@ -298,14 +318,21 @@ SinkFinalizeType PhysicalRecyclerMaterialize::Finalize(Pipeline &pipeline, Event
 	entry->bytes = bytes;
 	entry->ordered = spec.ordered;
 	entry->est_input_rows = spec.est_input_rows;
-	cache->Store(std::move(entry), spec.budget_bytes);
+	if (spec.kind == RecyclerEntryKind::BLOCK) {
+		entry->columns = spec.columns;
+		entry->constraints = spec.constraints;
+		entry->conjuncts = spec.conjuncts;
+		cache->StoreBlock(std::move(entry), spec.budget_bytes);
+	} else {
+		cache->Store(std::move(entry), spec.budget_bytes);
+	}
 	return SinkFinalizeType::READY;
 }
 
 unique_ptr<GlobalSourceState> PhysicalRecyclerMaterialize::GetGlobalSourceState(ClientContext &context) const {
 	D_ASSERT(sink_state);
 	auto &gstate = sink_state->Cast<RecyclerMaterializeGlobalSinkState>();
-	return make_uniq<RecyclerScanGlobalState>(*gstate.collection, spec.ordered);
+	return make_uniq<RecyclerScanGlobalState>(*gstate.collection, spec.ordered, vector<column_t>());
 }
 
 unique_ptr<LocalSourceState> PhysicalRecyclerMaterialize::GetLocalSourceState(ExecutionContext &context,

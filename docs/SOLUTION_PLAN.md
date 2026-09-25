@@ -11,8 +11,15 @@ pre-optimize hook, nested-block matching, post-optimize subtree cache with the d
 budget/eviction, invalidation, settings, `recycler_stats()`/`recycler_entries()`, SQL tests, differential harness).
 Measured on the local machine (6 threads, hot cache, `make benchmark`): **geomean 14.9 ms vs 30.65 ms vanilla**
 (2.1x; 14.9–15.8 ms across runs), total 15.6 s vs 20.2 s; `IMDB_DATA=1 make test` passes and `scripts/recycler_diff.py` matches vanilla for all
-149 queries in filename, reverse and shuffled order. Deferred to follow-up PRs: predicate subsumption (M5), ordered
-pagination replay (M6), union-projection widening for the Family A sub-groups (M7), batch-index sink mode.
+149 queries in filename, reverse and shuffled order.
+
+M5 (predicate subsumption, 2026-09-25): implemented as pre-optimize *block shapes* (structure minus range predicates
+on base columns, columns by physical id), planted `RECYCLER_MATERIALIZE` markers whose constrained columns are kept
+alive through column pruning, post-optimize resolution of the stored columns' identities (seeing through DuckDB's
+compress/decompress projections), and consumer rewrites to a column-subset `RECYCLER_SCAN` plus a residual filter.
+Measured: **geomean 9.24 ms** (vs 14.9 ms after M0–M4, 30.65 ms vanilla), total 11.9 s; all 149 answers match vanilla in
+three query orders (21–38 subsumption hits per run depending on order). Deferred: ordered pagination replay (M6),
+union-projection widening (M7), batch-index sink mode.
 
 ## 0. Decision in one paragraph
 

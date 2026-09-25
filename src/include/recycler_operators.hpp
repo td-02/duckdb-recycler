@@ -24,12 +24,15 @@ class PhysicalPlanGenerator;
 //===----------------------------------------------------------------------===//
 class LogicalRecyclerScan : public LogicalExtensionOperator {
 public:
-	LogicalRecyclerScan(idx_t table_index, vector<LogicalType> types, shared_ptr<CachedEntry> entry, bool ordered);
+	//! `column_ids` selects the stored columns to emit (empty = all, in stored order); `types` are their types
+	LogicalRecyclerScan(idx_t table_index, vector<LogicalType> types, shared_ptr<CachedEntry> entry, bool ordered,
+	                    vector<column_t> column_ids = vector<column_t>());
 
 	idx_t table_index;
 	vector<LogicalType> scan_types;
 	shared_ptr<CachedEntry> entry;
 	bool ordered;
+	vector<column_t> column_ids;
 
 public:
 	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override;
@@ -53,10 +56,11 @@ public:
 	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::INVALID;
 
 	PhysicalRecyclerScan(PhysicalPlan &physical_plan, vector<LogicalType> types, idx_t estimated_cardinality,
-	                     shared_ptr<CachedEntry> entry, bool ordered);
+	                     shared_ptr<CachedEntry> entry, bool ordered, vector<column_t> column_ids);
 
 	shared_ptr<CachedEntry> entry;
 	bool ordered;
+	vector<column_t> column_ids;
 
 public:
 	string GetName() const override;
@@ -91,6 +95,12 @@ struct RecyclerWriteSpec {
 	idx_t cap_rows = 0;
 	idx_t cap_bytes = 0;
 	idx_t budget_bytes = 0;
+	//! BLOCK writes: the block's constraints and conjunct renderings (from the pre hook), the table_index ->
+	//! canonical id map used to resolve column identities, and the identities themselves (filled by the post hook)
+	vector<RangeConstraint> constraints;
+	vector<string> conjuncts;
+	std::unordered_map<idx_t, idx_t> table_ids;
+	vector<ColumnIdentity> columns;
 };
 
 class LogicalRecyclerMaterialize : public LogicalExtensionOperator {

@@ -8,6 +8,8 @@ const char *RecyclerEntryKindName(RecyclerEntryKind kind) {
 		return "whole_result";
 	case RecyclerEntryKind::SUBTREE:
 		return "subtree";
+	case RecyclerEntryKind::BLOCK:
+		return "block";
 	default:
 		return "unknown";
 	}
@@ -47,23 +49,74 @@ shared_ptr<CachedEntry> RecyclerCache::Lookup(RecyclerEntryKind kind, const SigH
 		stats.misses++;
 		return nullptr;
 	}
-	candidate->hits++;
-	candidate->last_used = NextSequence();
+	NoteHit(*candidate);
 	return candidate;
+}
+
+void RecyclerCache::NoteHit(CachedEntry &entry) {
+	entry.hits++;
+	entry.last_used = NextSequence();
 }
 
 shared_ptr<CachedEntry> RecyclerCache::PickVictim() const {
 	shared_ptr<CachedEntry> victim;
+	auto consider = [&](const shared_ptr<CachedEntry> &candidate) {
+		if (!victim || candidate->Benefit() < victim->Benefit() ||
+		    (candidate->Benefit() == victim->Benefit() && candidate->last_used < victim->last_used)) {
+			victim = candidate;
+		}
+	};
 	for (auto *map : {&whole, &subtrees}) {
 		for (auto &entry : *map) {
-			auto &candidate = entry.second;
-			if (!victim || candidate->Benefit() < victim->Benefit() ||
-			    (candidate->Benefit() == victim->Benefit() && candidate->last_used < victim->last_used)) {
-				victim = candidate;
-			}
+			consider(entry.second);
+		}
+	}
+	for (auto &shape : blocks) {
+		for (auto &entry : shape.second) {
+			consider(entry);
 		}
 	}
 	return victim;
+}
+
+void RecyclerCache::Erase(const CachedEntry &entry) {
+	if (entry.kind == RecyclerEntryKind::BLOCK) {
+		auto shape = blocks.find(entry.hash);
+		if (shape != blocks.end()) {
+			auto &list = shape->second;
+			for (idx_t i = 0; i < list.size(); i++) {
+				if (list[i].get() == &entry) {
+					list.erase(list.begin() + static_cast<int64_t>(i));
+					break;
+				}
+			}
+			if (list.empty()) {
+				blocks.erase(shape);
+			}
+		}
+	} else {
+		Map(entry.kind).erase(entry.hash);
+	}
+	total_bytes -= MinValue<idx_t>(total_bytes, entry.bytes);
+	stats.evictions++;
+}
+
+bool RecyclerCache::MakeRoom(const CachedEntry &entry, idx_t budget_bytes) {
+	if (entry.bytes > budget_bytes) {
+		return false;
+	}
+	while (total_bytes + entry.bytes > budget_bytes) {
+		auto victim = PickVictim();
+		if (!victim) {
+			break;
+		}
+		if (victim->Benefit() > entry.Benefit()) {
+			// the cache is full of more valuable results
+			return false;
+		}
+		Erase(*victim);
+	}
+	return true;
 }
 
 bool RecyclerCache::Store(shared_ptr<CachedEntry> entry, idx_t budget_bytes) {
@@ -74,23 +127,9 @@ bool RecyclerCache::Store(shared_ptr<CachedEntry> entry, idx_t budget_bytes) {
 		stats.store_rejected++;
 		return false;
 	}
-	if (entry->bytes > budget_bytes) {
+	if (!MakeRoom(*entry, budget_bytes)) {
 		stats.store_rejected++;
 		return false;
-	}
-	while (total_bytes + entry->bytes > budget_bytes) {
-		auto victim = PickVictim();
-		if (!victim) {
-			break;
-		}
-		if (victim->Benefit() > entry->Benefit()) {
-			// the cache is full of more valuable results
-			stats.store_rejected++;
-			return false;
-		}
-		Map(victim->kind).erase(victim->hash);
-		total_bytes -= MinValue<idx_t>(total_bytes, victim->bytes);
-		stats.evictions++;
 	}
 	entry->last_used = NextSequence();
 	total_bytes += entry->bytes;
@@ -103,10 +142,44 @@ bool RecyclerCache::Store(shared_ptr<CachedEntry> entry, idx_t budget_bytes) {
 	return true;
 }
 
+bool RecyclerCache::StoreBlock(shared_ptr<CachedEntry> entry, idx_t budget_bytes) {
+	std::lock_guard<std::mutex> guard(lock);
+	auto &list = blocks[entry->hash];
+	for (auto &existing : list) {
+		if (existing->canonical == entry->canonical && existing->conjuncts == entry->conjuncts &&
+		    existing->columns == entry->columns) {
+			stats.store_rejected++;
+			return false;
+		}
+	}
+	if (!MakeRoom(*entry, budget_bytes)) {
+		if (list.empty()) {
+			blocks.erase(entry->hash);
+		}
+		stats.store_rejected++;
+		return false;
+	}
+	entry->last_used = NextSequence();
+	total_bytes += entry->bytes;
+	blocks[entry->hash].push_back(entry);
+	stats.block_stores++;
+	return true;
+}
+
+vector<shared_ptr<CachedEntry>> RecyclerCache::LookupBlocks(const SigHash &hash) const {
+	std::lock_guard<std::mutex> guard(lock);
+	auto shape = blocks.find(hash);
+	if (shape == blocks.end()) {
+		return {};
+	}
+	return shape->second;
+}
+
 void RecyclerCache::Clear() {
 	std::lock_guard<std::mutex> guard(lock);
 	whole.clear();
 	subtrees.clear();
+	blocks.clear();
 	seen.clear();
 	too_big.clear();
 	total_bytes = 0;
@@ -142,7 +215,11 @@ idx_t RecyclerCache::TotalBytes() const {
 
 idx_t RecyclerCache::EntryCount() const {
 	std::lock_guard<std::mutex> guard(lock);
-	return whole.size() + subtrees.size();
+	idx_t count = whole.size() + subtrees.size();
+	for (auto &shape : blocks) {
+		count += shape.second.size();
+	}
+	return count;
 }
 
 vector<shared_ptr<CachedEntry>> RecyclerCache::Entries() const {
@@ -151,6 +228,11 @@ vector<shared_ptr<CachedEntry>> RecyclerCache::Entries() const {
 	for (auto *map : {&whole, &subtrees}) {
 		for (auto &entry : *map) {
 			result.push_back(entry.second);
+		}
+	}
+	for (auto &shape : blocks) {
+		for (auto &entry : shape.second) {
+			result.push_back(entry);
 		}
 	}
 	return result;
