@@ -164,6 +164,15 @@ optimizer extension with two hooks (`src/recycler_hooks.cpp`):
   `RECYCLER_MATERIALIZE` that stores the result while re-emitting it, one per root-to-leaf path. The
   complete query result is stored too, in the order it was produced.
 
+* **Predicate subsumption** (M5). At the pre-optimize hook every multi-table FROM/WHERE block gets a *shape*:
+  its structure with columns rendered by physical id and with range predicates on base columns
+  (`col <op> constant`, `BETWEEN`, `IS NOT NULL`) lifted out as constraints. The first query with a shape plants
+  a `RECYCLER_MATERIALIZE` marker that stores the block's rows (its constrained columns are kept alive through
+  column pruning). A later block with the same shape whose constraints imply the stored ones, and whose needed
+  columns are all stored, is replaced by a column-subset `RECYCLER_SCAN` plus a residual filter with its own
+  predicates (e.g. `production_year IS NOT NULL` stored, `BETWEEN 1998 AND 2003` served). Active only when
+  `preserve_insertion_order` is false; `SET recycler_subsumption = false` disables it.
+
 Correctness rules: results are keyed on the exact bound/optimized structure including types; subtrees with
 volatile functions, parameters, table functions, LIMIT without ORDER BY, runtime (dynamic) filters owned
 outside the subtree, or references into a delim join's other side are never cached; any statement that
@@ -171,7 +180,7 @@ modifies data or the catalog clears the cache, and nothing is cached or served i
 has written. Cached collections are buffer-managed and bounded by `recycler_budget_mb` with
 benefit-density eviction.
 
-Settings: `recycler_enabled`, `recycler_whole_result`, `recycler_blocks`, `recycler_subtrees`,
+Settings: `recycler_enabled`, `recycler_whole_result`, `recycler_blocks`, `recycler_subtrees`, `recycler_subsumption`,
 `recycler_budget_mb`, `recycler_entry_cap_mb`, `recycler_entry_cap_rows`, `recycler_min_input_rows`,
 `recycler_speculate_mb`. Introspection: `SELECT * FROM recycler_stats()`, `SELECT * FROM recycler_entries()`,
 `PRAGMA recycler_clear`. Tests: `test/sql/recycler/`. Differential check against vanilla over the whole

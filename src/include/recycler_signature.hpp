@@ -14,9 +14,18 @@
 //
 // The renderer is an allowlist: any operator or expression class it does not
 // understand marks the subtree (and all of its ancestors) as not cacheable.
+//
+// The same renderer has a "shape" mode for SPJ blocks (a FILTER over joins
+// and scans on the bound plan): column references are rendered by physical
+// column id instead of position, scans do not list their columns, and range
+// predicates on base columns are lifted out of the block-root filter as
+// parameters. Two blocks with the same shape can share a result when one's
+// parameters imply the other's (predicate subsumption) and the needed columns
+// are present (column subsumption).
 //===----------------------------------------------------------------------===//
-#include "duckdb/planner/logical_operator.hpp"
+#include "duckdb/common/types/value.hpp"
 #include "duckdb/planner/column_binding.hpp"
+#include "duckdb/planner/logical_operator.hpp"
 
 #include <string>
 #include <unordered_map>
@@ -27,6 +36,7 @@ namespace duckdb {
 class ClientContext;
 class Expression;
 class LogicalComparisonJoin;
+class LogicalGet;
 
 //! 128-bit compositional hash of a subtree
 struct SigHash {
@@ -82,10 +92,51 @@ struct NodeInfo {
 	}
 };
 
+//! A base-table column: block-relative canonical table id plus the physical column id in that table
+struct ColumnIdentity {
+	idx_t table = DConstants::INVALID_INDEX;
+	idx_t column = DConstants::INVALID_INDEX;
+
+	bool IsValid() const {
+		return table != DConstants::INVALID_INDEX;
+	}
+	bool operator==(const ColumnIdentity &other) const {
+		return table == other.table && column == other.column;
+	}
+};
+
+//! A block-root conjunct of the form `column <op> constant` or `column IS NOT NULL` over a base column
+struct RangeConstraint {
+	ColumnIdentity column;
+	//! COMPARE_EQUAL / COMPARE_GREATERTHAN / COMPARE_GREATERTHANOREQUALTO / COMPARE_LESSTHAN /
+	//! COMPARE_LESSTHANOREQUALTO or OPERATOR_IS_NOT_NULL
+	ExpressionType op = ExpressionType::INVALID;
+	//! The constant, cast to the column's type (NULL for IS NOT NULL)
+	Value value;
+};
+
+//! Normal form of an SPJ block for subsumption matching
+struct BlockShape {
+	bool ok = false;
+	SigHash hash;
+	//! Structure without the parameterized conjuncts, columns rendered by physical id
+	string canonical;
+	//! Canonical rendering of every block-root conjunct, index-aligned with the FILTER's expressions
+	vector<string> conjuncts;
+	vector<bool> is_constraint;
+	vector<RangeConstraint> constraints;
+	//! table_index -> block-relative canonical id
+	std::unordered_map<idx_t, idx_t> table_ids;
+	//! Identity of each output binding of the block root (invalid when it is not a plain base column)
+	vector<ColumnIdentity> output;
+	idx_t est_leaf_rows = 0;
+	idx_t joins = 0;
+};
+
 //! Analyzes a plan once and exposes per-node signatures
 class PlanSignatures {
 public:
-	explicit PlanSignatures(ClientContext &context);
+	explicit PlanSignatures(ClientContext &context, bool shape_mode = false);
 
 	//! Analyze the plan rooted at root (assigns canonical ids, computes NodeInfo for every node)
 	void Analyze(LogicalOperator &root);
@@ -99,12 +150,15 @@ public:
 	class StringSink;
 
 private:
+	friend BlockShape ComputeBlockShape(ClientContext &context, const LogicalOperator &root,
+	                                    const PlanSignatures &plan_info);
+
 	struct Frame {
 		idx_t start;
 		idx_t count;
 	};
 
-	void AssignIds(LogicalOperator &op);
+	void AssignIds(const LogicalOperator &op);
 	void Compute(LogicalOperator &op);
 	void RenderNode(const LogicalOperator &op, const Frame &frame, Sink &sink, NodeInfo &info,
 	                bool render_children) const;
@@ -113,17 +167,38 @@ private:
 	void RenderOwnIndex(idx_t table_index, const Frame &frame, Sink &sink) const;
 	void RenderJoin(const LogicalComparisonJoin &join, const Frame &frame, Sink &sink, NodeInfo &info) const;
 	void CollectDynamicOwners(const LogicalOperator &op);
+	//! Identity of a binding that refers to a scan of the analyzed (sub)tree
+	ColumnIdentity IdentityOf(ColumnBinding binding) const;
+	//! Recognize `column <op> constant` / `column IS NOT NULL` conjuncts over base columns
+	bool TryParseConstraint(const Expression &expr, vector<RangeConstraint> &out) const;
 
 private:
 	ClientContext &context;
+	//! Shape mode: block normal form (see file comment)
+	const bool shape_mode;
+	const LogicalOperator *block_root = nullptr;
+	//! Sorted canonical strings of the block root's non-parameterized conjuncts
+	vector<string> root_conjuncts;
 	//! table_index -> canonical id
 	std::unordered_map<idx_t, idx_t> ids;
 	idx_t next_id = 0;
+	//! table_index -> scan (shape mode: to render column references by physical id)
+	std::unordered_map<idx_t, const LogicalGet *> gets;
+	idx_t joins = 0;
 	//! node -> info
 	std::unordered_map<const LogicalOperator *, NodeInfo> infos;
 	//! DynamicTableFilterSet* -> owning join operator
 	std::unordered_map<const void *, const LogicalOperator *> dynamic_owners;
 };
+
+//! Compute the shape of the SPJ block rooted at `root` (a LOGICAL_FILTER on the bound plan); `plan_info` is the
+//! normal-mode analysis of the plan containing it. Returns ok=false when the block is not self-contained, has no
+//! joins, or contains anything the renderer refuses.
+BlockShape ComputeBlockShape(ClientContext &context, const LogicalOperator &root, const PlanSignatures &plan_info);
+
+//! True when every cached constraint is implied by the query's constraints, i.e. every row that satisfies the query's
+//! predicates also satisfies the cached ones (so the query's rows are a subset of the cached rows)
+bool RangeConstraintsImply(const vector<RangeConstraint> &query, const vector<RangeConstraint> &cached);
 
 //! Estimated bytes per row for a type list (fixed widths, allowance for strings)
 idx_t RecyclerEstimateRowWidth(const vector<LogicalType> &types);

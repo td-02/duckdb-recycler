@@ -10,6 +10,7 @@
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/types/column/column_data_scan_states.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
+#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/operator/join/join_filter_pushdown.hpp"
 #include "duckdb/function/function.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -46,6 +47,7 @@
 #include "duckdb/planner/operator/logical_top_n.hpp"
 #include "duckdb/planner/table_filter.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 
@@ -188,7 +190,7 @@ idx_t RecyclerEstimateRowWidth(const vector<LogicalType> &types) {
 //===----------------------------------------------------------------------===//
 // PlanSignatures
 //===----------------------------------------------------------------------===//
-PlanSignatures::PlanSignatures(ClientContext &context) : context(context) {
+PlanSignatures::PlanSignatures(ClientContext &context, bool shape_mode) : context(context), shape_mode(shape_mode) {
 }
 
 const NodeInfo &PlanSignatures::Get(const LogicalOperator &op) const {
@@ -202,8 +204,10 @@ const NodeInfo &PlanSignatures::Get(const LogicalOperator &op) const {
 void PlanSignatures::Analyze(LogicalOperator &root) {
 	ids.clear();
 	infos.clear();
+	gets.clear();
 	dynamic_owners.clear();
 	next_id = 0;
+	joins = 0;
 	CollectDynamicOwners(root);
 	AssignIds(root);
 	Compute(root);
@@ -224,9 +228,16 @@ void PlanSignatures::CollectDynamicOwners(const LogicalOperator &op) {
 	}
 }
 
-void PlanSignatures::AssignIds(LogicalOperator &op) {
+void PlanSignatures::AssignIds(const LogicalOperator &op) {
 	auto &info = infos[&op];
 	info.start = next_id;
+	if (op.type == LogicalOperatorType::LOGICAL_GET) {
+		gets[op.Cast<LogicalGet>().table_index] = &op.Cast<LogicalGet>();
+	}
+	if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN || op.type == LogicalOperatorType::LOGICAL_DELIM_JOIN ||
+	    op.type == LogicalOperatorType::LOGICAL_ANY_JOIN || op.type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT) {
+		joins++;
+	}
 	if (op.type == LogicalOperatorType::LOGICAL_EMPTY_RESULT) {
 		auto &empty = op.Cast<LogicalEmptyResult>();
 		for (auto &binding : empty.bindings) {
@@ -265,9 +276,36 @@ void PlanSignatures::RenderBinding(ColumnBinding binding, const Frame &frame, Si
 		sink.U64(binding.column_index);
 		return;
 	}
+	if (shape_mode) {
+		auto get = gets.find(binding.table_index);
+		if (get != gets.end()) {
+			auto &column_ids = get->second->GetColumnIds();
+			sink.Tag("P");
+			sink.U64(entry->second - frame.start);
+			sink.U64(binding.column_index < column_ids.size() ? column_ids[binding.column_index].GetPrimaryIndex()
+			                                                   : DConstants::INVALID_INDEX);
+			return;
+		}
+	}
 	sink.Tag("B");
 	sink.U64(entry->second - frame.start);
 	sink.U64(binding.column_index);
+}
+
+ColumnIdentity PlanSignatures::IdentityOf(ColumnBinding binding) const {
+	ColumnIdentity result;
+	auto id = ids.find(binding.table_index);
+	auto get = gets.find(binding.table_index);
+	if (id == ids.end() || get == gets.end()) {
+		return result;
+	}
+	auto &column_ids = get->second->GetColumnIds();
+	if (binding.column_index >= column_ids.size()) {
+		return result;
+	}
+	result.table = id->second;
+	result.column = column_ids[binding.column_index].GetPrimaryIndex();
+	return result;
 }
 
 static void RenderColumnIndex(const ColumnIndex &index, PlanSignatures::Sink &sink) {
@@ -472,13 +510,16 @@ void PlanSignatures::RenderNode(const LogicalOperator &op, const Frame &frame, S
 		sink.Str(table->catalog.GetName());
 		sink.Str(table->schema.name);
 		sink.Str(table->name);
-		sink.U64(get.GetColumnIds().size());
-		for (auto &col : get.GetColumnIds()) {
-			RenderColumnIndex(col, sink);
-		}
-		sink.U64(get.projection_ids.size());
-		for (auto idx : get.projection_ids) {
-			sink.U64(idx);
+		if (!shape_mode) {
+			// the shape of a block does not depend on which columns a query happens to reference
+			sink.U64(get.GetColumnIds().size());
+			for (auto &col : get.GetColumnIds()) {
+				RenderColumnIndex(col, sink);
+			}
+			sink.U64(get.projection_ids.size());
+			for (auto idx : get.projection_ids) {
+				sink.U64(idx);
+			}
 		}
 		sink.U64(get.table_filters.filters.size());
 		for (auto &entry : get.table_filters.filters) {
@@ -563,9 +604,17 @@ void PlanSignatures::RenderNode(const LogicalOperator &op, const Frame &frame, S
 	}
 	case LogicalOperatorType::LOGICAL_FILTER: {
 		auto &filter = op.Cast<LogicalFilter>();
-		sink.U64(filter.expressions.size());
-		for (auto &expr : filter.expressions) {
-			RenderExpression(*expr, frame, sink, info);
+		if (shape_mode && &op == block_root) {
+			// the parameterized conjuncts are the block's constraints, not part of its shape
+			sink.U64(root_conjuncts.size());
+			for (auto &conjunct : root_conjuncts) {
+				sink.Str(conjunct);
+			}
+		} else {
+			sink.U64(filter.expressions.size());
+			for (auto &expr : filter.expressions) {
+				RenderExpression(*expr, frame, sink, info);
+			}
 		}
 		sink.U64(filter.projection_map.size());
 		for (auto idx : filter.projection_map) {
@@ -745,6 +794,11 @@ void PlanSignatures::RenderNode(const LogicalOperator &op, const Frame &frame, S
 		break;
 	}
 	case LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR: {
+		if (dynamic_cast<const LogicalRecyclerMaterialize *>(&op)) {
+			// a planted block marker is a transparent wrapper around its child
+			sink.Tag("RMAT");
+			break;
+		}
 		auto scan = dynamic_cast<const LogicalRecyclerScan *>(&op);
 		if (!scan) {
 			Refuse(info, "foreign extension operator");
@@ -752,6 +806,10 @@ void PlanSignatures::RenderNode(const LogicalOperator &op, const Frame &frame, S
 		}
 		RenderOwnIndex(scan->table_index, frame, sink);
 		sink.Hash(scan->entry->hash);
+		sink.U64(scan->column_ids.size());
+		for (auto col : scan->column_ids) {
+			sink.U64(col);
+		}
 		break;
 	}
 	case LogicalOperatorType::LOGICAL_SAMPLE:
@@ -762,11 +820,13 @@ void PlanSignatures::RenderNode(const LogicalOperator &op, const Frame &frame, S
 		Refuse(info, "unsupported operator");
 		break;
 	}
-	// output types
-	sink.Tag("T");
-	sink.U64(op.types.size());
-	for (auto &type : op.types) {
-		sink.Str(type.ToString());
+	// output types (a block's output columns depend on what the query references, so not in shape mode)
+	if (!shape_mode) {
+		sink.Tag("T");
+		sink.U64(op.types.size());
+		for (auto &type : op.types) {
+			sink.Str(type.ToString());
+		}
 	}
 	// children
 	sink.U64(op.children.size());
@@ -887,6 +947,256 @@ string PlanSignatures::Render(const LogicalOperator &op) const {
 	NodeInfo scratch;
 	RenderNode(op, frame, sink, scratch, true);
 	return result;
+}
+
+//===----------------------------------------------------------------------===//
+// Block shapes and range constraints
+//===----------------------------------------------------------------------===//
+static bool IsRangeComparison(ExpressionType type) {
+	switch (type) {
+	case ExpressionType::COMPARE_EQUAL:
+	case ExpressionType::COMPARE_GREATERTHAN:
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+	case ExpressionType::COMPARE_LESSTHAN:
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static ExpressionType FlipRangeComparison(ExpressionType type) {
+	switch (type) {
+	case ExpressionType::COMPARE_GREATERTHAN:
+		return ExpressionType::COMPARE_LESSTHAN;
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+		return ExpressionType::COMPARE_LESSTHANOREQUALTO;
+	case ExpressionType::COMPARE_LESSTHAN:
+		return ExpressionType::COMPARE_GREATERTHAN;
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+		return ExpressionType::COMPARE_GREATERTHANOREQUALTO;
+	default:
+		return type;
+	}
+}
+
+//! Fold a constant expression (constants may still carry unfolded casts on the bound plan)
+static bool TryFoldConstant(ClientContext &context, const Expression &expr, const LogicalType &target, Value &result) {
+	if (!expr.IsFoldable() || expr.HasParameter()) {
+		return false;
+	}
+	Value value;
+	if (!ExpressionExecutor::TryEvaluateScalar(context, expr, value) || value.IsNull()) {
+		return false;
+	}
+	try {
+		result = value.DefaultCastAs(target);
+	} catch (std::exception &) {
+		return false;
+	}
+	return !result.IsNull();
+}
+
+bool PlanSignatures::TryParseConstraint(const Expression &expr, vector<RangeConstraint> &out) const {
+	switch (expr.GetExpressionClass()) {
+	case ExpressionClass::BOUND_COMPARISON: {
+		if (!IsRangeComparison(expr.GetExpressionType())) {
+			return false;
+		}
+		auto &cmp = expr.Cast<BoundComparisonExpression>();
+		const Expression *column = nullptr;
+		const Expression *constant = nullptr;
+		auto op = expr.GetExpressionType();
+		if (cmp.left->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+			column = cmp.left.get();
+			constant = cmp.right.get();
+		} else if (cmp.right->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+			column = cmp.right.get();
+			constant = cmp.left.get();
+			op = FlipRangeComparison(op);
+		} else {
+			return false;
+		}
+		auto &ref = column->Cast<BoundColumnRefExpression>();
+		auto identity = IdentityOf(ref.binding);
+		if (!identity.IsValid() || ref.depth != 0) {
+			return false;
+		}
+		RangeConstraint constraint;
+		if (!TryFoldConstant(context, *constant, ref.return_type, constraint.value)) {
+			return false;
+		}
+		constraint.column = identity;
+		constraint.op = op;
+		out.push_back(std::move(constraint));
+		return true;
+	}
+	case ExpressionClass::BOUND_OPERATOR: {
+		if (expr.GetExpressionType() != ExpressionType::OPERATOR_IS_NOT_NULL) {
+			return false;
+		}
+		auto &oper = expr.Cast<BoundOperatorExpression>();
+		if (oper.children.size() != 1 || oper.children[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+			return false;
+		}
+		auto &ref = oper.children[0]->Cast<BoundColumnRefExpression>();
+		auto identity = IdentityOf(ref.binding);
+		if (!identity.IsValid() || ref.depth != 0) {
+			return false;
+		}
+		RangeConstraint constraint;
+		constraint.column = identity;
+		constraint.op = ExpressionType::OPERATOR_IS_NOT_NULL;
+		out.push_back(std::move(constraint));
+		return true;
+	}
+	case ExpressionClass::BOUND_BETWEEN: {
+		auto &between = expr.Cast<BoundBetweenExpression>();
+		if (between.input->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+			return false;
+		}
+		auto &ref = between.input->Cast<BoundColumnRefExpression>();
+		auto identity = IdentityOf(ref.binding);
+		if (!identity.IsValid() || ref.depth != 0) {
+			return false;
+		}
+		RangeConstraint lower;
+		RangeConstraint upper;
+		if (!TryFoldConstant(context, *between.lower, ref.return_type, lower.value) ||
+		    !TryFoldConstant(context, *between.upper, ref.return_type, upper.value)) {
+			return false;
+		}
+		lower.column = identity;
+		lower.op = between.lower_inclusive ? ExpressionType::COMPARE_GREATERTHANOREQUALTO
+		                                   : ExpressionType::COMPARE_GREATERTHAN;
+		upper.column = identity;
+		upper.op = between.upper_inclusive ? ExpressionType::COMPARE_LESSTHANOREQUALTO
+		                                   : ExpressionType::COMPARE_LESSTHAN;
+		out.push_back(std::move(lower));
+		out.push_back(std::move(upper));
+		return true;
+	}
+	default:
+		return false;
+	}
+}
+
+BlockShape ComputeBlockShape(ClientContext &context, const LogicalOperator &root, const PlanSignatures &plan_info) {
+	BlockShape shape;
+	if (root.type != LogicalOperatorType::LOGICAL_FILTER || root.children.size() != 1) {
+		return shape;
+	}
+	auto &root_info = plan_info.Get(root);
+	if (!root_info.Cacheable()) {
+		return shape;
+	}
+	PlanSignatures block(context, true);
+	block.AssignIds(root);
+	if (block.joins == 0) {
+		return shape;
+	}
+	PlanSignatures::Frame frame {0, block.next_id};
+
+	// classify the root conjuncts
+	vector<string> regular;
+	for (idx_t i = 0; i < root.expressions.size(); i++) {
+		auto &expr = *root.expressions[i];
+		string rendered;
+		PlanSignatures::StringSink sink(rendered);
+		NodeInfo scratch;
+		block.RenderExpression(expr, frame, sink, scratch);
+		if (scratch.refused || scratch.external_ref) {
+			return shape;
+		}
+		shape.conjuncts.push_back(rendered);
+		vector<RangeConstraint> constraints;
+		if (block.TryParseConstraint(expr, constraints)) {
+			shape.is_constraint.push_back(true);
+			for (auto &constraint : constraints) {
+				shape.constraints.push_back(std::move(constraint));
+			}
+		} else {
+			shape.is_constraint.push_back(false);
+			regular.push_back(rendered);
+		}
+	}
+	std::sort(regular.begin(), regular.end());
+	block.block_root = &root;
+	block.root_conjuncts = std::move(regular);
+
+	// render the shape (full rendering, block-relative frame)
+	{
+		PlanSignatures::StringSink sink(shape.canonical);
+		NodeInfo scratch;
+		block.RenderNode(root, frame, sink, scratch, true);
+		if (scratch.refused || scratch.external_ref) {
+			return shape;
+		}
+	}
+	PlanSignatures::HashSink hasher;
+	hasher.Write(shape.canonical.data(), shape.canonical.size());
+	shape.hash = hasher.Result();
+	shape.table_ids = block.ids;
+	for (auto &binding : const_cast<LogicalOperator &>(root).GetColumnBindings()) {
+		shape.output.push_back(block.IdentityOf(binding));
+	}
+	shape.est_leaf_rows = root_info.est_leaf_rows;
+	shape.joins = block.joins;
+	shape.ok = true;
+	return shape;
+}
+
+//! Does the query constraint q guarantee the cached constraint c on the same column?
+static bool ConstraintImplied(const RangeConstraint &c, const RangeConstraint &q) {
+	if (c.op == ExpressionType::OPERATOR_IS_NOT_NULL) {
+		// every comparison with a constant rejects NULL
+		return true;
+	}
+	if (q.op == ExpressionType::OPERATOR_IS_NOT_NULL || q.value.type() != c.value.type()) {
+		return false;
+	}
+	auto &qv = q.value;
+	auto &cv = c.value;
+	auto ge = [&]() { return !(qv < cv); };
+	auto gt = [&]() { return cv < qv; };
+	auto le = [&]() { return !(cv < qv); };
+	auto lt = [&]() { return qv < cv; };
+	switch (c.op) {
+	case ExpressionType::COMPARE_EQUAL:
+		return q.op == ExpressionType::COMPARE_EQUAL && qv == cv;
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+		return (q.op == ExpressionType::COMPARE_GREATERTHANOREQUALTO && ge()) ||
+		       (q.op == ExpressionType::COMPARE_GREATERTHAN && ge()) || (q.op == ExpressionType::COMPARE_EQUAL && ge());
+	case ExpressionType::COMPARE_GREATERTHAN:
+		return (q.op == ExpressionType::COMPARE_GREATERTHAN && ge()) ||
+		       (q.op == ExpressionType::COMPARE_GREATERTHANOREQUALTO && gt()) ||
+		       (q.op == ExpressionType::COMPARE_EQUAL && gt());
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+		return (q.op == ExpressionType::COMPARE_LESSTHANOREQUALTO && le()) ||
+		       (q.op == ExpressionType::COMPARE_LESSTHAN && le()) || (q.op == ExpressionType::COMPARE_EQUAL && le());
+	case ExpressionType::COMPARE_LESSTHAN:
+		return (q.op == ExpressionType::COMPARE_LESSTHAN && le()) ||
+		       (q.op == ExpressionType::COMPARE_LESSTHANOREQUALTO && lt()) ||
+		       (q.op == ExpressionType::COMPARE_EQUAL && lt());
+	default:
+		return false;
+	}
+}
+
+bool RangeConstraintsImply(const vector<RangeConstraint> &query, const vector<RangeConstraint> &cached) {
+	for (auto &c : cached) {
+		bool implied = false;
+		for (auto &q : query) {
+			if (q.column == c.column && ConstraintImplied(c, q)) {
+				implied = true;
+				break;
+			}
+		}
+		if (!implied) {
+			return false;
+		}
+	}
+	return true;
 }
 
 } // namespace duckdb

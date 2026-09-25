@@ -20,7 +20,9 @@ enum class RecyclerEntryKind : uint8_t {
 	//! The complete result of a query (keyed on the pre-optimization plan)
 	WHOLE_RESULT = 0,
 	//! The output of a subtree of an optimized plan
-	SUBTREE = 1
+	SUBTREE = 1,
+	//! The output of an SPJ block keyed on its shape; reusable by narrower blocks (predicate/column subsumption)
+	BLOCK = 2
 };
 
 const char *RecyclerEntryKindName(RecyclerEntryKind kind);
@@ -42,6 +44,12 @@ struct CachedEntry {
 	std::atomic<idx_t> last_used {0};
 	std::atomic<idx_t> hits {0};
 
+	//! BLOCK entries only: identity of every stored column (invalid = not a plain base column), the range
+	//! constraints the rows satisfy, and the canonical rendering of every block-root conjunct
+	vector<ColumnIdentity> columns;
+	vector<RangeConstraint> constraints;
+	vector<string> conjuncts;
+
 	//! Benefit density used for eviction: work saved per reuse, per byte held
 	double Benefit() const;
 };
@@ -51,6 +59,7 @@ struct RecyclerSettings {
 	bool whole_result = true;
 	bool blocks = true;
 	bool subtrees = true;
+	bool subsumption = true;
 	idx_t budget_bytes = 2000ULL * 1024 * 1024;
 	idx_t entry_cap_bytes = 256ULL * 1024 * 1024;
 	idx_t entry_cap_rows = 4000000;
@@ -73,6 +82,9 @@ struct RecyclerStats {
 	std::atomic<uint64_t> evictions {0};
 	std::atomic<uint64_t> hash_collisions {0};
 	std::atomic<uint64_t> writes_planned {0};
+	std::atomic<uint64_t> blocks_planted {0};
+	std::atomic<uint64_t> block_stores {0};
+	std::atomic<uint64_t> subsumption_hits {0};
 	std::atomic<uint64_t> clears {0};
 	std::atomic<uint64_t> pre_ns {0};
 	std::atomic<uint64_t> post_ns {0};
@@ -94,6 +106,12 @@ public:
 	                               const std::function<string()> &render_canonical);
 	//! Insert an entry (never overwrites); evicts lower-benefit entries to respect the budget. Returns success.
 	bool Store(shared_ptr<CachedEntry> entry, idx_t budget_bytes);
+	//! Insert a BLOCK entry under its shape hash (several entries per shape may coexist)
+	bool StoreBlock(shared_ptr<CachedEntry> entry, idx_t budget_bytes);
+	//! All BLOCK entries with this shape hash
+	vector<shared_ptr<CachedEntry>> LookupBlocks(const SigHash &hash) const;
+	//! Account a reuse of an entry that was found through LookupBlocks
+	void NoteHit(CachedEntry &entry);
 	void Clear();
 
 	//! Bookkeeping about candidate subtrees that were seen but not (yet) cached
@@ -111,12 +129,17 @@ public:
 private:
 	idx_t NextSequence();
 	using EntryMap = std::unordered_map<SigHash, shared_ptr<CachedEntry>, SigHashHasher>;
+	using BlockMap = std::unordered_map<SigHash, vector<shared_ptr<CachedEntry>>, SigHashHasher>;
 	EntryMap &Map(RecyclerEntryKind kind);
 	shared_ptr<CachedEntry> PickVictim() const;
+	//! Evict until `entry` fits the budget; false when the cache holds more valuable results (caller holds the lock)
+	bool MakeRoom(const CachedEntry &entry, idx_t budget_bytes);
+	void Erase(const CachedEntry &entry);
 
 	mutable std::mutex lock;
 	EntryMap whole;
 	EntryMap subtrees;
+	BlockMap blocks;
 	std::unordered_map<SigHash, idx_t, SigHashHasher> seen;
 	std::unordered_set<SigHash, SigHashHasher> too_big;
 	idx_t total_bytes = 0;
