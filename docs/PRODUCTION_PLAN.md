@@ -1,28 +1,38 @@
-# Query Recycler — Production Plan (cost model, memory diet, ageing, disk tier, merge-readiness)
+# Query Recycler — Production Plan: a general-purpose recycler for DuckDB that keeps the leaderboard score
 
-Status: written 2026-09-30 against the code on `dev_tapesh_m6` (commit 9fb66fce3b, open as td-02/dsa_asignment2#10).
-`origin/main` carries M0–M5 and is what the grader builds; the local `main` checkout is 13 commits behind it.
-This plan extends `docs/SOLUTION_PLAN.md` (design, M0–M6 done) and `docs/EXTENSION_REPORT.md` (measurements of
-2026-09-26). Every number below is either quoted from the report or was measured today with `build/release/duckdb`
-(v1.5.5 d8cdaa33fd, the M6 binary) on `data/imdb.duckdb`; every DuckDB fact cites the pinned v1.5.5 source under
-`duckdb/`. "MiB" is used throughout; the report's "MB" are MiB.
+Status: revision 2, 2026-09-30, on branch `dev_tapesh_plan` (revision 1 is commit e2e60aafe2). Written against
+the code on `dev_tapesh_m6` (commit 9fb66fce3b, open as td-02/dsa_asignment2#10). `origin/main` carries M0–M5 and
+is what the grader builds. This plan extends `docs/SOLUTION_PLAN.md` (design, M0–M6 done) and
+`docs/EXTENSION_REPORT.md` (measurements of 2026-09-26). Every number below is either quoted from the report or
+was measured on 2026-09-30 with `build/release/duckdb` (v1.5.5 d8cdaa33fd, the M6 binary) on `data/imdb.duckdb`;
+every DuckDB fact cites the pinned v1.5.5 source under `duckdb/`. "MiB" is used throughout; the report's "MB"
+are MiB.
 
-The plan answers four requests in order: (1) a cost/performance model that decides which results are worth
-caching and which queries are worth touching at all (§2, §3); (2) a memory diet (§4); (3) cache ageing policies
-(§5); (4) whether the buffer manager can serve as a disk tier for the cache — the risky part (§6). §7 turns the
-current code into merge-worthy code (review findings, refactor, tests, CI) and §8 sequences everything into
-milestones with exit criteria.
+Direction of this revision: the extension stops being a solution tuned to the IMDB workload and becomes a
+**general query recycler that any DuckDB user could load** — correct under DuckDB's default settings, with
+writes, transactions, several connections, prepared statements, temporary tables, external files — with CI and
+stress testing to match, **under the hard rule that the leaderboard score never drops** (§10). The score levers
+and the safety work of revision 1 (cost model, memory diet, ageing, disk tier) are kept and re-ordered around
+that rule.
+
+Sections: §1 measured facts · §2 which queries are worth it · §3 cost/performance model · §4 memory diet ·
+§5 ageing policies · §6 the buffer manager as a disk tier · §7 generalization · §8 faster without losing score ·
+§9 verification: tests, stress, CI · §10 score protection · §11 merge-worthiness · §12 milestones · §13 risks ·
+§14 do not.
 
 ## 0. Ground rules that do not change
 
-- Extension name `waddle`, DuckDB pinned at v1.5.5, nothing under `duckdb/` is touched, `.github/workflows`
-  keeps `duckdb_version` and `uses` as they are.
-- Correctness before everything: any rewrite fails closed to the vanilla plan; every merge passes
-  `IMDB_DATA=1 make test`, the recycler sqllogictests, `scripts/recycler_diff.py` in three orders, and the
-  `anthropic-skills:duckdb-code-review` checklist (justify every addition, no copies, rigorous concurrency,
-  deterministic tests, one PR = one change).
+- Extension name `waddle`, DuckDB pinned at v1.5.5, nothing under `duckdb/` is touched, the distribution
+  workflow keeps `duckdb_version` and `uses` as they are. Additional workflows may be added; the distribution
+  pipeline is never edited before grading ends.
+- Correctness before everything: any rewrite fails closed to the vanilla plan; a served result is always what
+  vanilla returns under the same snapshot and settings.
 - The score is the geometric mean of per-query latency of the faster of two fresh-process runs, measured under
   `EXPLAIN (ANALYZE, FORMAT JSON)` with `threads=6`, `memory_limit='8000MB'`, `preserve_insertion_order=false`.
+  **Nothing merges to `main` and no CI build is dispatched without the score gate of §10.**
+- Every merge passes `IMDB_DATA=1 make test`, the recycler sqllogictests, the differential harness in three
+  orders, the stress suite of §9, and the `anthropic-skills:duckdb-code-review` checklist (justify every
+  addition, no copies, rigorous concurrency, deterministic tests, one PR = one change).
 
 ## 1. Facts measured for this plan (2026-09-30)
 
@@ -43,7 +53,8 @@ without the marker, so the estimate-distortion worry from the M5 notes is not wh
 1.3–1.6 ms/MiB of wall time if it overlaps perfectly; the report's fastest-run deltas (q0240 +375 ms, q0231
 +428 ms, i.e. 3.3–4.7 ms/MiB all-in) include the pipeline break and run-to-run noise. Today's absolute wall clocks
 were 1.5–2× the report's for every configuration including vanilla (thermal/noise state of the laptop), so only
-the thread-time ratios above are relied upon. Reproduction: Appendix A.
+the thread-time ratios above are relied upon. A copy at 9 ms/MiB of thread time is slow for a memory copy; §8.3
+says what to measure next. Reproduction: Appendix A.
 
 ### 1.2 What the cache holds after the public workload (census, one process, filename order)
 
@@ -137,6 +148,8 @@ Per family (membership from the report §3.2/§6.5; nats from Appendix D):
 Reading: tiers A and B are 45 % of the queries and 99 % of the gain; the cost model's job is not to find new
 hits there (widening does that, §4.1) but to keep them while spending less memory and less payer time, and to
 make the same decisions on the private set, whose families are "similar" but whose sizes and orders are unknown.
+The same model is what makes the extension general: every threshold that was tuned on this workload becomes a
+quantity calibrated online (§3.1).
 
 ## 3. The cost/performance model
 
@@ -149,7 +162,7 @@ For a candidate `e` (a signature at a plan node; kinds `WHOLE_RESULT`, `SUBTREE`
 | `est_in` | rows scanned by the subtree | `NodeInfo::est_leaf_rows` | unchanged |
 | `est_out`, `width`, `est_bytes` | output rows, bytes per row, bytes | `EstimateCardinality`, `RecyclerEstimateRowWidth` | unchanged; `bytes` measured once stored |
 | `t_p` | time of the query that would pay | — | measured in `QueryEnd` (query latency) |
-| `c_e` | time the subtree took to produce | — | measured: thread time of the subtree under the `RECYCLER_MATERIALIZE` node in the profiler tree (available under EXPLAIN ANALYZE, i.e. always on the grader) |
+| `c_e` | time the subtree took to produce | — | measured: thread time of the subtree under the `RECYCLER_MATERIALIZE` node in the profiler tree (available under EXPLAIN ANALYZE, i.e. always on the grader; otherwise the sink's own timer) |
 | `m_e` | cost of materializing | — | measured: the operator's own thread time; first sight: `bytes × w_write` |
 | `h_e` | cost of a hit | — | measured on hits (`RECYCLER_SCAN` thread time + hit floor); first sight: `floor + bytes × w_scan` |
 | `p_e` | probability the entry is reused before it is evicted | implicit (op-type rules) | per-kind ratio `(entries hit at least once + 1) / (entries stored + 2)`, updated online, and 0.7 once the signature has been seen twice |
@@ -181,7 +194,7 @@ Worked examples with the calibration defaults (6 threads):
 | Candidate | bytes | t_p | p | gain | cost | decision |
 |---|---:|---:|---:|---:|---:|---|
 | q0240 block (first sight) | 79 MiB | 928 ms | 0.3 (BLOCK prior) | 0.3 × ln(928/25) = 1.08 | ln(1 + 119/928) = 0.12 | admit |
-| q0080 page source (ordered, batch sink) | 57 MiB | 33 ms | 0.16 (WHOLE prior) | 0.16 × ln(33/13) = 0.15 | ln(1 + 86/33) = 1.3 | **refuse on first sight**; admit on the second sighting (p = 0.7 → 0.65 > cost? still no: the page source is only worth it because *three* later pages reuse it: the history's `seen` on the page-source signature reaches 2 at q0082, and with p = 0.7 and the measured `t_p` of the family (36 ms) the rule admits at q0082, so q0089 onwards hit; q0080 no longer pays) |
+| q0080 page source (ordered, batch sink) | 57 MiB | 33 ms | 0.16 (WHOLE prior) | 0.16 × ln(33/13) = 0.15 | ln(1 + 86/33) = 1.3 | **refuse on first sight**; the page-source signature is seen again at q0082, and with p = 0.7 and the family's measured `t_p` the rule admits there, so q0089 onwards hit and q0080 no longer pays |
 | q0011 subtree (2.2 M rows, singleton) | 60 MiB | 455 ms | 0.13 (SUBTREE prior) | 0.13 × ln(455/20) = 0.41 | ln(1 + 90/455) = 0.18 | admit (cheap in nats); memory handled by ageing |
 | a 20-row whole result of a 4 ms query | 1 KiB after compaction | 4 ms | 0.16 | 0.16 × ln(4/0.3) = 0.41 | ≈ 0 | admit |
 | point lookup, est_in 3 rows | — | 0.2 ms | — | — | — | never analyzed (bail-out, §3.3) |
@@ -229,8 +242,8 @@ Ablation on the public set in filename, reverse and shuffled order, interleaved 
 (the report's §6.7 protocol): current gate vs cost model. Exit criteria: no query served today is lost in any
 order; payer overhead total (1.69 s) reduced by at least the page-source deferrals; sub-ms queries within 2 % of
 vanilla; geomean within noise or better (expected 9.2 → 8.9–9.0 ms from the bail-out and the page sources).
-The model's real value is on the private set: fewer expensive first-sight writes, no cost on tiny queries, and
-memory bounded by usefulness rather than by the size of the workload.
+The model's real value is on the private set and on any other database: fewer expensive first-sight writes, no
+cost on tiny queries, and memory bounded by usefulness rather than by the size of the workload.
 
 ## 4. Memory diet
 
@@ -394,7 +407,7 @@ page source reads back in 20–60 ms against a 33–55 ms recomputation — a lo
 |---|---|---|---|---|
 | D0 | **Passive tier (exists).** Measure it: a test with `memory_limit='1GB'`, a temp directory and a workload that overflows; `recycler_stats()` reports `spilled_bytes` (from `GetUsedSwap()` / the `COLUMN_DATA` tag) and the hit path learns the read-back bandwidth. | tests, two counters | none | do (P7) |
 | D1 | **Evict-first priority + swap-aware serving.** Every unordered write (parallel sink and the compacted small entries excluded, they are in-memory) creates its per-thread collections with `SetPartitionIndex(32)` before the first append, so cache blocks leave memory before any other managed buffer; the serving rule of §3.4 refuses cold large entries for cheap queries; the soft target of §4.4 also tightens when `GetUsedMemory() > 0.8 × GetMaxMemory()`. | ≈ 40 lines in the sink states + policy; a test that forces eviction and asserts hits still return vanilla answers | low: public API, no private state; the ordered page sources keep the default index (3 entries, 171 MiB, accepted and documented) | do (P7), behind `recycler_evict_first` for the ablation, default on |
-| D2 | **Recycler-managed cold tier.** Entries demoted by the ageing policy are serialized to files in the temporary directory (`FileSystem` + `BufferedFileWriter`, `DataChunk` serialization) and their collections freed; a hit on a cold entry re-reads the file into a fresh collection. Full control over *what* is on disk and *when*; independent of the pool's heuristics. | ≈ 400 lines, file lifecycle (delete on evict, on clear, on shutdown, on error), a temp-dir-less fallback, tests | medium | only if the private set overflows the budget by a wide margin; decide after D1's measurements |
+| D2 | **Recycler-managed cold tier.** Entries demoted by the ageing policy are serialized to files in the temporary directory (`FileSystem` + `BufferedFileWriter`, `DataChunk` serialization) and their collections freed; a hit on a cold entry re-reads the file into a fresh collection. Full control over *what* is on disk and *when*; independent of the pool's heuristics. | ≈ 400 lines, file lifecycle (delete on evict, on clear, on shutdown, on error), a temp-dir-less fallback, tests | medium | only if a workload overflows the budget by a wide margin; decide after D1's measurements |
 | D3 | **Persistence across processes** ("get the cache from disk" at startup): files outside the run's directory, or tables written into the database. | — | breaks the harness's isolation (fresh cwd and `TMPDIR` per run; the database is opened read-only by the grader) and the assignment's intent | **never** |
 
 Recommendation: D0 + D1 now (one day), D2 only on evidence. The honest summary for the "risky endeavour": the
@@ -423,9 +436,276 @@ outside the scored latency. The `RecyclerClientState` already is a `ClientContex
 Publication itself (`Store`) stays in `Finalize` so that the next statement on any connection sees the entry;
 only its bookkeeping moves.
 
-## 7. Merge-worthiness: what the reviewer will say, and the answer
+## 7. Generalization: from the IMDB workload to a recycler any DuckDB user can load
 
-### 7.1 Findings from reading the m6 sources (`src/` at 9fb66fce3b)
+### 7.1 What is workload-specific today
+
+| Aspect | Today (dev_tapesh_m6) | General form |
+|---|---|---|
+| Admission thresholds | 200 K input rows, 64 MiB speculation with `×2`/`÷8` factors, 1 M / 4 M row caps, 256 MiB entry cap, tuned on the public set | the calibrated cost model of §3 (constants learned online, caps derived from the memory limit) |
+| Row order | unordered writes and subsumption are disabled when `preserve_insertion_order = true`, which is **DuckDB's default**: most users would get the whole-result cache of `ORDER BY` queries and nothing else | mirror vanilla's own order decision (§7.3) |
+| Invalidation | any modifying statement clears the entire cache; a write in flight on another connection is not seen until it is bound | per-table versions driven by the transaction callbacks, race-free by construction (§7.2) |
+| Temporary tables | keyed by `temp.main.t` like any table, although a temp table is private to its connection: two connections with a same-named, same-shaped temp table would share results (**wrong answers** outside the grader) | refuse temporary entries (`CatalogEntry::temporary`, `catalog_entry.hpp:52`) |
+| Non-DuckDB catalogs | any `TableCatalogEntry` is accepted; a table in an attached foreign catalog (SQLite, Postgres, DuckLake through their extensions) can change outside DuckDB's transactions | cache tables of DuckDB catalogs only (`Catalog::GetCatalogType() == "duckdb"`), everything else refused |
+| Session settings | not part of the key; `TimeZone`/`Calendar` (ICU) and `integer_division`/`ieee_floating_point_ops` change results of the same plan at execution time | hash the result-affecting settings into every key (§7.4) |
+| Prepared statements | any `BOUND_PARAMETER` refuses the plan | rebind on demand and key on the parameter values (§7.5) |
+| Table functions | refused ("table function scan"): `read_parquet`, `read_csv`, `read_json`, `range` never take part, although repeated scans of files are the case the assignment's introduction motivates | allow-listed pure and file-backed functions, keyed on their parameters, with file freshness checks (§7.6) |
+| Pagination | `limit + offset > 5000` (DuckDB's Top-N threshold) | already DuckDB-general (`TopN::CanOptimize`) |
+| Delim join as atomic unit, `EXTENSION` operators for the profiler, fail-closed renderer | DuckDB-general | unchanged |
+
+### 7.2 Fine-grained, race-free invalidation
+
+Verified facts: `TransactionContext::Commit()` runs the registered states' `TransactionCommit(MetaTransaction &,
+ClientContext &)` **after** `transaction->Commit()` succeeded and `TransactionRollback(...)` on failure or
+rollback (`transaction/transaction_context.cpp:50-72, 107`); `DuckTransaction` exposes `start_time`,
+`transaction_id` and `commit_id` (`duck_transaction.hpp:43-47`), drawn from one monotonic counter, and a
+transaction sees exactly the commits with `commit_id < start_time`; `Catalog::GetCatalogVersion(context)`
+(`catalog.hpp:127`) changes on DDL.
+
+Design (`RecyclerCache` gains a `TableVersions` map keyed by `(catalog, schema, table)`):
+
+1. **Dependencies.** Every entry records the tables its scans read (the signature already renders them) and,
+   per table, the `start_time` of the transaction of that table's catalog at the pre hook (`DuckTransaction::Get
+   (context, catalog)`; entries spanning several catalogs record one `start_time` per catalog).
+2. **Writers announce themselves before they write.** At the pre hook of `INSERT`/`UPDATE`/`DELETE`/`MERGE`/
+   `TRUNCATE`/`COPY ... TO table` the target table (`LogicalInsert::table`, `LogicalUpdate::table`,
+   `LogicalDelete::table`, …) is added to the connection's pending-write set and `TableVersions[t].writers++`
+   under the cache lock. While `writers > 0`, entries depending on `t` are neither served nor stored for any
+   connection (readers miss and run vanilla; correct by construction).
+3. **Commit bumps the version.** `TransactionCommit`: for every pending table `TableVersions[t].last_commit =
+   transaction.commit_id`, `writers--`, and every entry with `snapshot_start_time(t) < last_commit` is evicted.
+   `TransactionRollback`: `writers--` only. Auto-commit statements go through the same callbacks.
+4. **Store and serve check the same predicate.** `Store` refuses an entry whose recorded `start_time` for any
+   table is `< TableVersions[t].last_commit` (the writer committed after the reader's snapshot: the race of a
+   reader that started before, and stored after, a concurrent commit) or whose table has `writers > 0`.
+   `Lookup` does the same before returning.
+5. **DDL** stays coarse: `ALTER`/`DROP`/`CREATE OR REPLACE`/`ATTACH`/`DETACH` at the pre hook clear the
+   cache, and every entry records `GetCatalogVersion` at store time and is ignored on mismatch (belt and
+   braces for DDL committed by another connection between its pre hook and its commit).
+6. **Reads inside a writing transaction** keep today's rule (`MetaTransaction::ModifiedDatabase()` → no
+   store, no serve), so uncommitted writes stay visible to their own connection.
+
+Cost: two map lookups per table per statement under the existing lock; no effect on a read-only workload except
+the recorded `start_time`s. Tests: two connections with interleaved `BEGIN`/write/read/`COMMIT`/`ROLLBACK`
+sequences and an oracle (§9.2); a deterministic reproduction of the reader-stores-after-writer-commits race
+using explicit transactions.
+
+### 7.3 Row order: do exactly what vanilla does
+
+Verified: `PhysicalResultCollector::GetResultCollector` (`physical_result_collector.cpp:25-52`) chooses the
+result collector with two public static functions: not `PhysicalPlanGenerator::PreserveInsertionOrder(context,
+root)` → parallel materialized collector; preserving but not `UseBatchIndex(context, root)` → single-threaded
+collector; both → batch collector (`physical_plan_generator.hpp:91-93`, `plan_insert.cpp:36-69`).
+`OrderPreservationRecursive` (`plan_insert.cpp:15-34`) returns the first non-`INSERTION_ORDER` source order it
+finds, so a hash aggregate anywhere below makes the plan `NO_ORDER` (parallel) and a sort makes it
+`FIXED_ORDER`.
+
+Rule: `LogicalRecyclerMaterialize::CreatePlan` calls the same two functions on its child and picks the sink
+mode exactly as vanilla picks its collector: `NO_ORDER` → parallel sink (today's `PAR`); order-preserving with
+batch index → batch-index sink (today's M6 sink, now used for every entry, not only page sources);
+order-preserving without batch index → **no write** for subtrees and blocks (a serial sink would run the
+payer's pipeline on one thread) and the serial sink only for whole results of `ORDER BY` queries (the sort's
+output stage is small, today's behaviour). `PhysicalRecyclerScan` hands out its stored chunk position as the
+batch index (it must report batch-index support to the planner) so a parent batch collector reproduces the
+stored order. Under the grader's `preserve_insertion_order = false` every decision is unchanged, so this is a
+pure generalization; under DuckDB's default it turns on subtree, block and subsumption reuse for every plan
+whose sources support batch indexes (table scans do), with the same rows in the same order vanilla returns.
+Verify before implementing: `PhysicalColumnDataScan`'s batch-index support in v1.5.5 as the model for the
+scan's `SupportsPartitioning`.
+
+### 7.4 Session settings in the key
+
+A short explicit list is hashed into every signature at the pre hook (values from
+`ClientContext::TryGetCurrentSetting`, ≈ 1 µs): `TimeZone`, `Calendar`, `integer_division`,
+`ieee_floating_point_ops`. Everything bound into the plan (`default_null_order`, `default_order`, collations,
+`search_path`, `old_implicit_casting`, `pivot_limit`) is already in the signature; `preserve_insertion_order` is
+§7.3; `threads`/`memory_limit` change speed, not results. One sqllogictest per listed setting (same query, two
+settings, both answers vanilla). Adding a setting to the list is a one-line change with a test; the list is
+documented in the README as the invariant "settings that change a result at execution time".
+
+### 7.5 Prepared statements
+
+Verified: `ClientContextState::CanRequestRebind()` and `OnExecutePrepared(context, info, current_rebind)`
+(`client_context_state.hpp:73-85`) let a registered state return `RebindQueryInfo::ATTEMPT_TO_REBIND` at
+execution time (`client_context.cpp:615-623`), after which DuckDB re-binds and re-optimizes the statement for
+this execution with the parameter values known (`PreparedStatementCallbackInfo::parameters`), and both hooks
+run again. Design: `OnFinalizePrepare` records the statement's cost class from the parameter-free plan;
+`OnExecutePrepared` requests a rebind only when the class is above the bail-out floor (a rebind costs a bind and
+an optimize, 0.1–0.5 ms, which a point lookup must not pay); during that rebind the renderer emits each
+`BOUND_PARAMETER`'s current value as a constant instead of refusing, so repeated executions with equal
+parameters hit the whole-result cache and different parameters key different entries. Tests: `PREPARE`/`EXECUTE`
+with equal, different and NULL parameters, and mixed parameter types; the answer is always vanilla's. No effect
+on the grader (plain SQL).
+
+### 7.6 Table functions and external files
+
+`LogicalGet` carries `function`, `parameters`, `named_parameters`, `input_table_types` and `bind_data`
+(`logical_get.hpp:32-50`), and `TableFunction::to_string` renders the bind data (`table_function.hpp:334, 454`;
+the Parquet and CSV readers list their files there). Design: an allow-list of functions whose output is a pure
+function of their inputs — `range`, `generate_series`, `read_parquet`/`parquet_scan`, `read_csv`/
+`read_csv_auto`, `read_json`/`read_json_auto`, `read_text`, `read_blob` — is keyed on function name, parameters,
+named parameters, input table types and the `to_string` rendering; every other table function stays refused
+(`duckdb_*` system functions, `glob`, `query_table`, functions of other extensions). File-backed functions
+record `(path, last modified, size)` per file at store time (`FileSystem::GetLastModifiedTime`/`GetFileSize`)
+and re-check on hit; a mismatch evicts the entry (DuckDB's own external-file cache validates the same way).
+Remote files (`http`/`s3`) are excluded by default (`recycler_remote_files = false`: a `HEAD` per file per hit
+is not free and object stores are eventually consistent). No effect on the grader (native tables), large
+effect for the file-scanning workloads DuckDB is mostly used for.
+
+### 7.7 Scale and operations
+
+- **Many connections.** One mutex guards the maps; every critical section is a hash-map operation. The stress
+  suite (§9.3) runs 64 connections × 8 threads; sharding the lock by signature hash is done only if that run
+  shows contention (reviewer rule: no "just in case").
+- **Memory.** Budget and target follow the memory limit (§4.4); the cache is per `DatabaseInstance`, so several
+  databases in one process have separate budgets, each bounded by its own limit.
+- **Observability.** `recycler_stats()`, `recycler_entries()` (with the §3.5 columns), `PRAGMA recycler_clear`,
+  the operators' names and parameters in `EXPLAIN`; admission and eviction decisions go to DuckDB's structured
+  logger at debug level so `duckdb_logs()` explains a decision without a rebuild.
+- **Packaging after grading.** The distribution pipeline already builds the loadable extension; restoring the
+  excluded platforms (`exclude_archs`) and a community-extension descriptor are one commit each, done after the
+  deadline so that the graded workflow is never touched. The name `waddle` stays until then.
+
+## 8. Faster, without losing score
+
+| Lever | Expected effect on the public score | Risk | Milestone |
+|---|---|---|---|
+| Wide block entries (§4.1) | 8–12 more hits, +25–40 nats, geomean 9.2 → ~7.5 ms | medium | P4 |
+| Fast bail-out (§3.3) | +2.0 nats, ≈ 1 % | none | P5 |
+| Cost model on the page sources (§3.2) | ≈ +0.5 nats (q0080/q0082 stop paying) | low | P5 |
+| Cheaper payer copy (§8.3) | up to −40 % of the 1.69 s payer cost, ≈ +3 nats, ≈ 2 % | low | P3 |
+| Hit floor on large bound plans (§8.4) | ≤ +0.5 ms of geomean; measure first | none | P2 |
+| Subsumption hits 2× faster (§8.5) | +0.8 ms of geomean if achieved; measure first | medium | after P4 |
+
+### 8.1 Rules for every speed change
+
+Every change is measured with the score gate of §10 in filename order (the grader's order) and in two more
+orders, with interleaved vanilla checkpoints; a change that loses any served query, or costs more than the
+checkpoints' noise band, does not merge, whatever it wins elsewhere.
+
+### 8.2 Hook budget
+
+The pre hook is ≤ 25 µs on plans under 10 nodes and ≤ 50 µs on 30-node plans (SOLUTION_PLAN §2); today it is
+27–48 µs on average. A sqllogictest reads `pre_ns / pre_calls` after a synthetic 30-node plan and fails above
+the budget, so the generalizations of §7 (settings hash, table versions, temp-table and catalog checks) cannot
+creep. Two known savings if needed: the hash sink hashes `LogicalType::Hash()` instead of allocating
+`ToString()` per expression (`recycler_signature.cpp:326`), and the IN-list rendering (`:692-725`) hashes
+values without constructing `Value`s.
+
+### 8.3 The payer copy
+
+9 ms of thread time per MiB (§1.1) is far from a memory copy. The likely cause is many small `Sink` calls: the
+semi-join output above the delim join arrives in sparse chunks, and `ColumnDataCollection::Append` has a fixed
+per-call, per-column cost (vector format resolution, chunk state, pins). Measure `Sink` calls and rows per call
+in P2; if the average chunk is well under `STANDARD_VECTOR_SIZE`, the local sink state buffers rows into a full
+chunk before appending, as DuckDB's `CachingPhysicalOperator` does for outputs under `CACHE_THRESHOLD = 64` rows
+(`physical_operator.hpp:268-296`). Target: ≤ 4 ms/MiB, i.e. the block writes of q0231/q0240 cost 60–80 ms
+less each. Also measured in P2: the share of the re-scan (source side) in the operator's time; the scan is
+zero-copy over pinned blocks and should be a small share.
+
+### 8.4 The hit floor
+
+q0084–q0090 hit at 0.13–0.21 ms, q0248/q0284/q0293 at 0.36–0.45 ms; the difference is binding a six-table query
+with a subquery, not the hooks (48 µs). Profile the split (bind / hooks / execution) once; if the hooks' render
+for the byte comparison is a measurable share on hits, cache the rendered string of the last miss per
+connection (a hit renders the same plan the miss rendered). Ceiling ≈ 0.5 ms of geomean.
+
+### 8.5 Subsumption hits
+
+A subsumption hit scans the whole stored block and filters (2.7–11.5 ms for 1.6 M rows). Per-chunk min/max of
+the constrained columns, recorded at materialization, would let the scan skip chunks whose range misses the
+residual predicate. Because the parallel sink stores rows in arrival order the ranges per chunk are wide;
+worth it only if the payer's rows arrive clustered by the constrained column (they do when `title` is the probe
+side and is scanned in insertion order). Measure the skip ratio on the q0240 block before building it.
+
+## 9. Verification: tests, stress, CI
+
+### 9.1 The pyramid
+
+| Layer | What | Where it runs |
+|---|---|---|
+| 1. Module tests | sqllogictests per module and per generalization: keys (existing `recycler_basic`), subsumption, pagination, memory/budget/TTL/compaction, policy (bail-out both sides, admission first vs second sight, serving rule), order under `preserve_insertion_order = true`, spill (§6.4), invalidation and transactions (§7.2), temp tables, settings (§7.4), prepared statements (§7.5), table functions and file freshness (§7.6), all DuckDB types round-tripped through an entry (nested, decimal, enum, UUID, hugeint, timestamps with time zone, NULL-only columns, zero rows, 1,000 columns), `EXPLAIN (ANALYZE, FORMAT JSON)` of a hit carries `latency` | every build, CI |
+| 2. Differential | `scripts/recycler_diff.py` (IMDB, three orders, twice) and the in-process oracle of §9.2 on synthetic data | local (IMDB) / CI (synthetic) |
+| 3. Randomized | seeded query generator over synthetic schemas: SPJ, aggregates, `EXISTS`, CTEs, `IN` lists, `BETWEEN`, `LIMIT/OFFSET` with total-order tiebreakers, `DISTINCT`, set operations, window functions (must never be served), volatile functions (never served); every generated query checked against the oracle | CI, 10 minutes, fixed seeds; nightly with rotating seeds |
+| 4. Stress | §9.3 | CI (TSAN job) and nightly |
+| 5. Resource | `memory_limit` {128 MB, 256 MB, 1 GB, 8 GB} × `threads` {1, 2, 6, 16} × temp directory {set, unset}; 10 passes of the workload in one process with RSS and `duckdb_memory()` sampled (no growth after pass 2) | CI (small), nightly (full) |
+| 6. Sanitizers | ASAN + UBSAN on layers 1–3; TSAN on layer 4 | CI |
+| 7. Score gate | §10, IMDB, local only (the data is not in CI) | before every merge to `main` |
+| 8. Stock DuckDB | the built `waddle.duckdb_extension` loaded into the PyPI `duckdb==1.5.5` wheel with `allow_unsigned_extensions`, running layers 1–3 through Python — exactly how the grader consumes the binary | CI |
+
+### 9.2 The oracle
+
+Every checked query runs twice inside one transaction on the same connection: once as-is, once after
+`SET disabled_optimizers = 'extension'` (a session setting; the hooks do not run, as the report's vanilla
+baseline relies on). Same snapshot, same settings, same thread count; results must be identical as multisets,
+and identical as sequences when the query has an `ORDER BY` with a total key or when `preserve_insertion_order
+= true` makes the order observable. This is the only oracle that is valid under concurrent writers.
+
+### 9.3 Stress "to the max" (`scripts/recycler_stress.py`, seeded, deterministic in single-thread mode)
+
+Six synthetic tables (integers, strings, decimals, timestamps, nested types, NULL-heavy columns, one table with
+stale statistics after bulk deletes so estimates lie), 24 query templates with random constants, and the
+following actors on one database:
+
+- 8–64 reader connections on their own threads, each running random templates and checking every result with
+  the oracle of §9.2;
+- 1–4 writer connections doing `INSERT`/`UPDATE`/`DELETE`/`MERGE` in auto-commit and in explicit transactions
+  that commit or roll back at random, plus occasional DDL (`ALTER TABLE ADD COLUMN`, `CREATE OR REPLACE VIEW`,
+  `DROP`/`CREATE` of a table with the same name and a different content);
+- a chaos connection issuing `PRAGMA recycler_clear`, random `SET recycler_*` toggles, `SET memory_limit`
+  changes, `SET preserve_insertion_order`, `SET TimeZone`, and closing/reopening its connection;
+- temp tables of the same name and shape but different content on two connections;
+- prepared statements executed with rotating parameters;
+- a Parquet/CSV file rewritten in place between reads.
+
+Assertions: every result equals the oracle's; no query errors except the expected DDL races; `recycler_stats()`
+counters are consistent (stores + rejects = writes planned, hits ≤ lookups); the process ends with the cache
+cleared and no leaked collections (`duckdb_memory()` `COLUMN_DATA` back to zero after `recycler_clear`).
+Runs: CI 5 minutes under TSAN with 8 readers; nightly 60 minutes with 64 readers and rotating seeds; any failure
+is reproducible from its seed in single-thread mode.
+
+### 9.4 CI
+
+A new workflow `tests.yml` (manual dispatch and on pull requests to `main`; the distribution pipeline is not
+touched) with jobs: `build-test` (Linux GCC release, layers 1–3), `debug` (debug build with `D_ASSERT` and
+`ColumnBindingResolver::Verify`, layers 1–3), `asan-ubsan` (layers 1–3), `tsan-stress` (layer 4, 5 minutes),
+`resource` (layer 5 small), `stock-duckdb` (layer 8), `format` (clang-format with DuckDB's configuration).
+`ccache` keyed on the submodule commit keeps a job at 10–15 minutes after the first run; the full matrix costs
+about 90 Actions minutes per pull request, within the monthly budget at the team's merge rate, and the manual
+dispatch runs a subset for branches. A nightly schedule runs layers 3–5 in full.
+
+## 10. Score protection: the gate that every change passes
+
+`scripts/score_gate.py` (P2) runs, with the grader's protocol (`scripts/benchmark.py`'s fresh processes, warm-up,
+`EXPLAIN (ANALYZE, FORMAT JSON)`, grader settings):
+
+1. a vanilla checkpoint (`SET disabled_optimizers = 'extension'`) before and after, which defines the session's
+   noise band;
+2. the baseline binary (the last `main` build, kept in `build/baseline/`) and the candidate binary, each twice,
+   in filename order, and once each in reverse and shuffled order;
+3. per query: served or not (a `RECYCLER_SCAN` in the profile), latency, and the answer through
+   `scripts/recycler_diff.py`.
+
+The gate **fails** if any answer differs from vanilla in any order; if any query served by the baseline in
+filename order is not served by the candidate; if the candidate's filename-order geomean is worse than the
+baseline's by more than the noise band; or if any single payer is more than 25 % slower than in the baseline
+without a served query that explains it. It **prints** the per-family table of §2 for both binaries so a gain
+elsewhere never hides a loss. Merges to `main` and CI dispatches happen only after a passing gate, and the
+passing gate's output is attached to the pull request.
+
+Rules for defaults that follow from the gate:
+
+- A general feature that cannot touch the IMDB workload (temp tables, foreign catalogs, prepared statements,
+  table functions) ships default-on; the gate proves it is a no-op there.
+- A feature on the hot path (settings hash, table versions, order decision) ships only within the hook budget
+  of §8.2 and after the gate.
+- A feature that changes admission (cost model, ageing, evict-first) ships only after the gate in three orders
+  and the ablation of §3.6/§5.4; if the private set's order could turn a gain into a loss, the conservative
+  default wins.
+
+## 11. Merge-worthiness: what the reviewer will say, and the answer
+
+### 11.1 Findings from reading the m6 sources (`src/` at 9fb66fce3b)
 
 | Where | Finding | Rule | Fix (milestone) |
 |---|---|---|---|
@@ -439,82 +719,74 @@ only its bookkeeping moves.
 | `recycler_hooks.cpp:699-825` | `RecyclerPreOptimize` does gate, hoisting, analysis and four mechanisms in one 125-line function | 17 | named steps, same order, no behaviour change (P1) |
 | `recycler_hooks.cpp:844-921` | admission by op-type factors `×2`, `÷8`, `/2` tuned on the public set | 16 | cost model (P5) |
 | `recycler_hooks.cpp:52-85` | settings cached per connection are refreshed only after this connection's `SET`; a `SET GLOBAL` elsewhere is missed | 4 | document the invariant, or key the cache on `DBConfig`'s option values (P1: document) |
+| `recycler_hooks.cpp:113-140, 721-724` | any write clears everything; temp tables and foreign catalogs are not distinguished | 15 | §7.2, §7.1 (G1) |
 | `recycler_operators.cpp:275-287` | only allocated bytes; no used bytes | 18 | §4.3 (P2) |
 | `recycler_operators.cpp:353-386` | `Finalize` charges accounting and eviction to the query; no measured cost recorded | perf, 16 | §6.5 (P2) |
+| `recycler_operators.cpp:183-187` | the sink mode is chosen from `spec.ordered` and a batch-index check, not from vanilla's own order decision | 7 | §7.3 (G2) |
 | `recycler_signature.cpp:133-135` | `Refuse(info, reason)` discards the reason: `recycler_stats()` cannot say why a plan was refused | 18 | reason enum + counters (P2) |
 | `recycler_signature.cpp:326` | `return_type.ToString()` allocates a string per expression in the hash pass | 3 | `Sink::Type()` virtual: the hash sink hashes `LogicalType::Hash()`, the string sink still writes `ToString()` (P1; measure the hook time before and after) |
-| `recycler_signature.cpp:692-725` | IN-list rendering builds a `Value` per element (100 of 149 queries have IN lists; bounded at 4,096 rows) | 3 | acceptable; note in the hook-time budget test (P8) |
+| `recycler_signature.cpp:493-499` | every `LogicalGet` without a catalog table is refused, every one with a table accepted | 15 | §7.1, §7.6 (G1, G4) |
+| `recycler_signature.cpp:692-725` | IN-list rendering builds a `Value` per element (100 of 149 queries have IN lists; bounded at 4,096 rows) | 3 | acceptable; covered by the hook-budget test (P8) |
 | `recycler_functions.cpp:38-52` | shutdown by connection count is correct but subtle | 12 | comment says why (destroy order of `DatabaseInstance`), keep (P1) |
-| tests | no test for: eviction under a tiny budget, `preserve_insertion_order = true` with every mechanism, two connections, `memory_limit` overflow, the `latency` field on a hit under `EXPLAIN (ANALYZE, FORMAT JSON)`, the hook-time budget, the bail-out threshold | 5 | P2–P8 each add theirs |
+| tests | no test for: eviction under a tiny budget, `preserve_insertion_order = true` with every mechanism, two connections, `memory_limit` overflow, the `latency` field on a hit, the hook-time budget, the bail-out threshold, and none of §7 | 5 | §9 |
 
 Concurrency, checked and kept: the cache lock covers every map mutation; `Lookup` renders outside the lock and
 confirms by byte comparison; `hits`/`last_used` are atomics because `NoteHit` runs outside the lock (the
-comment should say so); per-connection state is touched only by that connection's hooks and `QueryEnd`;
-entries are `shared_ptr`-owned by plans. The ordered index of §5.3 lives under the same lock.
+comment should say so); per-connection state is touched only by that connection's hooks and callbacks; entries
+are `shared_ptr`-owned by plans. The ordered index of §5.3 and the table versions of §7.2 live under the same
+lock.
 
-### 7.2 Structure after the refactor (P1, a pure move)
+### 11.2 Structure after the refactor (P1, a pure move)
 
 | File | Responsibility | Lines (est.) |
 |---|---|---:|
-| `recycler_signature.{hpp,cpp}` | unchanged: canonical renderer, hashes, shapes, constraints | 1,400 |
-| `recycler_cache.{hpp,cpp}` | entries, maps, ordered index, history, budget/target, stats | 500 |
+| `recycler_signature.{hpp,cpp}` | canonical renderer, hashes, shapes, constraints; §7.4 settings hash, §7.5 parameter values, §7.6 table-function keys | 1,600 |
+| `recycler_cache.{hpp,cpp}` | entries, maps, ordered index, history, table versions, budget/target, stats | 600 |
 | `recycler_policy.{hpp,cpp}` | bail-out, admission, serving rule, calibration, priors (§3) | 300 |
 | `recycler_rewrite.{hpp,cpp}` | `SubstituteScan`, `WrapMaterialize`, `HoistPaginationLimit`, `BlockFinalizer`, the shared slot visitor | 350 |
 | `recycler_hooks.cpp` | the two hooks as orchestration of gate → analysis → mechanisms → writes | 400 |
-| `recycler_operators.{hpp,cpp}` | operators, compaction, evict-first priority, measured timings | 500 |
-| `recycler_functions.cpp` | registration, settings, `recycler_stats()`, `recycler_entries()`, pragma, `QueryEnd` state | 300 |
+| `recycler_operators.{hpp,cpp}` | operators, sink mode from vanilla's order decision, compaction, evict-first priority, measured timings, batch-index scan | 600 |
+| `recycler_functions.cpp` | registration, settings, `recycler_stats()`, `recycler_entries()`, pragma, the `ClientContextState` callbacks (query end, transactions, prepared statements) | 400 |
 
 One PR per row change; the P1 PR moves code and adds nothing (diff readable as a transform).
 
-### 7.3 Naming and comments
+### 11.3 Naming and comments
 
 Names say when to use them: `ShouldAnalyze`, `AdmitWrite`, `ShouldServe`, `SignatureHistory`,
-`recycler_min_lookup_rows`, `recycler_target_mb`, `recycler_speculation_ttl`, `recycler_evict_first`.
-Comments only where the *why* is non-obvious: the profiler trap (why `EXTENSION` operators), the destroy order
-at shutdown, the eviction-queue trick, the batch-index exception, the `NoteHit`-outside-the-lock atomics, the
-LIMIT hoisting invariant. No narration of what the code does.
+`TableVersions`, `recycler_min_lookup_rows`, `recycler_target_mb`, `recycler_speculation_ttl`,
+`recycler_evict_first`, `recycler_remote_files`. Comments only where the *why* is non-obvious: the profiler
+trap (why `EXTENSION` operators), the destroy order at shutdown, the eviction-queue trick, the batch-index
+exception, the `NoteHit`-outside-the-lock atomics, the LIMIT hoisting invariant, the writer-announce-before-write
+invariant of §7.2, the list of result-affecting settings. No narration of what the code does.
 
-### 7.4 Tests and CI
+## 12. Milestones
 
-- `test/sql/recycler/`: keep the three suites; add `recycler_memory.test` (budget, target, TTL, compaction,
-  used vs allocated bytes), `recycler_policy.test` (bail-out threshold both sides, admission on first vs second
-  sight with scripted sizes, serving rule), `recycler_order.test` (every mechanism under
-  `preserve_insertion_order = true`), `recycler_spill.test` (`memory_limit` overflow with and without a temp
-  directory), `recycler_explain.test` (`EXPLAIN (ANALYZE, FORMAT JSON)` of a hit contains `latency` and a
-  non-empty tree), `recycler_connections.test` (two connections: invalidation, `PRAGMA recycler_clear` while
-  the other scans).
-- Determinism: no sleeps, no wall-clock; sizes drive every decision through settings.
-- Local matrix before each merge: `make release` + tests; a debug build with `D_ASSERT`s; one ASAN/UBSAN run of
-  the recycler suites; GCC `-Wall -Wextra -Werror` (the CI compiles with GCC on Linux; development is
-  clang/macOS); `scripts/recycler_diff.py` in three orders; `make benchmark` with interleaved vanilla
-  checkpoints; three passes of the workload in one process.
-- CI: the distribution pipeline stays untouched. A second, manually dispatched workflow (`tests.yml`: Linux
-  GCC release build + `test/sql/recycler` + `test/sql/waddle.test`) is added so the merge gate runs where the
-  grader's binary is built; it does not touch `duckdb_version`/`uses` and is not run on push (Actions minutes).
-
-## 8. Milestones
-
-Effort in working days for one developer; each ends with the verification chain of §0 and, when merged to
-`main`, a dispatched build (the grader uses the last successful build).
+Effort in working days for one developer; each ends with the verification chain of §0 and the score gate of
+§10 and, when merged to `main`, a dispatched build. Three tracks, one order.
 
 | # | Milestone | Content | Effort | Exit criteria |
 |---|---|---|---:|---|
 | P0 | Land M6 | review td-02/dsa_asignment2#10 with the checklist, merge, dispatch CI, fast-forward local `main` | 0.5 | CI green on `main`; benchmark within noise of 9.2 ms |
-| P1 | Structure | §7.2 pure-move refactor, `RecyclerWriteSpec::Make`, common operator base, `Lookup` without `std::function`, `D_ASSERT`s, comments of §7.3 | 1 | identical results and stats on the public set; hook time not worse |
-| P2 | Observability | `QueryEnd` state, measured costs from the profiler tree, bounded `SignatureHistory` with reasons, used/allocated bytes, spilled bytes, new `recycler_entries()`/`recycler_stats()` columns | 1–1.5 | every entry shows a measured cost after its payer; tests |
-| P3 | Memory diet 1 | compaction (§4.2), budget/target from the memory limit (§4.4), bounded history (§4.5) | 0.5–1 | tiny entries ≤ 2 MiB in total; `recycler_memory.test` |
-| P4 | Wide block entries | §4.1 widening + subsumption-aware replacement | 2–3 | ≥ 8 more served queries in filename order, all answers vanilla in three orders, block space ≤ 600 MiB |
-| P5 | Cost model | `recycler_policy` (§3), bail-out, serving rule, removal of the speculation factors | 1.5–2 | ablation of §3.6 passes; sub-ms queries within 2 % of vanilla |
-| P6 | Ageing | GDSF + TTL with the ordered index (§5.3), policy ablation (§5.4) | 1–1.5 | O(log n) eviction; hits preserved at 1,000 MiB target; peak bytes ≤ target + one entry |
+| P1 | Structure | §11.2 pure-move refactor, `RecyclerWriteSpec::Make`, common operator base, `Lookup` without `std::function`, `D_ASSERT`s, comments of §11.3 | 1 | identical results and stats on the public set; hook time not worse |
+| P2 | Observability and the gate | `QueryEnd` state, measured costs from the profiler tree, `Sink` call statistics, bounded `SignatureHistory` with reasons, used/allocated bytes, spilled bytes, new `recycler_entries()`/`recycler_stats()` columns, **`scripts/score_gate.py`**, the oracle harness skeleton of §9.2 | 2 | every entry shows a measured cost after its payer; the gate runs end to end and passes on the current binary against itself |
+| G1 | Correctness on general databases | temp tables refused, DuckDB catalogs only, settings hash (§7.4), fine-grained race-free invalidation (§7.2); two-connection and transaction tests | 2–3 | stress layer 4 with writers passes under TSAN; hook budget test passes; gate passes |
+| P3 | Memory diet 1 and the payer copy | compaction (§4.2), budget/target from the memory limit (§4.4), chunk buffering in the sink if §8.3's measurement says so | 1–1.5 | tiny entries ≤ 2 MiB in total; payer copy ≤ 4 ms/MiB; gate passes |
+| G2 | Row order like vanilla | §7.3: sink mode from `PreserveInsertionOrder`/`UseBatchIndex`, batch-index scan; `recycler_order.test` | 1.5–2 | every mechanism active and correct under `preserve_insertion_order = true`; gate unchanged (the grader's setting is `false`) |
+| P4 | Wide block entries | §4.1 widening + subsumption-aware replacement | 2–3 | ≥ 8 more served queries in filename order, all answers vanilla in three orders, block space ≤ 600 MiB; gate passes |
+| P5 | Cost model | `recycler_policy` (§3), bail-out, serving rule, removal of the speculation factors | 1.5–2 | ablation of §3.6 passes; sub-ms queries within 2 % of vanilla; gate passes |
+| P6 | Ageing | GDSF + TTL with the ordered index (§5.3), policy ablation (§5.4) | 1–1.5 | O(log n) eviction; hits preserved at a 1,000 MiB target; gate passes |
+| V1 | Stress and CI to the max | §9.3 harness complete (readers, writers, chaos, temp tables, files), `tests.yml` with all jobs, nightly schedule, layer 5 and 8 | 2–3 | CI green on a pull request; a seeded nightly run reproduces any failure |
 | P7 | Disk tier | D0 tests and counters, D1 evict-first + swap-aware serving (§6.3) | 1 | `recycler_spill.test`; 1 GB run answers everything; decision on D2 recorded |
-| P8 | Hardening & CI | §7.4 matrix, `tests.yml`, docs (README section, this plan's status), report addendum | 1–2 | all suites green on GCC and clang; `EXTENSION_REPORT.md` numbers refreshed |
+| G3 | Prepared statements | §7.5 rebind on demand, parameter values in the key | 1–1.5 | `PREPARE`/`EXECUTE` tests; no rebind below the bail-out floor |
+| G4 | Table functions and files | §7.6 allow-list, keys, freshness checks | 2–3 | file rewrite between reads never serves stale rows; remote files off by default |
+| G5 | Release readiness | portability builds after the deadline, README for users, community-extension descriptor, report addendum with refreshed numbers | 1 | loads into stock DuckDB 1.5.5 on Linux/macOS/Windows |
 
-Total ≈ 10–13 days. Order matters: P1 before any behaviour change (reviewable diffs), P2 before P5/P6 (the
-model needs measurements), P4 before P7 (it changes what is worth spilling). P4 is the only milestone with a
-large expected score effect (9.2 → ~7.5 ms); P3, P5, P6, P7 are what make the extension safe on a workload
-that is not the public one.
+Total ≈ 20–26 days. Order rationale: the gate and the measurements come first because everything after them is
+judged by them; G1 comes before any performance work because a general recycler that can return a stale or
+foreign row is worthless whatever its score; P4 is the only milestone with a large expected score effect
+(9.2 → ~7.5 ms); G2–G4 are pure generalizations that the gate proves to be no-ops on the grader.
 
-## 9. Risks and open questions, each with the experiment that settles it
+## 13. Risks and open questions, each with the experiment that settles it
 
 1. **Widening's keep-alive through compress/decompress projections** may leave a kept column unresolvable
    (`BlockFinalizer` refuses compressed identities). Experiment: plant the union on the 21-member family and
@@ -528,27 +800,39 @@ that is not the public one.
    seen twice are exempt.
 5. **Evict-first (D1) changes nothing on the grader** (no pressure at 8,000 MB) and could cost on a machine
    where the cache is the only thing worth keeping. Keep it a setting; the ablation reports both.
-6. **Hit floor on large bound plans**: q0248/q0284/q0293 hit at 0.36–0.45 ms while q0084-q0090 hit at
-   0.13–0.21 ms; the difference is binding a six-table query with a subquery, not our hooks. Measure the split
-   (bind vs hooks vs execution) once with the profiler before spending anything on it; the ceiling is ≈ 0.5 ms
-   of geomean.
+6. **Hit floor on large bound plans**: the difference between 0.13 and 0.45 ms hits is binding, not the hooks.
+   Measure the split once; the ceiling is ≈ 0.5 ms of geomean.
 7. **A streaming "tee" materializer** (append while forwarding, no pipeline break) was evaluated and rejected:
    `PipelineExecutor` skips a whole pipeline whose sink already knows no output is possible and runs
    `FinalExecute` only from the operator that finished early (`pipeline_executor.cpp:42-46, 51-57`), so a tee
    below a LIMIT or on the probe side of a join with an empty build sees a partial input and cannot tell. The
    saving would have been at most the re-scan half of §1.1 on five queries (< 0.3 % of the score) against a
    silent-wrong-answer risk.
+8. **Batch-index support of the scan (§7.3)**: if `PhysicalColumnDataScan` in v1.5.5 does not model it, the
+   scan implements `SupportsPartitioning(BatchIndex)` itself with the chunk index; a test under
+   `preserve_insertion_order = true` with a total-order comparison settles it.
+9. **Table versions and DuckDB's visibility rule (§7.2)**: the design assumes a transaction sees commits with
+   `commit_id < start_time`. Verify against `DuckTransaction`/`UndoBuffer` before relying on `<` versus `≤`;
+   the explicit-transaction race test fails loudly if the comparison is off by one.
+10. **Rebind cost for prepared statements (§7.5)** could exceed the gain for mid-size statements. The cost
+    class threshold is measured, and a statement whose rebinds never hit stops requesting them (history).
+11. **The oracle's `disabled_optimizers` trick (§9.2)** must be re-verified whenever the hooks change: a test
+    asserts that `recycler_stats()` counters do not move on the oracle connection.
 
-## 10. Do not
+## 14. Do not
 
 - Persist anything across processes (files outside the run's directory, tables in the database).
-- Rename the extension, change the pinned DuckDB, touch `duckdb/`, or the distribution workflow's keys.
-- Serve `LIMIT` without `ORDER BY`, `SAMPLE`, volatile or parameterized expressions, table functions, delim
-  sides, subtrees with foreign `DELIM_GET`s or runtime filters, or anything whose bindings cannot be traced.
+- Rename the extension, change the pinned DuckDB, touch `duckdb/`, or the distribution workflow before grading
+  ends.
+- Serve `LIMIT` without `ORDER BY`, `SAMPLE`, volatile or parameterized (unbound) expressions, non-allow-listed
+  table functions, temporary or foreign-catalog tables, delim sides, subtrees with foreign `DELIM_GET`s or
+  runtime filters, or anything whose bindings cannot be traced.
+- Serve or store while a writer of a dependency is in flight, inside a writing transaction, or under a
+  different snapshot than the one the entry was computed under.
 - Add a setting, field, atomic, or fallback "just in case": every one above has a test or a measurement that
   needs it.
-- Quote a wall-clock effect below the machine's noise (±5 % on the geomean, more on one-second queries) without
-  interleaved vanilla checkpoints.
+- Merge to `main` or dispatch a build without a passing score gate; quote a wall-clock effect below the
+  machine's noise band without interleaved vanilla checkpoints.
 
 ## Appendix A. Reproducing today's measurements
 
@@ -569,18 +853,37 @@ SELECT tag, memory_usage_bytes, temporary_storage_bytes FROM duckdb_memory();
 
 ## Appendix B. DuckDB v1.5.5 references verified for this plan (paths under `duckdb/src`)
 
-`common/types/column/column_data_allocator.cpp:94-108` (block allocation, `can_destroy=false`, partition index →
-eviction queue index) · `storage/standard_buffer_manager.cpp:176` (`can_destroy` → `DestroyBufferUpon`) ·
-`include/duckdb/common/enums/destroy_buffer_upon.hpp` · `storage/buffer/buffer_pool.cpp:15-27, 244, 290-300`
-and `include/duckdb/storage/buffer/buffer_pool.hpp:79-90, 115-117` (eviction order, queue sizes, `EvictBlocks`
-protected) · `include/duckdb/common/radix_partitioning.hpp:34-36` (`RadixBits`) ·
-`include/duckdb/common/types/column/column_data_collection.hpp:73` and `common/types/column/column_data_collection.cpp:124-128`
-(`SetPartitionIndex`) · `include/duckdb/main/client_context_state.hpp:53-61` and `main/client_context.cpp:292-306`
-(`QueryEnd` after `profiler->EndQuery()`) · `execution/operator/helper/physical_explain_analyze.cpp:20-27`
-(latency fixed in `Finalize`) · `parallel/pipeline_executor.cpp:42-46, 51-57` (skipped pipelines, partial
-flush) · `main/config.cpp:555-557` (temporary directory default) · `storage/standard_buffer_manager.cpp:456`
-(eviction without a temporary directory throws) · `function/table/system/duckdb_memory.cpp` (`tag`,
-`memory_usage_bytes`, `temporary_storage_bytes`) · `include/duckdb/storage/storage_info.hpp:29` (256 KiB blocks).
+Memory and eviction: `common/types/column/column_data_allocator.cpp:94-108` (block allocation,
+`can_destroy=false`, partition index → eviction queue index) · `storage/standard_buffer_manager.cpp:176`
+(`can_destroy` → `DestroyBufferUpon`) · `include/duckdb/common/enums/destroy_buffer_upon.hpp` ·
+`storage/buffer/buffer_pool.cpp:15-27, 244, 290-300` and `include/duckdb/storage/buffer/buffer_pool.hpp:79-90,
+115-117` (eviction order, queue sizes, `EvictBlocks` protected) · `include/duckdb/common/radix_partitioning.hpp:34-36`
+(`RadixBits`) · `include/duckdb/common/types/column/column_data_collection.hpp:73` and
+`common/types/column/column_data_collection.cpp:124-128` (`SetPartitionIndex`) ·
+`include/duckdb/common/types/column/column_data_scan_states.hpp:18-27` (allocator types) ·
+`storage/standard_buffer_manager.cpp:456` (eviction without a temporary directory throws) ·
+`function/table/system/duckdb_memory.cpp` (`tag`, `memory_usage_bytes`, `temporary_storage_bytes`) ·
+`include/duckdb/storage/storage_info.hpp:29` (256 KiB blocks) · `main/config.cpp:555-557` (temporary directory
+default).
+
+Lifecycle and callbacks: `include/duckdb/main/client_context_state.hpp:20-47, 53-92` (`QueryBegin`/`QueryEnd`,
+transaction callbacks, `CanRequestRebind`, `OnFinalizePrepare`, `OnExecutePrepared`,
+`OnRebindPreparedStatement`, `RebindQueryInfo`) · `main/client_context.cpp:292-306` (`QueryEnd` after
+`profiler->EndQuery()`) and `:615-623` (rebind request honoured at execution) ·
+`transaction/transaction_context.cpp:50-72, 107` (commit and rollback callbacks after the commit) ·
+`include/duckdb/transaction/duck_transaction.hpp:43-47` (`start_time`, `transaction_id`, `commit_id`) ·
+`include/duckdb/catalog/catalog.hpp:127` (`GetCatalogVersion`) · `include/duckdb/catalog/catalog_entry.hpp:51-54`
+(`temporary`, `internal`) · `execution/operator/helper/physical_explain_analyze.cpp:20-27` (latency fixed in
+`Finalize`) · `parallel/pipeline_executor.cpp:42-46, 51-57` (skipped pipelines, partial flush).
+
+Order and operators: `execution/operator/helper/physical_result_collector.cpp:25-52` (vanilla's collector
+choice) · `include/duckdb/execution/physical_plan_generator.hpp:91-93` and `execution/physical_plan/plan_insert.cpp:15-69`
+(`OrderPreservationRecursive`, `PreserveInsertionOrder`, `UseBatchIndex`) ·
+`include/duckdb/execution/physical_operator.hpp:227, 268-296` (`AllSourcesSupportBatchIndex`,
+`CachingPhysicalOperator`, `CACHE_THRESHOLD`) · `include/duckdb/planner/operator/logical_get.hpp:32-50, 69`
+(`function`, `bind_data`, `parameters`, `named_parameters`, `input_table_types`, `GetTable`) ·
+`include/duckdb/function/table_function.hpp:334, 454` (`to_string`) · `include/duckdb/function/function.hpp:61-62`
+(`FunctionData::Copy`/`Equals`).
 
 Literature the model follows: Nagel, Boncz, Viglas (ICDE 2013) for measured-cost recycling with a persistent
 history; Dursun et al. (SIGMOD 2017) for the observation that in-memory materialization is not free; Zhou et al.
