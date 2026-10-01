@@ -1,0 +1,140 @@
+# name: test/sql/recycler/recycler_settings_icu.test
+# description: TimeZone and Calendar (ICU) are part of every key; under each value the served answer equals vanilla's
+# group: [recycler]
+
+# Runs only with ICU linked into the unittest binary: EXT_FLAGS=-DBUILD_EXTENSIONS=icu make release (what the
+# build-test and debug jobs of tests.yml do); a plain build skips it here.
+
+require icu
+
+require waddle
+
+statement ok
+SET threads = 4;
+
+statement ok
+SET recycler_min_input_rows = 1;
+
+statement ok
+CREATE TABLE ts AS
+SELECT range AS id, range % 7 AS g, TIMESTAMPTZ '2020-01-01 00:00:00+00' + to_hours(range) AS t
+FROM range(20000);
+
+# ---------------------------------------------------------------------------
+# TimeZone: the VARCHAR rendering of a TIMESTAMPTZ is local time
+# ---------------------------------------------------------------------------
+statement ok
+SET TimeZone = 'UTC';
+
+statement ok
+SET disabled_optimizers = 'extension';
+
+query ITT nosort tz_utc
+SELECT g, min(t::VARCHAR) AS lo, max(t::VARCHAR) AS hi FROM ts GROUP BY g ORDER BY g
+----
+
+statement ok
+SET disabled_optimizers = '';
+
+query ITT nosort tz_utc
+SELECT g, min(t::VARCHAR) AS lo, max(t::VARCHAR) AS hi FROM ts GROUP BY g ORDER BY g
+----
+
+query ITT nosort tz_utc
+SELECT g, min(t::VARCHAR) AS lo, max(t::VARCHAR) AS hi FROM ts GROUP BY g ORDER BY g
+----
+
+statement ok
+SET TimeZone = 'America/New_York';
+
+statement ok
+SET disabled_optimizers = 'extension';
+
+query ITT nosort tz_new_york
+SELECT g, min(t::VARCHAR) AS lo, max(t::VARCHAR) AS hi FROM ts GROUP BY g ORDER BY g
+----
+
+statement ok
+SET disabled_optimizers = '';
+
+query ITT nosort tz_new_york
+SELECT g, min(t::VARCHAR) AS lo, max(t::VARCHAR) AS hi FROM ts GROUP BY g ORDER BY g
+----
+
+query ITT nosort tz_new_york
+SELECT g, min(t::VARCHAR) AS lo, max(t::VARCHAR) AS hi FROM ts GROUP BY g ORDER BY g
+----
+
+statement ok
+SET TimeZone = 'UTC';
+
+query ITT nosort tz_utc
+SELECT g, min(t::VARCHAR) AS lo, max(t::VARCHAR) AS hi FROM ts GROUP BY g ORDER BY g
+----
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+3
+
+# ---------------------------------------------------------------------------
+# Calendar: the year of a TIMESTAMPTZ
+# ---------------------------------------------------------------------------
+statement ok
+SET Calendar = 'japanese';
+
+statement ok
+SET disabled_optimizers = 'extension';
+
+query II nosort cal_japanese
+SELECT g, max(year(t)) AS y FROM ts GROUP BY g ORDER BY g
+----
+
+statement ok
+SET disabled_optimizers = '';
+
+query II nosort cal_japanese
+SELECT g, max(year(t)) AS y FROM ts GROUP BY g ORDER BY g
+----
+
+query II nosort cal_japanese
+SELECT g, max(year(t)) AS y FROM ts GROUP BY g ORDER BY g
+----
+
+statement ok
+SET Calendar = 'gregorian';
+
+statement ok
+SET disabled_optimizers = 'extension';
+
+query II nosort cal_gregorian
+SELECT g, max(year(t)) AS y FROM ts GROUP BY g ORDER BY g
+----
+
+statement ok
+SET disabled_optimizers = '';
+
+query II nosort cal_gregorian
+SELECT g, max(year(t)) AS y FROM ts GROUP BY g ORDER BY g
+----
+
+query II nosort cal_gregorian
+SELECT g, max(year(t)) AS y FROM ts GROUP BY g ORDER BY g
+----
+
+statement ok
+SET Calendar = 'japanese';
+
+query II nosort cal_japanese
+SELECT g, max(year(t)) AS y FROM ts GROUP BY g ORDER BY g
+----
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+6
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_stores'
+----
+4

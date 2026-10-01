@@ -33,6 +33,9 @@ struct RecyclerClientState : public ClientContextState {
 	//! effect here only after this connection's next SET/RESET/PRAGMA.
 	bool settings_loaded = false;
 	RecyclerSettings settings;
+	//! The result-affecting session settings as the pre hook read them (PlanSignatures::SettingsSalt); the post hook
+	//! keys the same statement under the same values
+	string settings_salt;
 	//! Whole-result write requested by the pre hook (a miss on an admissible query)
 	bool has_pending_whole = false;
 	SigHash whole_hash;

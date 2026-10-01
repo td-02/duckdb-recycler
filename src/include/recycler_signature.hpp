@@ -164,7 +164,11 @@ struct BlockShape {
 //! Analyzes a plan once and exposes per-node signatures
 class PlanSignatures {
 public:
-	explicit PlanSignatures(ClientContext &context, bool shape_mode = false);
+	//! Rendering of the session settings that change a result without changing the plan (see the definition); the
+	//! pre hook reads it once per statement and both hooks analyze under it
+	static string SettingsSalt(const ClientContext &context);
+	//! Every signature of this analysis carries salt
+	PlanSignatures(ClientContext &context, string salt);
 
 	//! Analyze the plan rooted at root (assigns canonical ids, computes NodeInfo for every node)
 	void Analyze(LogicalOperator &root);
@@ -186,6 +190,8 @@ private:
 		idx_t count;
 	};
 
+	PlanSignatures(ClientContext &context, string salt, bool shape_mode);
+
 	void AssignIds(const LogicalOperator &op);
 	void Compute(LogicalOperator &op);
 	void RenderNode(const LogicalOperator &op, const Frame &frame, Sink &sink, NodeInfo &info,
@@ -204,6 +210,8 @@ private:
 	ClientContext &context;
 	//! Shape mode: block normal form (see file comment)
 	const bool shape_mode;
+	//! Written at the start of every node, in the hash and in the stored rendering
+	const string salt;
 	const LogicalOperator *block_root = nullptr;
 	//! Sorted canonical strings of the block root's non-parameterized conjuncts
 	vector<string> root_conjuncts;

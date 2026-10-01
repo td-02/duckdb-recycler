@@ -178,8 +178,11 @@ volatile functions, parameters, table functions, temporary tables (private to th
 non-DuckDB catalogs (attached SQLite/Postgres/... databases change outside DuckDB's transactions), LIMIT
 without ORDER BY, runtime (dynamic) filters owned outside the subtree, or references into a delim join's other
 side are never cached; any statement that modifies data or the catalog clears the cache, and nothing is cached
-or served inside a transaction that has written. Cached collections are buffer-managed and bounded by `recycler_budget_mb` with
-benefit-density eviction.
+or served inside a transaction that has written. The values of the result-affecting session settings `TimeZone`,
+`Calendar` and `ieee_floating_point_ops` (the settings that change a result at execution time without changing the
+bound plan; `integer_division` is a parser option and already changes the plan) are part of every key, so a
+statement is never served an entry computed under other values. Cached collections are buffer-managed and bounded
+by `recycler_budget_mb` with benefit-density eviction.
 
 Settings: `recycler_enabled`, `recycler_whole_result`, `recycler_blocks`, `recycler_subtrees`, `recycler_subsumption`,
 `recycler_budget_mb`, `recycler_entry_cap_mb`, `recycler_entry_cap_rows`, `recycler_min_input_rows`,

@@ -1,0 +1,267 @@
+# name: test/sql/recycler/recycler_settings.test
+# description: ieee_floating_point_ops (a result-affecting setting the renderer cannot see) is part of every key
+# group: [recycler]
+
+require waddle
+
+statement ok
+SET threads = 4;
+
+# subsumption serves blocks only when the session does not promise insertion order
+statement ok
+SET preserve_insertion_order = false;
+
+statement ok
+SET recycler_min_input_rows = 1;
+
+statement ok
+CREATE TABLE t AS SELECT range AS id, range % 7 AS g, 1990 + range % 30 AS y FROM range(20000);
+
+statement ok
+CREATE TABLE d AS SELECT range AS id, 'role' || range AS role FROM range(12);
+
+statement ok
+CREATE TABLE k AS SELECT range AS id, 'kind' || range AS kind FROM range(7);
+
+# ---------------------------------------------------------------------------
+# whole result: the same plan under each value gets its own entry and is never served across values
+# ---------------------------------------------------------------------------
+statement ok
+SET ieee_floating_point_ops = true;
+
+query II
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g
+----
+0	2858
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+statement ok
+SET ieee_floating_point_ops = false;
+
+query II
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g
+----
+0	2858
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_stores'
+----
+2
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+0
+
+# each value is served its own entry
+statement ok
+SET ieee_floating_point_ops = true;
+
+query II
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g
+----
+0	2858
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+1
+
+statement ok
+SET ieee_floating_point_ops = false;
+
+query II
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g
+----
+0	2858
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+2
+
+# ---------------------------------------------------------------------------
+# subtree: the aggregate stored under one value (the two whole queries above stored theirs too) is served only
+# under that value; the ORDER BY direction keeps the whole results apart
+# ---------------------------------------------------------------------------
+query II
+SELECT g, sum(id) AS s FROM t GROUP BY g ORDER BY g
+----
+0	28578571
+1	28561429
+2	28564286
+3	28567143
+4	28570000
+5	28572857
+6	28575714
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'subtree_stores'
+----
+3
+
+statement ok
+SET ieee_floating_point_ops = true;
+
+query II
+SELECT g, sum(id) AS s FROM t GROUP BY g ORDER BY g DESC
+----
+6	28575714
+5	28572857
+4	28570000
+3	28567143
+2	28564286
+1	28561429
+0	28578571
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'subtree_hits'
+----
+0
+
+statement ok
+SET ieee_floating_point_ops = false;
+
+query II
+SELECT g, sum(id) AS s FROM t GROUP BY g ORDER BY g DESC
+----
+6	28575714
+5	28572857
+4	28570000
+3	28567143
+2	28564286
+1	28561429
+0	28578571
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'subtree_hits'
+----
+1
+
+# ---------------------------------------------------------------------------
+# subsumption: the block stored under one value is not served to a narrower block under the other
+# ---------------------------------------------------------------------------
+query II
+SELECT g, count(*) AS c FROM t JOIN d ON t.g = d.id JOIN k ON k.id = t.g WHERE y IS NOT NULL AND d.id < 3 GROUP BY g ORDER BY g
+----
+0	2858
+1	2857
+2	2857
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'block_stores'
+----
+1
+
+statement ok
+SET ieee_floating_point_ops = true;
+
+query II
+SELECT g, count(*) AS c FROM t JOIN d ON t.g = d.id JOIN k ON k.id = t.g WHERE y BETWEEN 2000 AND 2005 AND d.id < 3 GROUP BY g ORDER BY g
+----
+0	572
+1	572
+2	571
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'subsumption_hits'
+----
+0
+
+statement ok
+SET ieee_floating_point_ops = false;
+
+query II
+SELECT g, count(*) AS c FROM t JOIN d ON t.g = d.id JOIN k ON k.id = t.g WHERE y BETWEEN 2000 AND 2005 AND d.id < 3 GROUP BY g ORDER BY g
+----
+0	572
+1	572
+2	571
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'subsumption_hits'
+----
+1
+
+# ---------------------------------------------------------------------------
+# under each value the stored and the served answers equal vanilla's (the labelled runs with the extension's
+# optimizer disabled): a division by zero is NULL or infinity
+# ---------------------------------------------------------------------------
+statement ok
+SET disabled_optimizers = 'extension';
+
+query IRI nosort div_zero_null
+SELECT g, max(1.0::DOUBLE / (id % 2)) AS m, count(1.0::DOUBLE / (id % 2)) AS n FROM t GROUP BY g ORDER BY g
+----
+
+statement ok
+SET disabled_optimizers = '';
+
+query IRI nosort div_zero_null
+SELECT g, max(1.0::DOUBLE / (id % 2)) AS m, count(1.0::DOUBLE / (id % 2)) AS n FROM t GROUP BY g ORDER BY g
+----
+
+query IRI nosort div_zero_null
+SELECT g, max(1.0::DOUBLE / (id % 2)) AS m, count(1.0::DOUBLE / (id % 2)) AS n FROM t GROUP BY g ORDER BY g
+----
+
+statement ok
+SET ieee_floating_point_ops = true;
+
+statement ok
+SET disabled_optimizers = 'extension';
+
+query IRI nosort div_zero_inf
+SELECT g, max(1.0::DOUBLE / (id % 2)) AS m, count(1.0::DOUBLE / (id % 2)) AS n FROM t GROUP BY g ORDER BY g
+----
+
+statement ok
+SET disabled_optimizers = '';
+
+query IRI nosort div_zero_inf
+SELECT g, max(1.0::DOUBLE / (id % 2)) AS m, count(1.0::DOUBLE / (id % 2)) AS n FROM t GROUP BY g ORDER BY g
+----
+
+query IRI nosort div_zero_inf
+SELECT g, max(1.0::DOUBLE / (id % 2)) AS m, count(1.0::DOUBLE / (id % 2)) AS n FROM t GROUP BY g ORDER BY g
+----
+
+statement ok
+SET ieee_floating_point_ops = false;
+
+query IRI nosort div_zero_null
+SELECT g, max(1.0::DOUBLE / (id % 2)) AS m, count(1.0::DOUBLE / (id % 2)) AS n FROM t GROUP BY g ORDER BY g
+----
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+5
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_stores'
+----
+10

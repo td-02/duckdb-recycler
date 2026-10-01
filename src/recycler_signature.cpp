@@ -14,6 +14,7 @@
 #include "duckdb/execution/operator/join/join_filter_pushdown.hpp"
 #include "duckdb/function/function.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_case_expression.hpp"
@@ -262,7 +263,33 @@ idx_t RecyclerEstimateRowWidth(const vector<LogicalType> &types) {
 //===----------------------------------------------------------------------===//
 // PlanSignatures
 //===----------------------------------------------------------------------===//
-PlanSignatures::PlanSignatures(ClientContext &context, bool shape_mode) : context(context), shape_mode(shape_mode) {
+//! Session settings that change a query's result although the renderer sees the same plan: ICU reads TimeZone and
+//! Calendar into function bind data (not rendered), and ieee_floating_point_ops swaps the callback of the same "/"
+//! function without bind data (BindBinaryFloatingPoint). Everything else that affects a result is bound into the
+//! plan and rendered: integer_division is a parser option ("/" becomes "//"), ordering defaults, collations,
+//! search_path and casts are in the operators; threads and memory_limit change speed only. The values are read once
+//! per statement after binding, so a SET GLOBAL on another connection between the bind and the pre hook is not
+//! detected, as for the recycler's own settings (RecyclerClientState::settings_loaded). Documented in the README; a
+//! new entry here needs a sqllogictest.
+static const char *const ICU_SETTINGS[] = {"TimeZone", "Calendar"};
+
+string PlanSignatures::SettingsSalt(const ClientContext &context) {
+	string salt;
+	StringSink sink(salt);
+	for (auto name : ICU_SETTINGS) {
+		// registered when ICU loads; absent, the setting renders as empty
+		Value value;
+		sink.Str(context.TryGetCurrentSetting(name, value) && !value.IsNull() ? value.ToString() : string());
+	}
+	sink.Bool(Settings::Get<IeeeFloatingPointOpsSetting>(context));
+	return salt;
+}
+
+PlanSignatures::PlanSignatures(ClientContext &context, string salt) : PlanSignatures(context, std::move(salt), false) {
+}
+
+PlanSignatures::PlanSignatures(ClientContext &context, string salt, bool shape_mode)
+    : context(context), shape_mode(shape_mode), salt(std::move(salt)) {
 }
 
 const NodeInfo &PlanSignatures::Get(const LogicalOperator &op) const {
@@ -560,6 +587,7 @@ void PlanSignatures::RenderJoin(const LogicalComparisonJoin &join, const Frame &
 void PlanSignatures::RenderNode(const LogicalOperator &op, const Frame &frame, Sink &sink, NodeInfo &info,
                                 bool render_children) const {
 	sink.Tag("{");
+	sink.Str(salt);
 	sink.U8(static_cast<uint8_t>(op.type));
 	switch (op.type) {
 	case LogicalOperatorType::LOGICAL_GET: {
@@ -1175,7 +1203,7 @@ BlockShape ComputeBlockShape(ClientContext &context, const LogicalOperator &root
 	if (!root_info.Cacheable()) {
 		return shape;
 	}
-	PlanSignatures block(context, true);
+	PlanSignatures block(context, plan_info.salt, true);
 	block.AssignIds(root);
 	if (block.joins == 0) {
 		return shape;

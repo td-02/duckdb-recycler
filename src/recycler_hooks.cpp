@@ -564,7 +564,8 @@ void RecyclerPreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOpera
 	bool preserve_order = Settings::Get<PreserveInsertionOrderSetting>(context);
 
 	auto &root = **root_slot;
-	PlanSignatures sig(context);
+	client.settings_salt = PlanSignatures::SettingsSalt(context);
+	PlanSignatures sig(context, client.settings_salt);
 	try {
 		plan->ResolveOperatorTypes();
 		sig.Analyze(root);
@@ -732,7 +733,7 @@ void RecyclerOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator
 	// planted block markers learn which base columns their (now pruned and reordered) child produces
 	ResolveBlockColumns(*root_slot);
 
-	PlanSignatures sig(context);
+	PlanSignatures sig(context, client.settings_salt);
 	try {
 		plan->ResolveOperatorTypes();
 		sig.Analyze(**root_slot);
