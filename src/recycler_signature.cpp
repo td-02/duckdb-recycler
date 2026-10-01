@@ -285,7 +285,7 @@ string PlanSignatures::SettingsSalt(const ClientContext &context) {
 	for (auto name : ICU_SETTINGS) {
 		// registered when ICU loads; absent, the setting renders as empty
 		Value value;
-		sink.Str(context.TryGetCurrentSetting(name, value) && !value.IsNull() ? value.ToString() : string());
+		sink.Str(context.TryGetCurrentSetting(name, value) ? value.ToString() : string());
 	}
 	sink.Bool(Settings::Get<IeeeFloatingPointOpsSetting>(context));
 	sink.U8(static_cast<uint8_t>(Settings::Get<DefaultOrderSetting>(context)));
