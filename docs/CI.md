@@ -21,6 +21,8 @@ them, as they do in a plain developer build. The waddle artifact does not change
 The four build jobs share `.github/actions/build-extension`: it checks that the `duckdb` submodule is at the pinned tag `v1.5.5` (fetching
 that one tag so `git describe` stamps the extension with the version stock DuckDB expects), restores a `ccache` keyed on job name
 and submodule commit, runs one make target, and saves the cache right after the build so a red test run still warms the next one.
+The cache limit is 2 GB per job so that the objects of a build with debug information (1.9 GB before ccache's compression for a
+local `make reldebug`; the release objects are 85 MB) fit next to the previous submodule pin's objects while a pin changes.
 Cost (Actions minutes on `ubuntu-latest`, 4 vCPU): the first run of each job compiles all of DuckDB, about 45 min for `build-test`
 and `debug` and 55 min for each sanitizer job, roughly 200 min for the first pull request; with a warm cache only the extension's
 sources recompile, about 12 min per build job, 60 min per pull request and 15 min for a plain dispatch (`build-test`, `stock-duckdb`,
