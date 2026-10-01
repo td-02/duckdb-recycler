@@ -220,13 +220,6 @@ idx_t RecyclerCache::Seen(const SigHash &hash) const {
 	return node == history.end() ? 0 : node->second.history.seen;
 }
 
-void RecyclerCache::NoteRefused(const SigHash &hash, RefusalReason reason) {
-	D_ASSERT(reason != RefusalReason::NONE);
-	stats.refused[static_cast<idx_t>(reason)]++;
-	std::lock_guard<std::mutex> guard(lock);
-	History(hash).reason = reason;
-}
-
 void RecyclerCache::NoteMaterialized(const SigHash &hash, idx_t rows, idx_t bytes, uint64_t measured_cost_ns,
                                      bool too_big) {
 	if (too_big) {

@@ -175,9 +175,33 @@ SELECT value FROM recycler_stats() WHERE name = 'refused_table_function'
 20
 
 # ---------------------------------------------------------------------------
-# the history is bounded: 5000 distinct refused signatures leave the 4096 most recent ones
+# the history is bounded: 5000 distinct subtree candidates leave the 4096 most recently seen signatures
 # ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE u AS SELECT range AS id FROM range(10)
+
+# the aggregates are noted as seen but nothing is materialized: the table is far below the input threshold
+# (the constant sits inside the aggregate's argument, where no rewrite moves it out of the subtree)
+statement ok
+SET recycler_whole_result = false
+
+statement ok
+SET recycler_min_input_rows = 1000000
+
 loop i 0 5000
+
+statement ok
+SELECT max(id + ${i}) FROM u
+
+endloop
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'history_entries'
+----
+4096
+
+# a refused root has no signature and takes no slot
+loop i 0 10
 
 statement ok
 SELECT ${i} + random()
@@ -192,4 +216,4 @@ SELECT value FROM recycler_stats() WHERE name = 'history_entries'
 query I
 SELECT value FROM recycler_stats() WHERE name = 'refused_volatile_function'
 ----
-5001
+11

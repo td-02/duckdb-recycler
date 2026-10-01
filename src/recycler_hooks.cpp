@@ -576,8 +576,11 @@ void RecyclerPreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOpera
 	}
 	auto &root_info = sig.Get(root);
 	if (!root_info.Cacheable()) {
+		// the hash of a refused subtree is undefined, so the refusal is counted but not remembered per signature
+		auto reason = root_info.Reason();
+		D_ASSERT(reason != RefusalReason::NONE);
 		cache.stats.root_not_cacheable++;
-		cache.NoteRefused(root_info.hash, root_info.Reason());
+		cache.stats.refused[static_cast<idx_t>(reason)]++;
 	}
 
 	if (settings.whole_result && root_info.Cacheable()) {

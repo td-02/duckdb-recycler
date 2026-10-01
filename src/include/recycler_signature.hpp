@@ -57,7 +57,7 @@ struct SigHashHasher {
 	}
 };
 
-//! Why a subtree is not cacheable; counted per query root in recycler_stats() and kept in the signature history
+//! Why a subtree is not cacheable; counted per query root in recycler_stats()
 enum class RefusalReason : uint8_t {
 	NONE = 0,
 	TABLE_FUNCTION,

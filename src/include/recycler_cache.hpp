@@ -99,7 +99,6 @@ struct SignatureHistory {
 	uint64_t measured_cost_ns = 0;
 	uint64_t materialize_ns = 0;
 	uint64_t hit_ns = 0;
-	RefusalReason reason = RefusalReason::NONE;
 };
 
 struct RecyclerStats {
@@ -155,7 +154,6 @@ public:
 	//! The signature history (bounded to HISTORY_BOUND signatures, least recently noted first out)
 	idx_t NoteSeen(const SigHash &hash);
 	idx_t Seen(const SigHash &hash) const;
-	void NoteRefused(const SigHash &hash, RefusalReason reason);
 	//! A materialization finished with this size and the sink's wall time as its cost; `too_big` when the caps
 	//! stopped the store
 	void NoteMaterialized(const SigHash &hash, idx_t rows, idx_t bytes, uint64_t measured_cost_ns, bool too_big);
