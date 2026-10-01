@@ -13,8 +13,20 @@ SET recycler_min_input_rows = 1;
 statement ok
 CREATE TABLE t AS SELECT range AS id, range % 7 AS g, range % 13 AS h FROM range(20000);
 
-# every query over recycler_stats() / recycler_entries() below is itself refused as a table function scan,
-# which the refused_table_function expectations account for
+# every query over recycler_stats() / recycler_entries() is itself refused as a table function scan: this first
+# one counts itself
+query I
+SELECT value FROM recycler_stats() WHERE name = 'refused_table_function'
+----
+1
+
+statement ok
+SELECT count(*) FROM range(100000)
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'refused_table_function'
+----
+3
 
 # ---------------------------------------------------------------------------
 # a payer under EXPLAIN ANALYZE stores its aggregate (subtree) and its result (whole_result); both carry the
@@ -159,20 +171,6 @@ query I
 SELECT value FROM recycler_stats() WHERE name = 'refused_limit_without_order'
 ----
 1
-
-# 18 introspection queries so far, including this one
-query I
-SELECT value FROM recycler_stats() WHERE name = 'refused_table_function'
-----
-18
-
-statement ok
-SELECT count(*) FROM range(100000)
-
-query I
-SELECT value FROM recycler_stats() WHERE name = 'refused_table_function'
-----
-20
 
 # ---------------------------------------------------------------------------
 # the history is bounded: 5000 distinct subtree candidates leave the 4096 most recently seen signatures
