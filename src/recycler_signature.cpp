@@ -51,7 +51,6 @@
 
 #include <algorithm>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 
 namespace duckdb {
@@ -128,15 +127,6 @@ string SigHash::ToString() const {
 	char buf[40];
 	snprintf(buf, sizeof(buf), "%016llx%016llx", (unsigned long long)h1, (unsigned long long)h2);
 	return string(buf);
-}
-
-bool SigHash::TryParse(const string &text, SigHash &result) {
-	if (text.size() != 32 || text.find_first_not_of("0123456789abcdef") != string::npos) {
-		return false;
-	}
-	result.h1 = std::strtoull(text.substr(0, 16).c_str(), nullptr, 16);
-	result.h2 = std::strtoull(text.substr(16).c_str(), nullptr, 16);
-	return true;
 }
 
 const char *RefusalReasonName(RefusalReason reason) {

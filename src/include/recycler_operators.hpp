@@ -75,9 +75,11 @@ class PhysicalRecyclerScan : public PhysicalOperator {
 public:
 	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::INVALID;
 
-	PhysicalRecyclerScan(PhysicalPlan &physical_plan, vector<LogicalType> types, idx_t estimated_cardinality,
+	PhysicalRecyclerScan(PhysicalPlan &physical_plan, vector<LogicalType> types, idx_t estimated_cardinality, idx_t id,
 	                     shared_ptr<CachedEntry> entry, bool ordered, vector<column_t> column_ids);
 
+	//! RecyclerClientState::NextOperatorId at planning
+	idx_t id;
 	shared_ptr<CachedEntry> entry;
 	bool ordered;
 	vector<column_t> column_ids;
@@ -155,8 +157,11 @@ public:
 	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::INVALID;
 
 	PhysicalRecyclerMaterialize(PhysicalPlan &physical_plan, vector<LogicalType> types, idx_t estimated_cardinality,
-	                            RecyclerWriteSpec spec, shared_ptr<RecyclerCache> cache, PhysicalOperator &child);
+	                            idx_t id, RecyclerWriteSpec spec, shared_ptr<RecyclerCache> cache,
+	                            PhysicalOperator &child);
 
+	//! RecyclerClientState::NextOperatorId at planning
+	idx_t id;
 	RecyclerWriteSpec spec;
 	shared_ptr<RecyclerCache> cache;
 

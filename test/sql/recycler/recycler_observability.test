@@ -217,3 +217,53 @@ query I
 SELECT value FROM recycler_stats() WHERE name = 'refused_volatile_function'
 ----
 11
+
+# ---------------------------------------------------------------------------
+# two block entries of one shape in one profiled query: the first one serves a narrower range through a
+# RECYCLER_SCAN, the second one is materialized; each receives the time of its own operator only
+# ---------------------------------------------------------------------------
+statement ok
+PRAGMA recycler_clear
+
+statement ok
+SET recycler_min_input_rows = 1
+
+statement ok
+SET preserve_insertion_order = false
+
+statement ok
+CREATE TABLE d AS SELECT range AS id, 'role' || range AS role FROM range(7)
+
+statement ok
+CREATE TABLE k AS SELECT range AS id, 'kind' || range AS kind FROM range(7)
+
+# the payer is not profiled: its block keeps materialize_ms = 0, which the scan below must not overwrite
+query II
+SELECT g, count(*) AS c FROM t JOIN d ON t.g = d.id JOIN k ON k.id = t.g WHERE h BETWEEN 2 AND 5 GROUP BY g ORDER BY g
+----
+0	880
+1	880
+2	880
+3	879
+4	879
+5	879
+6	879
+
+query I
+SELECT count(*) FROM recycler_entries() WHERE kind = 'block'
+----
+1
+
+statement ok
+EXPLAIN ANALYZE SELECT count(*) FROM t JOIN d ON t.g = d.id JOIN k ON k.id = t.g WHERE h BETWEEN 3 AND 4 UNION ALL SELECT count(*) FROM t JOIN d ON t.g = d.id JOIN k ON k.id = t.g WHERE h BETWEEN 8 AND 9
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'subsumption_hits'
+----
+1
+
+query IIII
+SELECT hits, hit_ms > 0, materialize_ms > 0, measured_cost_ms > 0 FROM recycler_entries() WHERE kind = 'block' ORDER BY stored_at
+----
+1	true	false	true
+0	false	true	true

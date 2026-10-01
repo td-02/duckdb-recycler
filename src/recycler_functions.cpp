@@ -41,18 +41,18 @@ RecyclerClientState &RecyclerClientState::Get(ClientContext &context) {
 	return *context.registered_state->GetOrCreate<RecyclerClientState>("recycler");
 }
 
-void RecyclerClientState::NoteTouched(shared_ptr<CachedEntry> entry) {
+void RecyclerClientState::NoteTouched(idx_t operator_id, shared_ptr<CachedEntry> entry) {
 	if (!profiled) {
 		return;
 	}
 	std::lock_guard<std::mutex> guard(touched_lock);
-	touched.push_back(std::move(entry));
+	touched.push_back(TouchedEntry {operator_id, std::move(entry)});
 }
 
 //! A RECYCLER_MATERIALIZE or RECYCLER_SCAN node of the profiler tree
 struct ProfiledOperator {
 	bool materialize;
-	SigHash hash;
+	idx_t id;
 	//! Operator thread time of the node and of the operators below it, in nanoseconds
 	uint64_t own_ns;
 	uint64_t below_ns;
@@ -62,16 +62,17 @@ static uint64_t ToNs(double seconds) {
 	return uint64_t(seconds * 1e9);
 }
 
-//! The "Key" parameter of a recycler operator from the EXTRA_INFO map of its profiler node
-static bool ProfiledKey(const ProfilingInfo &info, SigHash &hash) {
+//! The "Id" parameter of a recycler operator from the EXTRA_INFO map of its profiler node
+static bool ProfiledId(const ProfilingInfo &info, idx_t &id) {
 	auto extra = info.metrics.find(MetricType::EXTRA_INFO);
 	if (extra == info.metrics.end()) {
 		return false;
 	}
 	for (auto &pair : MapValue::GetChildren(extra->second)) {
 		auto &fields = StructValue::GetChildren(pair);
-		if (StringValue::Get(fields[0]) == "Key") {
-			return SigHash::TryParse(StringValue::Get(fields[1]), hash);
+		if (StringValue::Get(fields[0]) == "Id") {
+			id = std::stoull(StringValue::Get(fields[1]));
+			return true;
 		}
 	}
 	return false;
@@ -93,7 +94,7 @@ static double CollectProfiledOperators(const ProfilingNode &node, vector<Profile
 		if (materialize || op_name == "RECYCLER_SCAN") {
 			ProfiledOperator op;
 			op.materialize = materialize;
-			if (ProfiledKey(info, op.hash)) {
+			if (ProfiledId(info, op.id)) {
 				op.own_ns = ToNs(own);
 				op.below_ns = ToNs(below);
 				out.push_back(op);
@@ -108,40 +109,38 @@ void RecyclerClientState::QueryEnd(ClientContext &context, optional_ptr<ErrorDat
 		return;
 	}
 	profiled = false;
-	vector<shared_ptr<CachedEntry>> entries;
+	vector<TouchedEntry> entries;
 	{
 		std::lock_guard<std::mutex> guard(touched_lock);
 		entries.swap(touched);
 	}
-	if (error) {
+	if (error || entries.empty()) {
+		// a failed query has no complete tree; without a touched entry the tree holds nothing to pair
 		return;
 	}
 	// runs after the query's latency was fixed (section 6.5 of the plan); the profiler's tree of this query stays
 	// readable until the next profiled query starts
 	try {
 		auto root = QueryProfiler::Get(context).GetRoot();
-		if (!root) {
-			// the plan had no operator the profiler covers
-			return;
-		}
+		D_ASSERT(root);
 		vector<ProfiledOperator> operators;
 		CollectProfiledOperators(*root, operators);
 		auto &cache = *GetRecyclerState(context)->cache;
 		for (auto &op : operators) {
-			for (auto &entry : entries) {
-				if (entry->hash == op.hash) {
-					if (op.materialize) {
-						entry->measured_cost_ns = op.below_ns;
-						entry->materialize_ns = op.own_ns;
-					} else {
-						entry->hit_ns = op.own_ns;
-					}
+			for (auto &touched : entries) {
+				if (touched.operator_id != op.id) {
+					continue;
 				}
-			}
-			if (op.materialize) {
-				cache.NoteMaterializeTime(op.hash, op.below_ns, op.own_ns);
-			} else {
-				cache.NoteHitTime(op.hash, op.own_ns);
+				auto &entry = *touched.entry;
+				if (op.materialize) {
+					entry.measured_cost_ns = op.below_ns;
+					entry.materialize_ns = op.own_ns;
+					cache.NoteMaterializeTime(entry.hash, op.below_ns, op.own_ns);
+				} else {
+					entry.hit_ns = op.own_ns;
+					cache.NoteHitTime(entry.hash, op.own_ns);
+				}
+				break;
 			}
 		}
 	} catch (std::exception &) {

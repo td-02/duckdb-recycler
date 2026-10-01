@@ -87,7 +87,8 @@ LogicalRecyclerScan::LogicalRecyclerScan(idx_t table_index, vector<LogicalType> 
 
 PhysicalOperator &LogicalRecyclerScan::CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) {
 	D_ASSERT(children.empty());
-	return planner.Make<PhysicalRecyclerScan>(types, entry->rows, entry, ordered, column_ids);
+	auto id = RecyclerClientState::Get(context).NextOperatorId();
+	return planner.Make<PhysicalRecyclerScan>(types, entry->rows, id, entry, ordered, column_ids);
 }
 
 string LogicalRecyclerScan::GetExtensionName() const {
@@ -134,10 +135,10 @@ void LogicalRecyclerScan::ResolveTypes() {
 // PhysicalRecyclerScan
 //===----------------------------------------------------------------------===//
 PhysicalRecyclerScan::PhysicalRecyclerScan(PhysicalPlan &physical_plan, vector<LogicalType> types_p,
-                                           idx_t estimated_cardinality, shared_ptr<CachedEntry> entry_p, bool ordered,
-                                           vector<column_t> column_ids_p)
+                                           idx_t estimated_cardinality, idx_t id, shared_ptr<CachedEntry> entry_p,
+                                           bool ordered, vector<column_t> column_ids_p)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types_p), estimated_cardinality),
-      entry(std::move(entry_p)), ordered(ordered), column_ids(std::move(column_ids_p)) {
+      id(id), entry(std::move(entry_p)), ordered(ordered), column_ids(std::move(column_ids_p)) {
 }
 
 string PhysicalRecyclerScan::GetName() const {
@@ -150,11 +151,12 @@ InsertionOrderPreservingMap<string> PhysicalRecyclerScan::ParamsToString() const
 	result["Key"] = entry->hash.ToString();
 	result["Rows"] = to_string(entry->rows);
 	result["Ordered"] = ordered ? "true" : "false";
+	result["Id"] = to_string(id);
 	return result;
 }
 
 unique_ptr<GlobalSourceState> PhysicalRecyclerScan::GetGlobalSourceState(ClientContext &context) const {
-	RecyclerClientState::Get(context).NoteTouched(entry);
+	RecyclerClientState::Get(context).NoteTouched(id, entry);
 	return make_uniq<RecyclerScanGlobalState>(*entry->data, ordered, column_ids);
 }
 
@@ -199,7 +201,8 @@ PhysicalOperator &LogicalRecyclerMaterialize::CreatePlan(ClientContext &context,
 	auto &child = planner.CreatePlan(*children[0]);
 	auto estimated = children[0]->has_estimated_cardinality ? children[0]->estimated_cardinality
 	                                                         : child.estimated_cardinality;
-	return planner.Make<PhysicalRecyclerMaterialize>(types, estimated, spec, cache, child);
+	auto id = RecyclerClientState::Get(context).NextOperatorId();
+	return planner.Make<PhysicalRecyclerMaterialize>(types, estimated, id, spec, cache, child);
 }
 
 string LogicalRecyclerMaterialize::GetExtensionName() const {
@@ -283,10 +286,11 @@ public:
 };
 
 PhysicalRecyclerMaterialize::PhysicalRecyclerMaterialize(PhysicalPlan &physical_plan, vector<LogicalType> types_p,
-                                                         idx_t estimated_cardinality, RecyclerWriteSpec spec_p,
-                                                         shared_ptr<RecyclerCache> cache_p, PhysicalOperator &child)
+                                                         idx_t estimated_cardinality, idx_t id,
+                                                         RecyclerWriteSpec spec_p, shared_ptr<RecyclerCache> cache_p,
+                                                         PhysicalOperator &child)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types_p), estimated_cardinality),
-      spec(std::move(spec_p)), cache(std::move(cache_p)) {
+      id(id), spec(std::move(spec_p)), cache(std::move(cache_p)) {
 	// the child lives in `children`, so the default BuildPipelines/GetSources/GetChildren and every planner walk
 	// (delim scan gathering, order preservation, thread estimation) see it
 	children.push_back(child);
@@ -301,6 +305,7 @@ InsertionOrderPreservingMap<string> PhysicalRecyclerMaterialize::ParamsToString(
 	result["Kind"] = RecyclerEntryKindName(spec.kind);
 	result["Key"] = spec.hash.ToString();
 	result["Ordered"] = spec.ordered ? "true" : "false";
+	result["Id"] = to_string(id);
 	return result;
 }
 
@@ -371,7 +376,7 @@ SinkFinalizeType PhysicalRecyclerMaterialize::Finalize(Pipeline &pipeline, Event
 		stored = cache->Store(entry, spec.budget_bytes);
 	}
 	if (stored) {
-		RecyclerClientState::Get(context).NoteTouched(std::move(entry));
+		RecyclerClientState::Get(context).NoteTouched(id, std::move(entry));
 	}
 	return SinkFinalizeType::READY;
 }

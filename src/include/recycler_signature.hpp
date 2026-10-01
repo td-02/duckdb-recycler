@@ -47,8 +47,6 @@ struct SigHash {
 		return h1 == other.h1 && h2 == other.h2;
 	}
 	string ToString() const;
-	//! Parse the output of ToString (as shown by EXPLAIN and the profiler); false for anything else
-	static bool TryParse(const string &text, SigHash &result);
 };
 
 struct SigHashHasher {
