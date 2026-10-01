@@ -167,6 +167,10 @@ const char *RefusalReasonName(RefusalReason reason) {
 		return "limit_without_order";
 	case RefusalReason::RUNTIME_FILTER:
 		return "runtime_filter";
+	case RefusalReason::TEMPORARY_TABLE:
+		return "temporary_table";
+	case RefusalReason::FOREIGN_CATALOG:
+		return "foreign_catalog";
 	default:
 		return "unknown";
 	}
@@ -564,6 +568,15 @@ void PlanSignatures::RenderNode(const LogicalOperator &op, const Frame &frame, S
 		if (!table) {
 			Refuse(info, RefusalReason::TABLE_FUNCTION);
 			break;
+		}
+		if (table->temporary) {
+			// a temp table is private to its connection: two connections with a same-named, same-shaped temp table
+			// are keyed alike (temp.main.t) but hold different rows
+			Refuse(info, RefusalReason::TEMPORARY_TABLE);
+		} else if (!table->catalog.IsDuckCatalog()) {
+			// tables of attached foreign catalogs (SQLite, Postgres, ...) change outside DuckDB's transactions, so
+			// no invalidation signal exists for them
+			Refuse(info, RefusalReason::FOREIGN_CATALOG);
 		}
 		if (get.extra_info.sample_options) {
 			Refuse(info, RefusalReason::SAMPLED_SCAN);

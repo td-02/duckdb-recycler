@@ -174,10 +174,11 @@ optimizer extension with two hooks (`src/recycler_hooks.cpp`):
   `preserve_insertion_order` is false; `SET recycler_subsumption = false` disables it.
 
 Correctness rules: results are keyed on the exact bound/optimized structure including types; subtrees with
-volatile functions, parameters, table functions, LIMIT without ORDER BY, runtime (dynamic) filters owned
-outside the subtree, or references into a delim join's other side are never cached; any statement that
-modifies data or the catalog clears the cache, and nothing is cached or served inside a transaction that
-has written. Cached collections are buffer-managed and bounded by `recycler_budget_mb` with
+volatile functions, parameters, table functions, temporary tables (private to their connection), tables of
+non-DuckDB catalogs (attached SQLite/Postgres/... databases change outside DuckDB's transactions), LIMIT
+without ORDER BY, runtime (dynamic) filters owned outside the subtree, or references into a delim join's other
+side are never cached; any statement that modifies data or the catalog clears the cache, and nothing is cached
+or served inside a transaction that has written. Cached collections are buffer-managed and bounded by `recycler_budget_mb` with
 benefit-density eviction.
 
 Settings: `recycler_enabled`, `recycler_whole_result`, `recycler_blocks`, `recycler_subtrees`, `recycler_subsumption`,

@@ -73,6 +73,8 @@ enum class RefusalReason : uint8_t {
 	DELIM_GET,
 	LIMIT_WITHOUT_ORDER,
 	RUNTIME_FILTER,
+	TEMPORARY_TABLE,
+	FOREIGN_CATALOG,
 	COUNT
 };
 
