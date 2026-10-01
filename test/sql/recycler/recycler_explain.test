@@ -67,10 +67,12 @@ EXPLAIN (ANALYZE, FORMAT JSON) SELECT g, count(*) AS c FROM t GROUP BY g ORDER B
 ----
 analyzed_plan	<REGEX>:.*RECYCLER_SCAN.*
 
+# the text renderer titles an extension operator's box with its type, EXTENSION, so the scan is recognised by
+# its parameters: only the scan prints the stored row count
 query II
 EXPLAIN ANALYZE SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g DESC
 ----
-analyzed_plan	<REGEX>:.*RECYCLER_SCAN.*
+analyzed_plan	<REGEX>:.*EXTENSION.*Kind: whole_result.*Rows: 7.*Ordered: true.*
 
 # the profile of a hit still carries the latency the grader scores
 query II
