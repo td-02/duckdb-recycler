@@ -73,11 +73,56 @@ SELECT kind, hit_ms = 0 FROM recycler_entries() WHERE hits = 0
 ----
 subtree	true
 
+query II
+SELECT kind, last_used > stored_at FROM recycler_entries() WHERE hits > 0
+----
+whole_result	true
+
 # the hit is noted in the history as well
 query II
 SELECT h.hit_ms > 0, h.last_seen > e.stored_at FROM recycler_entries() e JOIN recycler_history() h ON h.key = e.key WHERE e.hits > 0
 ----
 true	true
+
+# ---------------------------------------------------------------------------
+# a profiled statement that fails during execution writes no measurement: the aggregate it stored before the
+# failure keeps the sink's fallback cost and no materialization time, the other entries keep their times
+# ---------------------------------------------------------------------------
+statement error
+EXPLAIN ANALYZE SELECT g, c, CAST(CASE WHEN g = 3 THEN 'x' ELSE '1' END AS INTEGER) AS bad FROM (SELECT g, count(*) AS c FROM t WHERE h > 2 GROUP BY g) ORDER BY g
+----
+Conversion Error
+
+query I
+SELECT count(*) FROM recycler_entries()
+----
+3
+
+query I
+SELECT measured_cost_ms > 0 AND materialize_ms = 0 AND hit_ms = 0 FROM recycler_entries() WHERE stored_at = (SELECT max(stored_at) FROM recycler_entries())
+----
+true
+
+query II
+SELECT kind, materialize_ms > 0 AND (hit_ms > 0) = (hits > 0) FROM recycler_entries() WHERE stored_at < (SELECT max(stored_at) FROM recycler_entries()) ORDER BY kind
+----
+subtree	true
+whole_result	true
+
+# the next profiled statement records normally: it hits that aggregate and stores its own result
+statement ok
+EXPLAIN ANALYZE SELECT g, count(*) AS c FROM t WHERE h > 2 GROUP BY g ORDER BY g
+
+query II
+SELECT kind, hit_ms > 0 AND last_used > stored_at FROM recycler_entries() WHERE hits > 0 ORDER BY kind
+----
+subtree	true
+whole_result	true
+
+query I
+SELECT bool_and(measured_cost_ms > 0 AND materialize_ms > 0) FROM recycler_entries() WHERE stored_at = (SELECT max(stored_at) FROM recycler_entries())
+----
+true
 
 # ---------------------------------------------------------------------------
 # without a profile the sink's wall time stands in for the subtree cost and the materialization time stays unset
@@ -137,7 +182,7 @@ query II
 SELECT name, value FROM recycler_stats() WHERE name IN ('too_big', 'writes_planned') ORDER BY name
 ----
 too_big	1
-writes_planned	5
+writes_planned	8
 
 # the history keeps the size of the materialization the caps stopped
 query II
@@ -153,7 +198,7 @@ query II
 SELECT name, value FROM recycler_stats() WHERE name IN ('too_big', 'writes_planned') ORDER BY name
 ----
 too_big	1
-writes_planned	5
+writes_planned	8
 
 statement ok
 SET recycler_entry_cap_rows = 4000000
@@ -165,7 +210,7 @@ query II
 SELECT name, value FROM recycler_stats() WHERE name IN ('too_big', 'writes_planned') ORDER BY name
 ----
 too_big	1
-writes_planned	6
+writes_planned	9
 
 query I
 SELECT count(*) FROM recycler_entries() WHERE rows > 1000
