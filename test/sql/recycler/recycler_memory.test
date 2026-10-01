@@ -1,0 +1,187 @@
+# name: test/sql/recycler/recycler_memory.test
+# description: entry cap, budget-driven eviction and PRAGMA recycler_clear under a 1 MB budget
+# group: [recycler]
+
+require waddle
+
+statement ok
+SET threads = 4;
+
+statement ok
+SET recycler_min_input_rows = 1;
+
+statement ok
+SET recycler_budget_mb = 1;
+
+statement ok
+SET recycler_entry_cap_mb = 1;
+
+statement ok
+CREATE TABLE big AS SELECT range AS id, range % 100000 AS g, range % 5 AS h FROM range(200000);
+
+# ---------------------------------------------------------------------------
+# a result above the entry cap (100000 rows x 16 bytes) is materialized but not stored
+# ---------------------------------------------------------------------------
+query II
+SELECT g, count(*) AS c FROM big GROUP BY g ORDER BY g
+----
+200000 values hashing to 1565eb91c561496028aa3ea62f09edc5
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'too_big'
+----
+1
+
+query I
+SELECT count(*) FROM recycler_entries()
+----
+0
+
+# the oversized key is remembered: the repeat is neither served nor materialized again
+query II
+SELECT g, count(*) AS c FROM big GROUP BY g ORDER BY g
+----
+200000 values hashing to 1565eb91c561496028aa3ea62f09edc5
+
+query II
+SELECT name, value FROM recycler_stats() WHERE name IN ('too_big', 'whole_hits', 'writes_planned') ORDER BY name
+----
+too_big	1
+whole_hits	0
+writes_planned	1
+
+# ---------------------------------------------------------------------------
+# results of 20000 rows take two 256 KB blocks each: two of them fill the 1 MB budget exactly, the
+# third evicts the least recently used one. Each query also materializes its aggregate as a subtree,
+# which finishes first: the first one is stored and then evicted by its own query's whole result
+# (same benefit, older), the later ones are rejected because the whole results in the cache save more
+# work per byte.
+# ---------------------------------------------------------------------------
+query II
+SELECT g, count(*) AS c FROM big WHERE h = 0 GROUP BY g ORDER BY g
+----
+40000 values hashing to 17817d3a78c3ca2953704778a019fb00
+
+query III
+SELECT kind, rows, bytes FROM recycler_entries()
+----
+whole_result	20000	524272
+
+query II
+SELECT name, value FROM recycler_stats() WHERE name IN ('evictions', 'store_rejected', 'subtree_stores', 'whole_stores') ORDER BY name
+----
+evictions	1
+store_rejected	0
+subtree_stores	1
+whole_stores	1
+
+query II
+SELECT g, count(*) AS c FROM big WHERE h = 1 GROUP BY g ORDER BY g
+----
+40000 values hashing to db01126f100b7f4fe3c76ce2eecccd53
+
+query II
+SELECT name, value FROM recycler_stats() WHERE name IN ('entries', 'bytes', 'evictions', 'store_rejected') ORDER BY name
+----
+bytes	1048544
+entries	2
+evictions	1
+store_rejected	1
+
+query II
+SELECT g, count(*) AS c FROM big WHERE h = 2 GROUP BY g ORDER BY g
+----
+40000 values hashing to 12323765e330ec9efa3c0338ae6b0631
+
+query II
+SELECT name, value FROM recycler_stats() WHERE name IN ('entries', 'bytes', 'evictions', 'store_rejected') ORDER BY name
+----
+bytes	1048544
+entries	2
+evictions	2
+store_rejected	2
+
+query II
+SELECT g, count(*) AS c FROM big WHERE h = 3 GROUP BY g ORDER BY g
+----
+40000 values hashing to ac554d0cc2b0ecdc1786cb8e38b9ea33
+
+query II
+SELECT g, count(*) AS c FROM big WHERE h = 4 GROUP BY g ORDER BY g
+----
+40000 values hashing to cfb81360f3fa31f453b684e33e9fbbec
+
+query II
+SELECT name, value FROM recycler_stats() WHERE name IN ('entries', 'bytes', 'evictions', 'store_rejected', 'whole_stores') ORDER BY name
+----
+bytes	1048544
+entries	2
+evictions	4
+store_rejected	4
+whole_stores	5
+
+# ---------------------------------------------------------------------------
+# answers stay correct after eviction: evicted keys are recomputed and re-stored, survivors are served
+# ---------------------------------------------------------------------------
+query II
+SELECT g, count(*) AS c FROM big WHERE h = 0 GROUP BY g ORDER BY g
+----
+40000 values hashing to 17817d3a78c3ca2953704778a019fb00
+
+query II
+SELECT g, count(*) AS c FROM big WHERE h = 4 GROUP BY g ORDER BY g
+----
+40000 values hashing to cfb81360f3fa31f453b684e33e9fbbec
+
+query II
+SELECT g, count(*) AS c FROM big WHERE h = 1 GROUP BY g ORDER BY g
+----
+40000 values hashing to db01126f100b7f4fe3c76ce2eecccd53
+
+query II
+SELECT name, value FROM recycler_stats() WHERE name IN ('entries', 'bytes', 'evictions', 'store_rejected', 'whole_hits', 'whole_stores') ORDER BY name
+----
+bytes	1048544
+entries	2
+evictions	6
+store_rejected	6
+whole_hits	1
+whole_stores	7
+
+# the entry that was served has the higher benefit and survived the last eviction
+query II
+SELECT rows, hits FROM recycler_entries() ORDER BY hits
+----
+20000	0
+20000	1
+
+# ---------------------------------------------------------------------------
+# PRAGMA recycler_clear empties the cache
+# ---------------------------------------------------------------------------
+statement ok
+PRAGMA recycler_clear;
+
+query I
+SELECT count(*) FROM recycler_entries()
+----
+0
+
+query II
+SELECT name, value FROM recycler_stats() WHERE name IN ('entries', 'bytes') ORDER BY name
+----
+bytes	0
+entries	0
+
+query II
+SELECT g, count(*) AS c FROM big WHERE h = 4 GROUP BY g ORDER BY g
+----
+40000 values hashing to cfb81360f3fa31f453b684e33e9fbbec
+
+# the cleared cache is empty again, so the subtree is stored first and evicted by the whole result
+query II
+SELECT name, value FROM recycler_stats() WHERE name IN ('entries', 'bytes', 'evictions', 'whole_hits') ORDER BY name
+----
+bytes	524272
+entries	1
+evictions	7
+whole_hits	1

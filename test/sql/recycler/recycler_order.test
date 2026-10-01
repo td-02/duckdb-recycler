@@ -1,0 +1,287 @@
+# name: test/sql/recycler/recycler_order.test
+# description: with preserve_insertion_order every mechanism returns vanilla's rows in vanilla's order
+# group: [recycler]
+
+require waddle
+
+statement ok
+SET threads = 4;
+
+statement ok
+SET preserve_insertion_order = true;
+
+statement ok
+SET recycler_min_input_rows = 1;
+
+statement ok
+CREATE TABLE t AS
+SELECT range AS id, range % 7 AS g, 1990 + range % 30 AS y, range % 13 AS h,
+       CASE WHEN range % 2 = 0 THEN 'm' ELSE 'f' END AS gender
+FROM range(300000);
+
+statement ok
+CREATE TABLE d AS SELECT range AS id, 'role' || range AS role FROM range(12);
+
+statement ok
+CREATE TABLE k AS SELECT range AS id, 'kind' || range AS kind FROM range(7);
+
+# every shape is run once with the extension's optimizer hooks disabled (vanilla), then twice with
+# them enabled: the second run is the one that can be served from the cache. The labels compare rows
+# and order.
+
+# ---------------------------------------------------------------------------
+# whole result with ORDER BY: stored by a serial sink and replayed in stored order
+# ---------------------------------------------------------------------------
+statement ok
+SET disabled_optimizers = 'extension';
+
+query II nosort whole_ordered
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g DESC
+----
+
+statement ok
+RESET disabled_optimizers;
+
+query II nosort whole_ordered
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g DESC
+----
+
+query II nosort whole_ordered
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g DESC
+----
+
+query I
+SELECT value >= 1 FROM recycler_stats() WHERE name = 'whole_hits'
+----
+true
+
+# ---------------------------------------------------------------------------
+# whole result without ORDER BY: insertion order is observable, so the result is never stored
+# ---------------------------------------------------------------------------
+statement ok
+SET disabled_optimizers = 'extension';
+
+query II nosort whole_unordered
+SELECT id, h FROM t WHERE g = 3 AND h > 10
+----
+
+statement ok
+RESET disabled_optimizers;
+
+query II nosort whole_unordered
+SELECT id, h FROM t WHERE g = 3 AND h > 10
+----
+
+query II nosort whole_unordered
+SELECT id, h FROM t WHERE g = 3 AND h > 10
+----
+
+query I
+SELECT count(*) FROM recycler_entries() WHERE kind = 'whole_result' AND NOT ordered
+----
+0
+
+# ---------------------------------------------------------------------------
+# subtree hit (aggregate) under a different ORDER BY
+# ---------------------------------------------------------------------------
+statement ok
+SET disabled_optimizers = 'extension';
+
+query TI nosort subtree_sorted
+SELECT d.role, count(*) AS c FROM t JOIN d ON t.g = d.id WHERE t.gender = 'f' GROUP BY d.role ORDER BY d.role DESC
+----
+
+statement ok
+RESET disabled_optimizers;
+
+query TI nosort subtree_sorted_asc
+SELECT d.role, count(*) AS c FROM t JOIN d ON t.g = d.id WHERE t.gender = 'f' GROUP BY d.role ORDER BY d.role
+----
+
+query TI nosort subtree_sorted
+SELECT d.role, count(*) AS c FROM t JOIN d ON t.g = d.id WHERE t.gender = 'f' GROUP BY d.role ORDER BY d.role DESC
+----
+
+query I
+SELECT value >= 1 FROM recycler_stats() WHERE name = 'subtree_hits'
+----
+true
+
+# ---------------------------------------------------------------------------
+# subtree hit (aggregate) under a projection without ORDER BY: the aggregate's output order is
+# whatever the hash table produced, and the replay must reproduce it
+# ---------------------------------------------------------------------------
+statement ok
+SET disabled_optimizers = 'extension';
+
+query II nosort agg_unordered
+SELECT g, c + 0 FROM (SELECT g, count(*) AS c FROM t WHERE h < 11 GROUP BY g) sub
+----
+
+statement ok
+RESET disabled_optimizers;
+
+query II nosort agg_unordered
+SELECT g, c + 0 FROM (SELECT g, count(*) AS c FROM t WHERE h < 11 GROUP BY g) sub
+----
+
+query II nosort agg_unordered
+SELECT g, c + 0 FROM (SELECT g, count(*) AS c FROM t WHERE h < 11 GROUP BY g) sub
+----
+
+# ---------------------------------------------------------------------------
+# subsumption-shaped block (three-way join with a range predicate) under narrower predicates
+# ---------------------------------------------------------------------------
+statement ok
+SET disabled_optimizers = 'extension';
+
+query ITII nosort block_wide
+SELECT g, gender, count(*) AS c, max(y) AS my FROM t JOIN d ON t.g = d.id JOIN k ON k.id = t.g WHERE y IS NOT NULL AND d.id < 3 GROUP BY g, gender ORDER BY g, gender
+----
+
+query II nosort block_narrow
+SELECT g, count(*) AS c FROM t JOIN d ON t.g = d.id JOIN k ON k.id = t.g WHERE y BETWEEN 2000 AND 2005 AND d.id < 3 GROUP BY g ORDER BY g
+----
+
+statement ok
+RESET disabled_optimizers;
+
+query ITII nosort block_wide
+SELECT g, gender, count(*) AS c, max(y) AS my FROM t JOIN d ON t.g = d.id JOIN k ON k.id = t.g WHERE y IS NOT NULL AND d.id < 3 GROUP BY g, gender ORDER BY g, gender
+----
+
+query II nosort block_narrow
+SELECT g, count(*) AS c FROM t JOIN d ON t.g = d.id JOIN k ON k.id = t.g WHERE y BETWEEN 2000 AND 2005 AND d.id < 3 GROUP BY g ORDER BY g
+----
+
+query II nosort block_narrow
+SELECT g, count(*) AS c FROM t JOIN d ON t.g = d.id JOIN k ON k.id = t.g WHERE y BETWEEN 2000 AND 2005 AND d.id < 3 GROUP BY g ORDER BY g
+----
+
+# block subsumption is switched off while insertion order is observable
+query I
+SELECT value FROM recycler_stats() WHERE name = 'subsumption_hits'
+----
+0
+
+# ---------------------------------------------------------------------------
+# nested block: an earlier whole query inside a subquery, outer filter without ORDER BY
+# ---------------------------------------------------------------------------
+statement ok
+SET disabled_optimizers = 'extension';
+
+query II nosort nested
+SELECT * FROM (SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g) sub WHERE sub.g IN (0, 6)
+----
+
+statement ok
+RESET disabled_optimizers;
+
+query II nosort nested_inner
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g
+----
+
+query II nosort nested
+SELECT * FROM (SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g) sub WHERE sub.g IN (0, 6)
+----
+
+query I
+SELECT value >= 1 FROM recycler_stats() WHERE name = 'block_hits'
+----
+true
+
+# the outer query's own result was written as well, by a parallel sink: it is marked unordered and
+# therefore never served while insertion order is observable (the repeat is another block hit; the
+# lookup still counts a hit on the refused entry)
+query IIII
+SELECT kind, rows, ordered, hits FROM recycler_entries() WHERE kind = 'whole_result' AND NOT ordered
+----
+whole_result	2	false	0
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+2
+
+query II nosort nested
+SELECT * FROM (SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g) sub WHERE sub.g IN (0, 6)
+----
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+2
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'block_hits'
+----
+2
+
+query IIII
+SELECT kind, rows, ordered, hits FROM recycler_entries() WHERE kind = 'whole_result' AND NOT ordered
+----
+whole_result	2	false	1
+
+# ---------------------------------------------------------------------------
+# ORDER BY ... LIMIT over a plain scan is never written: the optimizer rewrites it into a TOP_N on
+# row ids plus a semi join with a dynamic filter, which the post hook does not accept. The answer is
+# vanilla's either way.
+# ---------------------------------------------------------------------------
+statement ok
+SET disabled_optimizers = 'extension';
+
+query II nosort limited_scan
+SELECT id, h FROM t WHERE g = 5 ORDER BY h DESC, id LIMIT 20
+----
+
+statement ok
+RESET disabled_optimizers;
+
+query II nosort limited_scan
+SELECT id, h FROM t WHERE g = 5 ORDER BY h DESC, id LIMIT 20
+----
+
+query II nosort limited_scan
+SELECT id, h FROM t WHERE g = 5 ORDER BY h DESC, id LIMIT 20
+----
+
+query I
+SELECT count(*) FROM recycler_entries() WHERE rows = 20
+----
+0
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+2
+
+# ---------------------------------------------------------------------------
+# ORDER BY ... LIMIT over an aggregate is stored by a serial sink and replayed in order
+# ---------------------------------------------------------------------------
+statement ok
+SET disabled_optimizers = 'extension';
+
+query II nosort limited_agg
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY c DESC, g LIMIT 3
+----
+
+statement ok
+RESET disabled_optimizers;
+
+query II nosort limited_agg
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY c DESC, g LIMIT 3
+----
+
+query II nosort limited_agg
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY c DESC, g LIMIT 3
+----
+
+query I
+SELECT count(*) FROM recycler_entries() WHERE kind = 'whole_result' AND rows = 3 AND ordered
+----
+2
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+3
