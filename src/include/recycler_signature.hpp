@@ -75,6 +75,7 @@ enum class RefusalReason : uint8_t {
 	RUNTIME_FILTER,
 	TEMPORARY_TABLE,
 	FOREIGN_CATALOG,
+	SESSION_BOUND_FUNCTION,
 	COUNT
 };
 

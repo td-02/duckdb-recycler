@@ -173,6 +173,8 @@ const char *RefusalReasonName(RefusalReason reason) {
 		return "temporary_table";
 	case RefusalReason::FOREIGN_CATALOG:
 		return "foreign_catalog";
+	case RefusalReason::SESSION_BOUND_FUNCTION:
+		return "session_bound_function";
 	default:
 		return "unknown";
 	}
@@ -270,8 +272,9 @@ idx_t RecyclerEstimateRowWidth(const vector<LogicalType> &types) {
 //! resolved by the binder, so a sort's direction is in the operator), and ieee_floating_point_ops swaps the callback
 //! of the same "/" function without bind data (BindBinaryFloatingPoint). Everything else that affects a result is
 //! bound into the plan and rendered: integer_division is a parser option ("/" becomes "//"), collations, search_path
-//! and casts are in the operators; threads and memory_limit change speed only. The values are read once per
-//! statement after binding, so a SET GLOBAL on another connection between the bind and the pre hook is not
+//! and casts are in the operators; threads and memory_limit change speed only. current_setting(), whose bind data
+//! holds the value of whichever setting it names, is refused instead (RenderExpression). The values are read once
+//! per statement after binding, so a SET GLOBAL on another connection between the bind and the pre hook is not
 //! detected, as for the recycler's own settings (RecyclerClientState::settings_loaded). Documented in the README; a
 //! new entry here needs a sqllogictest.
 static const char *const ICU_SETTINGS[] = {"TimeZone", "Calendar"};
@@ -451,6 +454,10 @@ void PlanSignatures::RenderExpression(const Expression &expr, const Frame &frame
 		auto &func = expr.Cast<BoundFunctionExpression>();
 		if (func.function.GetStability() != FunctionStability::CONSISTENT) {
 			Refuse(info, RefusalReason::VOLATILE_FUNCTION);
+		} else if (func.function.name == "current_setting") {
+			// CONSISTENT, but CurrentSettingBind folds the named setting's value into bind data, which is rendered
+			// below only as current_setting('name'): the result is a function of the session, not of the arguments
+			Refuse(info, RefusalReason::SESSION_BOUND_FUNCTION);
 		}
 		sink.Str(func.function.name);
 		sink.Bool(func.is_operator);

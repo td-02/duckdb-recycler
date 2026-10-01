@@ -1,5 +1,5 @@
 # name: test/sql/recycler/recycler_settings.test
-# description: the result-affecting settings the renderer cannot see (ieee_floating_point_ops, default_order, default_null_order) are part of every key
+# description: the result-affecting settings the renderer cannot see (ieee_floating_point_ops, default_order, default_null_order) are part of every key; current_setting() is refused
 # group: [recycler]
 
 require waddle
@@ -377,6 +377,48 @@ query I
 SELECT value FROM recycler_stats() WHERE name = 'whole_stores'
 ----
 14
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+9
+
+# ---------------------------------------------------------------------------
+# current_setting folds the named setting's value into its bind data: a CONSISTENT function whose result is a function
+# of the session, not of its arguments, so the statement is refused rather than keyed
+# ---------------------------------------------------------------------------
+statement ok
+SET threads = 2;
+
+query II
+SELECT g, current_setting('threads') AS th FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+0	2
+1	2
+2	2
+3	2
+4	2
+5	2
+6	2
+
+statement ok
+SET threads = 3;
+
+query II
+SELECT g, current_setting('threads') AS th FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+0	3
+1	3
+2	3
+3	3
+4	3
+5	3
+6	3
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'refused_session_bound_function'
+----
+2
 
 query I
 SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
