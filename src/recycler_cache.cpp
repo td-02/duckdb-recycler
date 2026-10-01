@@ -227,7 +227,7 @@ void RecyclerCache::NoteRefused(const SigHash &hash, RefusalReason reason) {
 	History(hash).reason = reason;
 }
 
-void RecyclerCache::NoteMaterialized(const SigHash &hash, idx_t rows, idx_t bytes, uint64_t materialize_ns,
+void RecyclerCache::NoteMaterialized(const SigHash &hash, idx_t rows, idx_t bytes, uint64_t measured_cost_ns,
                                      bool too_big) {
 	if (too_big) {
 		stats.too_big++;
@@ -236,7 +236,7 @@ void RecyclerCache::NoteMaterialized(const SigHash &hash, idx_t rows, idx_t byte
 	auto &entry = History(hash);
 	entry.rows = rows;
 	entry.bytes = bytes;
-	entry.materialize_ns = materialize_ns;
+	entry.measured_cost_ns = measured_cost_ns;
 }
 
 bool RecyclerCache::TooBig(const SigHash &hash, idx_t cap_rows, idx_t cap_bytes) const {

@@ -50,7 +50,7 @@ SELECT kind, hit_ms = 0 FROM recycler_entries() WHERE hits = 0
 subtree	true
 
 # ---------------------------------------------------------------------------
-# without a profile the sink's own timer provides the materialization time and the subtree cost stays unset
+# without a profile the sink's wall time stands in for the subtree cost and the materialization time stays unset
 # ---------------------------------------------------------------------------
 statement ok
 PRAGMA recycler_clear
@@ -64,7 +64,7 @@ SELECT count(*) FROM recycler_entries()
 2
 
 query I
-SELECT bool_and(measured_cost_ms = 0 AND materialize_ms > 0 AND sink_calls >= 1 AND used_bytes > 0 AND used_bytes <= bytes)
+SELECT bool_and(measured_cost_ms > 0 AND materialize_ms = 0 AND sink_calls >= 1 AND used_bytes > 0 AND used_bytes <= bytes)
 FROM recycler_entries()
 ----
 true

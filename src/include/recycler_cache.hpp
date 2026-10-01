@@ -50,7 +50,7 @@ struct CachedEntry {
 	std::atomic<idx_t> hits {0};
 	//! Operator thread time from the profiler tree of the query that stored (or last hit) the entry, written by
 	//! that connection's QueryEnd while recycler_entries() may read on another: the cost of producing the
-	//! wrapped subtree, the materialization's own time (the sink's wall time when the query was not profiled)
+	//! wrapped subtree (the sink's wall time when the query was not profiled), the materialization's own time
 	//! and the time of the last RECYCLER_SCAN over the entry
 	std::atomic<uint64_t> measured_cost_ns {0};
 	std::atomic<uint64_t> materialize_ns {0};
@@ -156,8 +156,9 @@ public:
 	idx_t NoteSeen(const SigHash &hash);
 	idx_t Seen(const SigHash &hash) const;
 	void NoteRefused(const SigHash &hash, RefusalReason reason);
-	//! A materialization finished with this size; `too_big` when the caps stopped the store
-	void NoteMaterialized(const SigHash &hash, idx_t rows, idx_t bytes, uint64_t materialize_ns, bool too_big);
+	//! A materialization finished with this size and the sink's wall time as its cost; `too_big` when the caps
+	//! stopped the store
+	void NoteMaterialized(const SigHash &hash, idx_t rows, idx_t bytes, uint64_t measured_cost_ns, bool too_big);
 	//! The last materialization of this signature exceeded the given caps
 	bool TooBig(const SigHash &hash, idx_t cap_rows, idx_t cap_bytes) const;
 	//! Measured operator thread time of a materialization (the wrapped subtree and the operator's own time) and

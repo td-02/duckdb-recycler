@@ -255,7 +255,8 @@ public:
 	      start(std::chrono::steady_clock::now()) {
 	}
 
-	//! Wall time from the sink's creation to Finalize: the materialization cost when the query is not profiled
+	//! Wall time from the sink's creation (executor start) to Finalize: stands in for the cost of producing the
+	//! wrapped subtree when the query is not profiled (section 3.1 of the plan)
 	uint64_t ElapsedNs() const {
 		auto elapsed = std::chrono::steady_clock::now() - start;
 		return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
@@ -341,9 +342,9 @@ SinkFinalizeType PhysicalRecyclerMaterialize::Finalize(Pipeline &pipeline, Event
 	auto &gstate = input.global_state.Cast<RecyclerMaterializeGlobalSinkState>();
 	auto rows = gstate.collection->Count();
 	idx_t bytes = gstate.collection->AllocationSize();
-	auto materialize_ns = gstate.ElapsedNs();
+	auto cost_ns = gstate.ElapsedNs();
 	bool too_big = gstate.too_big || rows > spec.cap_rows || bytes > spec.cap_bytes;
-	cache->NoteMaterialized(spec.hash, rows, bytes, materialize_ns, too_big);
+	cache->NoteMaterialized(spec.hash, rows, bytes, cost_ns, too_big);
 	if (too_big) {
 		return SinkFinalizeType::READY;
 	}
@@ -357,7 +358,7 @@ SinkFinalizeType PhysicalRecyclerMaterialize::Finalize(Pipeline &pipeline, Event
 	entry->bytes = bytes;
 	entry->used_bytes = gstate.collection->SizeInBytes();
 	entry->sink_calls = gstate.sink_calls;
-	entry->materialize_ns = materialize_ns;
+	entry->measured_cost_ns = cost_ns;
 	entry->ordered = spec.ordered;
 	entry->est_input_rows = spec.est_input_rows;
 	bool stored;
