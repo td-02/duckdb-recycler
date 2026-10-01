@@ -293,11 +293,11 @@ string PlanSignatures::SettingsSalt(const ClientContext &context) {
 	return salt;
 }
 
-PlanSignatures::PlanSignatures(ClientContext &context, string salt) : PlanSignatures(context, std::move(salt), false) {
+PlanSignatures::PlanSignatures(ClientContext &context, const string &salt) : PlanSignatures(context, salt, false) {
 }
 
-PlanSignatures::PlanSignatures(ClientContext &context, string salt, bool shape_mode)
-    : context(context), shape_mode(shape_mode), salt(std::move(salt)) {
+PlanSignatures::PlanSignatures(ClientContext &context, const string &salt, bool shape_mode)
+    : context(context), shape_mode(shape_mode), salt(salt) {
 }
 
 const NodeInfo &PlanSignatures::Get(const LogicalOperator &op) const {
