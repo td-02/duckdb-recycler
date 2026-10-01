@@ -3,7 +3,7 @@
 # group: [recycler]
 
 # Tables of attached non-DuckDB catalogs (SQLite, Postgres, ...) go through the same LOGICAL_GET refusal
-# (refused_foreign_catalog); they need another extension to attach and are therefore not exercised here.
+# (refused_foreign_catalog): recycler_catalogs_sqlite.test, which needs sqlite_scanner linked into the binary.
 
 require waddle
 

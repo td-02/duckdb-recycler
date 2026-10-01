@@ -37,9 +37,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 75
     env:
-      # Links ICU into the unittest binary so that recycler_settings_icu.test (TimeZone and Calendar in the
-      # key) runs instead of being skipped by its `require icu`; the waddle artifact is the same.
+      # Links ICU and sqlite_scanner into the unittest binary so that recycler_settings_icu.test (TimeZone and
+      # Calendar in the key) and recycler_catalogs_sqlite.test (a non-DuckDB catalog's tables are refused) run
+      # instead of being skipped by their `require` lines; the waddle artifact is the same. sqlite_scanner is
+      # out of tree: duckdb's pinned config fetches it at configure time and links it statically.
       EXT_FLAGS: -DBUILD_EXTENSIONS=icu
+      EXTRA_EXTENSION_CONFIGS: ${{ github.workspace }}/duckdb/.github/config/extensions/sqlite_scanner.cmake
     steps:
       - uses: actions/checkout@v4
         with:
@@ -72,6 +75,7 @@ jobs:
       # suites several times faster and a failure here is an assertion or a logic error.
       DISABLE_SANITIZER: 1
       EXT_FLAGS: -DBUILD_EXTENSIONS=icu
+      EXTRA_EXTENSION_CONFIGS: ${{ github.workspace }}/duckdb/.github/config/extensions/sqlite_scanner.cmake
     steps:
       - uses: actions/checkout@v4
         with:
