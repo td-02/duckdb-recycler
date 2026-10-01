@@ -1,5 +1,5 @@
 # name: test/sql/recycler/recycler_settings.test
-# description: the result-affecting settings the renderer cannot see (ieee_floating_point_ops, default_order, default_null_order) are part of every key; current_setting() is refused
+# description: the result-affecting settings the renderer cannot see (ieee_floating_point_ops, default_order, default_null_order) are part of every key; current_setting() is refused; integer_division is in the plan
 # group: [recycler]
 
 require waddle
@@ -424,3 +424,68 @@ query I
 SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
 ----
 9
+
+# ---------------------------------------------------------------------------
+# integer_division needs no salt: it is a parser option that rewrites "/" into "//", so the two plans differ in the
+# rendered function and each value gets its own entry; under each value the stored and the served answers equal
+# vanilla's (a half is 0.5 or 0)
+# ---------------------------------------------------------------------------
+statement ok
+SET integer_division = false;
+
+statement ok
+SET disabled_optimizers = 'extension';
+
+query IR nosort div_float
+SELECT g, max(id / 2) AS m FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+
+statement ok
+SET disabled_optimizers = '';
+
+query IR nosort div_float
+SELECT g, max(id / 2) AS m FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+
+query IR nosort div_float
+SELECT g, max(id / 2) AS m FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+
+statement ok
+SET integer_division = true;
+
+statement ok
+SET disabled_optimizers = 'extension';
+
+query II nosort div_int
+SELECT g, max(id / 2) AS m FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+
+statement ok
+SET disabled_optimizers = '';
+
+# a miss: the entry stored under "/" is not served to "//"
+query II nosort div_int
+SELECT g, max(id / 2) AS m FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+
+query II nosort div_int
+SELECT g, max(id / 2) AS m FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+
+statement ok
+SET integer_division = false;
+
+query IR nosort div_float
+SELECT g, max(id / 2) AS m FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_stores'
+----
+16
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+12
