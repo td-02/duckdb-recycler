@@ -78,6 +78,9 @@ query I nosort hits_insert
 SELECT sum(value) FROM recycler_stats() WHERE name IN ('whole_hits', 'block_hits', 'subtree_hits', 'subsumption_hits')
 
 statement ok
+SET VARIABLE skip_modifying_before = (SELECT value FROM recycler_stats() WHERE name = 'skip_modifying');
+
+statement ok
 INSERT INTO t VALUES (300000, 0, 0, 'extra', 'f');
 
 query I
@@ -85,8 +88,9 @@ SELECT count(*) FROM recycler_entries()
 ----
 0
 
+# the INSERT itself was classified as a modifying statement
 query I
-SELECT value >= 1 FROM recycler_stats() WHERE name = 'skip_modifying'
+SELECT value = getvariable('skip_modifying_before') + 1 FROM recycler_stats() WHERE name = 'skip_modifying'
 ----
 true
 
@@ -249,6 +253,9 @@ query I nosort hits_txn
 SELECT sum(value) FROM recycler_stats() WHERE name IN ('whole_hits', 'block_hits', 'subtree_hits', 'subsumption_hits')
 
 statement ok
+SET VARIABLE skip_txn_before = (SELECT value FROM recycler_stats() WHERE name = 'skip_write_transaction');
+
+statement ok
 BEGIN TRANSACTION;
 
 statement ok
@@ -305,9 +312,10 @@ SELECT count(*) FROM recycler_entries()
 query I nosort hits_txn
 SELECT sum(value) FROM recycler_stats() WHERE name IN ('whole_hits', 'block_hits', 'subtree_hits', 'subsumption_hits')
 
-# the four reads over t above were all skipped because the transaction has written
+# every read since BEGIN was skipped because the transaction has written: the four reads over t, the two
+# recycler_entries() checks, the hit-counter snapshot above, and this query itself (its hook runs before it executes)
 query I
-SELECT value >= 4 FROM recycler_stats() WHERE name = 'skip_write_transaction'
+SELECT value = getvariable('skip_txn_before') + 8 FROM recycler_stats() WHERE name = 'skip_write_transaction'
 ----
 true
 

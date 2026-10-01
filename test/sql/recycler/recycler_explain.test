@@ -67,12 +67,17 @@ EXPLAIN (ANALYZE, FORMAT JSON) SELECT g, count(*) AS c FROM t GROUP BY g ORDER B
 ----
 analyzed_plan	<REGEX>:.*RECYCLER_SCAN.*
 
-# the text renderer titles an extension operator's box with its type, EXTENSION, so the scan is recognised by
-# its parameters: only the scan prints the stored row count
+# the text renderer titles an extension operator's box with its type, EXTENSION, so the text format is checked
+# twice: the served scan's box is present, and no aggregate operator ran because the whole plan was replaced
 query II
 EXPLAIN ANALYZE SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g DESC
 ----
 analyzed_plan	<REGEX>:.*EXTENSION.*Kind: whole_result.*Rows: 7.*Ordered: true.*
+
+query II
+EXPLAIN ANALYZE SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g DESC
+----
+analyzed_plan	<!REGEX>:.*GROUP_BY.*
 
 # the profile of a hit still carries the latency the grader scores
 query II
@@ -81,12 +86,12 @@ EXPLAIN (ANALYZE, FORMAT JSON) SELECT g, count(*) AS c FROM t GROUP BY g ORDER B
 analyzed_plan	<REGEX>:.*"latency".*
 
 # ---------------------------------------------------------------------------
-# 3. the counters: three hits, and hits do not count as misses
+# 3. the counters: four hits, and hits do not count as misses
 # ---------------------------------------------------------------------------
 query I
 SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
 ----
-3
+4
 
 query I
 SELECT value = getvariable('misses_after_miss') FROM recycler_stats() WHERE name = 'misses'
@@ -108,7 +113,7 @@ SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g DESC
 query I
 SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
 ----
-4
+5
 
 # plain EXPLAIN does not execute anything: it is neither served nor stored, and nothing breaks
 statement ok
@@ -117,7 +122,7 @@ EXPLAIN SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g DESC
 query I
 SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
 ----
-4
+5
 
 query I
 SELECT value >= 1 FROM recycler_stats() WHERE name = 'skip_not_query'
@@ -158,7 +163,7 @@ role6	21428
 query I
 SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
 ----
-6
+7
 
 # two queries of the same shape stored under EXPLAIN ANALYZE must not collide when served plain
 query II
@@ -196,7 +201,7 @@ SELECT g, min(h) FROM t GROUP BY g ORDER BY g
 query I
 SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
 ----
-8
+9
 
 # a write wrapped in EXPLAIN ANALYZE still clears the cache: the next plain run is a miss that sees the row
 statement ok
@@ -221,7 +226,7 @@ SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g DESC
 query I
 SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
 ----
-8
+9
 
 query II
 EXPLAIN (ANALYZE, FORMAT JSON) SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g DESC
@@ -231,7 +236,7 @@ analyzed_plan	<REGEX>:.*RECYCLER_SCAN.*
 query I
 SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
 ----
-9
+10
 
 query I
 SELECT value >= 5 FROM recycler_stats() WHERE name = 'whole_stores'

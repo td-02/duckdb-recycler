@@ -728,7 +728,7 @@ Rules for defaults that follow from the gate:
 | `recycler_signature.cpp:493-499` | every `LogicalGet` without a catalog table is refused, every one with a table accepted | 15 | §7.1, §7.6 (G1, G4) |
 | `recycler_signature.cpp:692-725` | IN-list rendering builds a `Value` per element (100 of 149 queries have IN lists; bounded at 4,096 rows) | 3 | acceptable; covered by the hook-budget test (P8) |
 | `recycler_functions.cpp:38-52` | shutdown by connection count is correct but subtle | 12 | comment says why (destroy order of `DatabaseInstance`), keep (P1) |
-| tests | no test for: eviction under a tiny budget, `preserve_insertion_order = true` with every mechanism, two connections, `memory_limit` overflow, the `latency` field on a hit, the hook-time budget, the bail-out threshold, and none of §7 | 5 | §9 |
+| tests | no test for: `preserve_insertion_order = true` with every mechanism, two connections (reproduced 2026-10-01: a read-only transaction on one connection is served a subtree entry stored by another connection after a commit it cannot see, the race of §7.2), `memory_limit` overflow, the hook-time budget, the bail-out threshold, eviction and clearing of subtree and block entries, and none of §7. Eviction under a tiny budget and the `latency` field on a hit are covered by `recycler_memory.test` and `recycler_explain.test` | 5 | §9 |
 
 Concurrency, checked and kept: the cache lock covers every map mutation; `Lookup` renders outside the lock and
 confirms by byte comparison; `hits`/`last_used` are atomics because `NoteHit` runs outside the lock (the
