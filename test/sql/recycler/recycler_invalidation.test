@@ -1,0 +1,370 @@
+# name: test/sql/recycler/recycler_invalidation.test
+# description: writes clear the cache; a writing transaction is never served from or stored into it (§7.2, §9.1)
+# group: [recycler]
+
+require waddle
+
+statement ok
+SET threads = 4;
+
+# lower the admission floor so that the small synthetic tables take part
+statement ok
+SET recycler_min_input_rows = 1000;
+
+statement ok
+CREATE TABLE t AS
+SELECT range AS id, range % 7 AS g, range % 13 AS h, 'name' || range AS name,
+       CASE WHEN range % 2 = 0 THEN 'm' ELSE 'f' END AS gender
+FROM range(300000);
+
+statement ok
+CREATE TABLE d AS SELECT range AS id, 'role' || range AS role FROM range(12);
+
+# Every section below proves a clear in three ways: recycler_entries() is empty right after the write, the
+# first re-read after the write is a miss (the sum of all hit counters, snapshotted under a label right before
+# the write, is unchanged after it), and the re-read returns the written data. A labelled query is compared by
+# hash against the first query with the same label, so no absolute counter values appear in this file.
+
+# ---------------------------------------------------------------------------
+# warm the cache: a whole-result entry and a join aggregate, confirmed by a hit
+# ---------------------------------------------------------------------------
+query II
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g DESC
+----
+6	42857
+5	42857
+4	42857
+3	42857
+2	42857
+1	42857
+0	42858
+
+query II
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g DESC
+----
+6	42857
+5	42857
+4	42857
+3	42857
+2	42857
+1	42857
+0	42858
+
+query II
+SELECT d.role, count(*) AS c FROM t JOIN d ON t.g = d.id GROUP BY d.role ORDER BY d.role
+----
+role0	42858
+role1	42857
+role2	42857
+role3	42857
+role4	42857
+role5	42857
+role6	42857
+
+query I
+SELECT value >= 1 FROM recycler_stats() WHERE name = 'whole_hits'
+----
+true
+
+query I
+SELECT count(*) >= 1 FROM recycler_entries()
+----
+true
+
+# ---------------------------------------------------------------------------
+# 1. INSERT clears the cache: no entries, the next run is a miss that sees the new row, then it is cached again
+# ---------------------------------------------------------------------------
+query I nosort hits_insert
+SELECT sum(value) FROM recycler_stats() WHERE name IN ('whole_hits', 'block_hits', 'subtree_hits', 'subsumption_hits')
+
+statement ok
+INSERT INTO t VALUES (300000, 0, 0, 'extra', 'f');
+
+query I
+SELECT count(*) FROM recycler_entries()
+----
+0
+
+query I
+SELECT value >= 1 FROM recycler_stats() WHERE name = 'skip_modifying'
+----
+true
+
+query II
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g DESC
+----
+6	42857
+5	42857
+4	42857
+3	42857
+2	42857
+1	42857
+0	42859
+
+query I nosort hits_insert
+SELECT sum(value) FROM recycler_stats() WHERE name IN ('whole_hits', 'block_hits', 'subtree_hits', 'subsumption_hits')
+
+query II
+SELECT d.role, count(*) AS c FROM t JOIN d ON t.g = d.id GROUP BY d.role ORDER BY d.role
+----
+role0	42859
+role1	42857
+role2	42857
+role3	42857
+role4	42857
+role5	42857
+role6	42857
+
+query II
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g DESC
+----
+6	42857
+5	42857
+4	42857
+3	42857
+2	42857
+1	42857
+0	42859
+
+query I
+SELECT count(*) >= 1 FROM recycler_entries()
+----
+true
+
+# ---------------------------------------------------------------------------
+# 2. UPDATE clears the cache: the moved row is counted under its new group by a miss
+# ---------------------------------------------------------------------------
+query I nosort hits_update
+SELECT sum(value) FROM recycler_stats() WHERE name IN ('whole_hits', 'block_hits', 'subtree_hits', 'subsumption_hits')
+
+statement ok
+UPDATE t SET g = 1 WHERE id = 300000;
+
+query I
+SELECT count(*) FROM recycler_entries()
+----
+0
+
+query II
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g DESC
+----
+6	42857
+5	42857
+4	42857
+3	42857
+2	42857
+1	42858
+0	42858
+
+query I nosort hits_update
+SELECT sum(value) FROM recycler_stats() WHERE name IN ('whole_hits', 'block_hits', 'subtree_hits', 'subsumption_hits')
+
+query II
+SELECT d.role, count(*) AS c FROM t JOIN d ON t.g = d.id GROUP BY d.role ORDER BY d.role
+----
+role0	42858
+role1	42858
+role2	42857
+role3	42857
+role4	42857
+role5	42857
+role6	42857
+
+query II
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g DESC
+----
+6	42857
+5	42857
+4	42857
+3	42857
+2	42857
+1	42858
+0	42858
+
+query I
+SELECT count(*) >= 1 FROM recycler_entries()
+----
+true
+
+# ---------------------------------------------------------------------------
+# 3. DELETE clears the cache: the counts return to their original values by a miss
+# ---------------------------------------------------------------------------
+query I nosort hits_delete
+SELECT sum(value) FROM recycler_stats() WHERE name IN ('whole_hits', 'block_hits', 'subtree_hits', 'subsumption_hits')
+
+statement ok
+DELETE FROM t WHERE id = 300000;
+
+query I
+SELECT count(*) FROM recycler_entries()
+----
+0
+
+query II
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g DESC
+----
+6	42857
+5	42857
+4	42857
+3	42857
+2	42857
+1	42857
+0	42858
+
+query I nosort hits_delete
+SELECT sum(value) FROM recycler_stats() WHERE name IN ('whole_hits', 'block_hits', 'subtree_hits', 'subsumption_hits')
+
+query II
+SELECT d.role, count(*) AS c FROM t JOIN d ON t.g = d.id GROUP BY d.role ORDER BY d.role
+----
+role0	42858
+role1	42857
+role2	42857
+role3	42857
+role4	42857
+role5	42857
+role6	42857
+
+query II
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g DESC
+----
+6	42857
+5	42857
+4	42857
+3	42857
+2	42857
+1	42857
+0	42858
+
+query I
+SELECT count(*) >= 1 FROM recycler_entries()
+----
+true
+
+# ---------------------------------------------------------------------------
+# 4. inside a write transaction nothing is stored and nothing is served: the uncommitted row is visible on
+#    every repeat, the cache stays empty, and the hit counters do not move
+# ---------------------------------------------------------------------------
+query I nosort hits_txn
+SELECT sum(value) FROM recycler_stats() WHERE name IN ('whole_hits', 'block_hits', 'subtree_hits', 'subsumption_hits')
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+INSERT INTO t VALUES (300001, 2, 0, 'extra', 'm');
+
+query I
+SELECT count(*) FROM recycler_entries()
+----
+0
+
+query II
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g DESC
+----
+6	42857
+5	42857
+4	42857
+3	42857
+2	42858
+1	42857
+0	42858
+
+query II
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g DESC
+----
+6	42857
+5	42857
+4	42857
+3	42857
+2	42858
+1	42857
+0	42858
+
+query II
+SELECT d.role, count(*) AS c FROM t JOIN d ON t.g = d.id GROUP BY d.role ORDER BY d.role
+----
+role0	42858
+role1	42857
+role2	42858
+role3	42857
+role4	42857
+role5	42857
+role6	42857
+
+query I
+SELECT count(*) FROM t WHERE g = 2
+----
+42858
+
+query I
+SELECT count(*) FROM recycler_entries()
+----
+0
+
+query I nosort hits_txn
+SELECT sum(value) FROM recycler_stats() WHERE name IN ('whole_hits', 'block_hits', 'subtree_hits', 'subsumption_hits')
+
+# the four reads over t above were all skipped because the transaction has written
+query I
+SELECT value >= 4 FROM recycler_stats() WHERE name = 'skip_write_transaction'
+----
+true
+
+# ---------------------------------------------------------------------------
+# 5. after a rollback the cache is still cleared: the rolled-back row is gone, the first re-read is a miss,
+#    and the recycler starts storing again
+# ---------------------------------------------------------------------------
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM recycler_entries()
+----
+0
+
+query I
+SELECT count(*) FROM t WHERE g = 2
+----
+42857
+
+query II
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g DESC
+----
+6	42857
+5	42857
+4	42857
+3	42857
+2	42857
+1	42857
+0	42858
+
+query I nosort hits_txn
+SELECT sum(value) FROM recycler_stats() WHERE name IN ('whole_hits', 'block_hits', 'subtree_hits', 'subsumption_hits')
+
+query II
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g DESC
+----
+6	42857
+5	42857
+4	42857
+3	42857
+2	42857
+1	42857
+0	42858
+
+query II
+SELECT d.role, count(*) AS c FROM t JOIN d ON t.g = d.id GROUP BY d.role ORDER BY d.role
+----
+role0	42858
+role1	42857
+role2	42857
+role3	42857
+role4	42857
+role5	42857
+role6	42857
+
+query I
+SELECT count(*) >= 1 FROM recycler_entries()
+----
+true
