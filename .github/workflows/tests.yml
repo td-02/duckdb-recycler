@@ -36,6 +36,10 @@ jobs:
     name: Release build and recycler suites
     runs-on: ubuntu-latest
     timeout-minutes: 75
+    env:
+      # Links ICU into the unittest binary so that recycler_settings_icu.test (TimeZone and Calendar in the
+      # key) runs instead of being skipped by its `require icu`; the waddle artifact is the same.
+      EXT_FLAGS: -DBUILD_EXTENSIONS=icu
     steps:
       - uses: actions/checkout@v4
         with:
@@ -67,6 +71,7 @@ jobs:
       # Sanitizers are the asan-ubsan job's business; without them the -O0 binary runs the
       # suites several times faster and a failure here is an assertion or a logic error.
       DISABLE_SANITIZER: 1
+      EXT_FLAGS: -DBUILD_EXTENSIONS=icu
     steps:
       - uses: actions/checkout@v4
         with:
