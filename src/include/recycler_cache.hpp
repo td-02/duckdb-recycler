@@ -9,9 +9,9 @@
 #include "duckdb/common/types/column/column_data_collection.hpp"
 
 #include <atomic>
+#include <list>
 #include <mutex>
 #include <unordered_map>
-#include <unordered_set>
 
 namespace duckdb {
 
@@ -40,8 +40,21 @@ struct CachedEntry {
 	bool ordered = false;
 	//! Estimated rows scanned to produce the result (benefit proxy)
 	idx_t est_input_rows = 0;
+	//! Bytes holding rows; `bytes` is the allocation the buffer pool charges
+	idx_t used_bytes = 0;
+	//! Sink() calls that built the collection: many small chunks make the materialization expensive
+	idx_t sink_calls = 0;
+	//! Cache sequence at which the entry was stored
+	idx_t stored_at = 0;
 	std::atomic<idx_t> last_used {0};
 	std::atomic<idx_t> hits {0};
+	//! Operator thread time from the profiler tree of the query that stored (or last hit) the entry, written by
+	//! that connection's QueryEnd while recycler_entries() may read on another: the cost of producing the
+	//! wrapped subtree, the materialization's own time (the sink's wall time when the query was not profiled)
+	//! and the time of the last RECYCLER_SCAN over the entry
+	std::atomic<uint64_t> measured_cost_ns {0};
+	std::atomic<uint64_t> materialize_ns {0};
+	std::atomic<uint64_t> hit_ns {0};
 
 	//! BLOCK entries only: identity of every stored column (invalid = not a plain base column), the range
 	//! constraints the rows satisfy, and the canonical rendering of every block-root conjunct
@@ -65,6 +78,28 @@ struct RecyclerSettings {
 	idx_t whole_cap_rows = 1000000;
 	idx_t min_input_rows = 200000;
 	idx_t speculate_bytes = 64ULL * 1024 * 1024;
+
+	//! The row cap of an entry of this kind
+	idx_t CapRows(RecyclerEntryKind kind) const {
+		return kind == RecyclerEntryKind::WHOLE_RESULT ? MinValue<idx_t>(whole_cap_rows, entry_cap_rows)
+		                                               : entry_cap_rows;
+	}
+};
+
+//! What is known about a signature whether or not its result is in the cache: it survives eviction and a
+//! too-big verdict (the recorded size against the caps of the moment)
+struct SignatureHistory {
+	//! Sightings as a subtree candidate
+	idx_t seen = 0;
+	idx_t last_seen = 0;
+	//! Size of the last materialization, stored or not
+	idx_t rows = 0;
+	idx_t bytes = 0;
+	//! Operator thread time, as on CachedEntry
+	uint64_t measured_cost_ns = 0;
+	uint64_t materialize_ns = 0;
+	uint64_t hit_ns = 0;
+	RefusalReason reason = RefusalReason::NONE;
 };
 
 struct RecyclerStats {
@@ -96,6 +131,8 @@ struct RecyclerStats {
 	std::atomic<uint64_t> skip_write_transaction {0};
 	std::atomic<uint64_t> skip_analyze_failed {0};
 	std::atomic<uint64_t> root_not_cacheable {0};
+	//! root_not_cacheable by reason
+	std::atomic<uint64_t> refused[static_cast<idx_t>(RefusalReason::COUNT)] {};
 };
 
 class RecyclerCache {
@@ -115,15 +152,26 @@ public:
 	void NoteHit(CachedEntry &entry);
 	void Clear();
 
-	//! Bookkeeping about candidate subtrees that were seen but not (yet) cached
+	//! The signature history (bounded to HISTORY_BOUND signatures, least recently noted first out)
 	idx_t NoteSeen(const SigHash &hash);
 	idx_t Seen(const SigHash &hash) const;
-	void NoteTooBig(const SigHash &hash);
-	bool IsTooBig(const SigHash &hash) const;
+	void NoteRefused(const SigHash &hash, RefusalReason reason);
+	//! A materialization finished with this size; `too_big` when the caps stopped the store
+	void NoteMaterialized(const SigHash &hash, idx_t rows, idx_t bytes, uint64_t materialize_ns, bool too_big);
+	//! The last materialization of this signature exceeded the given caps
+	bool TooBig(const SigHash &hash, idx_t cap_rows, idx_t cap_bytes) const;
+	//! Measured operator thread time of a materialization (the wrapped subtree and the operator's own time) and
+	//! of a scan over the signature's result
+	void NoteMaterializeTime(const SigHash &hash, uint64_t measured_cost_ns, uint64_t materialize_ns);
+	void NoteHitTime(const SigHash &hash, uint64_t hit_ns);
+	idx_t HistorySize() const;
 
 	idx_t TotalBytes() const;
+	idx_t UsedBytes() const;
 	idx_t EntryCount() const;
 	vector<shared_ptr<CachedEntry>> Entries() const;
+
+	static constexpr idx_t HISTORY_BOUND = 4096;
 
 	RecyclerStats stats;
 
@@ -136,14 +184,24 @@ private:
 	//! Evict until `entry` fits the budget; false when the cache holds more valuable results (caller holds the lock)
 	bool MakeRoom(const CachedEntry &entry, idx_t budget_bytes);
 	void Erase(const CachedEntry &entry);
+	//! The history of `hash`, created and moved to the front of the LRU order (caller holds the lock)
+	SignatureHistory &History(const SigHash &hash);
+
+	using HistoryOrder = std::list<SigHash>;
+	struct HistoryNode {
+		SignatureHistory history;
+		HistoryOrder::iterator position;
+	};
 
 	mutable std::mutex lock;
 	EntryMap whole;
 	EntryMap subtrees;
 	BlockMap blocks;
-	std::unordered_map<SigHash, idx_t, SigHashHasher> seen;
-	std::unordered_set<SigHash, SigHashHasher> too_big;
+	std::unordered_map<SigHash, HistoryNode, SigHashHasher> history;
+	//! Most recently noted first
+	HistoryOrder history_order;
 	idx_t total_bytes = 0;
+	idx_t total_used_bytes = 0;
 	std::atomic<idx_t> sequence {0};
 };
 

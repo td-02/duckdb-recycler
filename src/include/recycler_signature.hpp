@@ -47,6 +47,8 @@ struct SigHash {
 		return h1 == other.h1 && h2 == other.h2;
 	}
 	string ToString() const;
+	//! Parse the output of ToString (as shown by EXPLAIN and the profiler); false for anything else
+	static bool TryParse(const string &text, SigHash &result);
 };
 
 struct SigHashHasher {
@@ -54,6 +56,27 @@ struct SigHashHasher {
 		return static_cast<size_t>(h.h1 ^ (h.h2 * 0x9E3779B97F4A7C15ULL));
 	}
 };
+
+//! Why a subtree is not cacheable; counted per query root in recycler_stats() and kept in the signature history
+enum class RefusalReason : uint8_t {
+	NONE = 0,
+	TABLE_FUNCTION,
+	SAMPLED_SCAN,
+	SCAN_OPTIONS,
+	CORRELATED_COLUMN,
+	VOLATILE_FUNCTION,
+	PARAMETER,
+	EXPRESSION,
+	OPERATOR,
+	CONSTANT_COLLECTION,
+	EXTERNAL_REFERENCE,
+	DELIM_GET,
+	LIMIT_WITHOUT_ORDER,
+	RUNTIME_FILTER,
+	COUNT
+};
+
+const char *RefusalReasonName(RefusalReason reason);
 
 //! Per-node analysis results
 struct NodeInfo {
@@ -63,8 +86,9 @@ struct NodeInfo {
 	idx_t start = 0;
 	idx_t count = 0;
 	//! The subtree contains an operator/expression the renderer does not support (volatile functions,
-	//! parameters, table functions, unknown operator types, ...)
+	//! parameters, table functions, unknown operator types, ...); `refusal` is the first one met
 	bool refused = false;
+	RefusalReason refusal = RefusalReason::NONE;
 	//! The subtree references a column binding that is produced outside of it
 	bool external_ref = false;
 	//! The subtree contains a LogicalDelimGet whose owning delim join is not inside the subtree
@@ -90,6 +114,8 @@ struct NodeInfo {
 		return !refused && !external_ref && !unresolved_delim_get && !nondeterministic && !runtime_filtered &&
 		       pending_dynamic_owners.empty();
 	}
+	//! Why the subtree is not cacheable (NONE when it is)
+	RefusalReason Reason() const;
 };
 
 //! A base-table column: block-relative canonical table id plus the physical column id in that table

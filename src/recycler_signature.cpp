@@ -49,6 +49,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace duckdb {
@@ -127,11 +128,78 @@ string SigHash::ToString() const {
 	return string(buf);
 }
 
+bool SigHash::TryParse(const string &text, SigHash &result) {
+	if (text.size() != 32 || text.find_first_not_of("0123456789abcdef") != string::npos) {
+		return false;
+	}
+	result.h1 = std::strtoull(text.substr(0, 16).c_str(), nullptr, 16);
+	result.h2 = std::strtoull(text.substr(16).c_str(), nullptr, 16);
+	return true;
+}
+
+const char *RefusalReasonName(RefusalReason reason) {
+	switch (reason) {
+	case RefusalReason::NONE:
+		return "none";
+	case RefusalReason::TABLE_FUNCTION:
+		return "table_function";
+	case RefusalReason::SAMPLED_SCAN:
+		return "sampled_scan";
+	case RefusalReason::SCAN_OPTIONS:
+		return "scan_options";
+	case RefusalReason::CORRELATED_COLUMN:
+		return "correlated_column";
+	case RefusalReason::VOLATILE_FUNCTION:
+		return "volatile_function";
+	case RefusalReason::PARAMETER:
+		return "parameter";
+	case RefusalReason::EXPRESSION:
+		return "expression";
+	case RefusalReason::OPERATOR:
+		return "operator";
+	case RefusalReason::CONSTANT_COLLECTION:
+		return "constant_collection";
+	case RefusalReason::EXTERNAL_REFERENCE:
+		return "external_reference";
+	case RefusalReason::DELIM_GET:
+		return "delim_get";
+	case RefusalReason::LIMIT_WITHOUT_ORDER:
+		return "limit_without_order";
+	case RefusalReason::RUNTIME_FILTER:
+		return "runtime_filter";
+	default:
+		return "unknown";
+	}
+}
+
+RefusalReason NodeInfo::Reason() const {
+	if (refused) {
+		return refusal;
+	}
+	if (external_ref) {
+		return RefusalReason::EXTERNAL_REFERENCE;
+	}
+	if (unresolved_delim_get) {
+		return RefusalReason::DELIM_GET;
+	}
+	if (nondeterministic) {
+		// SAMPLE refuses with its own reason, so what is left is a LIMIT whose input has no order
+		return RefusalReason::LIMIT_WITHOUT_ORDER;
+	}
+	if (runtime_filtered || !pending_dynamic_owners.empty()) {
+		return RefusalReason::RUNTIME_FILTER;
+	}
+	return RefusalReason::NONE;
+}
+
 //===----------------------------------------------------------------------===//
 // Helpers
 //===----------------------------------------------------------------------===//
-static void Refuse(NodeInfo &info, const char *) {
+static void Refuse(NodeInfo &info, RefusalReason reason) {
 	info.refused = true;
+	if (info.refusal == RefusalReason::NONE) {
+		info.refusal = reason;
+	}
 }
 
 static bool ContainsDynamicFilter(const TableFilter &filter) {
@@ -328,7 +396,7 @@ void PlanSignatures::RenderExpression(const Expression &expr, const Frame &frame
 	case ExpressionClass::BOUND_COLUMN_REF: {
 		auto &ref = expr.Cast<BoundColumnRefExpression>();
 		if (ref.depth != 0) {
-			Refuse(info, "correlated column reference");
+			Refuse(info, RefusalReason::CORRELATED_COLUMN);
 			info.external_ref = true;
 		}
 		RenderBinding(ref.binding, frame, sink, info);
@@ -346,7 +414,7 @@ void PlanSignatures::RenderExpression(const Expression &expr, const Frame &frame
 	case ExpressionClass::BOUND_FUNCTION: {
 		auto &func = expr.Cast<BoundFunctionExpression>();
 		if (func.function.GetStability() != FunctionStability::CONSISTENT) {
-			Refuse(info, "non-deterministic function");
+			Refuse(info, RefusalReason::VOLATILE_FUNCTION);
 		}
 		sink.Str(func.function.name);
 		sink.Bool(func.is_operator);
@@ -364,7 +432,7 @@ void PlanSignatures::RenderExpression(const Expression &expr, const Frame &frame
 	case ExpressionClass::BOUND_AGGREGATE: {
 		auto &aggr = expr.Cast<BoundAggregateExpression>();
 		if (aggr.function.GetStability() != FunctionStability::CONSISTENT) {
-			Refuse(info, "non-deterministic aggregate");
+			Refuse(info, RefusalReason::VOLATILE_FUNCTION);
 		}
 		sink.Str(aggr.function.name);
 		sink.U8(static_cast<uint8_t>(aggr.aggr_type));
@@ -438,11 +506,11 @@ void PlanSignatures::RenderExpression(const Expression &expr, const Frame &frame
 		break;
 	}
 	case ExpressionClass::BOUND_PARAMETER:
-		Refuse(info, "prepared statement parameter");
+		Refuse(info, RefusalReason::PARAMETER);
 		break;
 	default:
 		// BOUND_REF, BOUND_SUBQUERY, BOUND_WINDOW, BOUND_UNNEST, BOUND_LAMBDA, BOUND_LAMBDA_REF, BOUND_DEFAULT, ...
-		Refuse(info, "unsupported expression class");
+		Refuse(info, RefusalReason::EXPRESSION);
 		break;
 	}
 }
@@ -494,16 +562,16 @@ void PlanSignatures::RenderNode(const LogicalOperator &op, const Frame &frame, S
 		auto &get = op.Cast<LogicalGet>();
 		auto table = get.GetTable();
 		if (!table) {
-			Refuse(info, "table function scan");
+			Refuse(info, RefusalReason::TABLE_FUNCTION);
 			break;
 		}
 		if (get.extra_info.sample_options) {
-			Refuse(info, "sampled scan");
+			Refuse(info, RefusalReason::SAMPLED_SCAN);
 			info.nondeterministic = true;
 		}
 		if (!get.projected_input.empty() || !get.children.empty() || get.ordinality_idx.IsValid() ||
 		    get.row_group_order_options) {
-			Refuse(info, "unsupported scan options");
+			Refuse(info, RefusalReason::SCAN_OPTIONS);
 		}
 		RenderOwnIndex(get.table_index, frame, sink);
 		sink.Str(get.function.name);
@@ -665,7 +733,7 @@ void PlanSignatures::RenderNode(const LogicalOperator &op, const Frame &frame, S
 				break;
 			}
 			default:
-				Refuse(info, "expression limit");
+				Refuse(info, RefusalReason::EXPRESSION);
 				break;
 			}
 		}
@@ -697,12 +765,12 @@ void PlanSignatures::RenderNode(const LogicalOperator &op, const Frame &frame, S
 			sink.Str(type.ToString());
 		}
 		if (!cdg.collection) {
-			Refuse(info, "chunk get without data");
+			Refuse(info, RefusalReason::OPERATOR);
 			break;
 		}
 		auto &collection = *cdg.collection;
 		if (collection.Count() > 4096) {
-			Refuse(info, "large constant collection");
+			Refuse(info, RefusalReason::CONSTANT_COLLECTION);
 			break;
 		}
 		sink.U64(collection.Count());
@@ -733,7 +801,7 @@ void PlanSignatures::RenderNode(const LogicalOperator &op, const Frame &frame, S
 	case LogicalOperatorType::LOGICAL_CTE_REF: {
 		auto &ref = op.Cast<LogicalCTERef>();
 		if (ref.is_recurring || ref.correlated_columns > 0) {
-			Refuse(info, "recursive/correlated cte reference");
+			Refuse(info, RefusalReason::OPERATOR);
 		}
 		RenderOwnIndex(ref.table_index, frame, sink);
 		// the referenced CTE must be part of the subtree for the result to be self-contained
@@ -796,7 +864,7 @@ void PlanSignatures::RenderNode(const LogicalOperator &op, const Frame &frame, S
 	case LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR: {
 		auto ours = AsRecyclerOperator(op);
 		if (!ours) {
-			Refuse(info, "foreign extension operator");
+			Refuse(info, RefusalReason::OPERATOR);
 			break;
 		}
 		if (ours->kind == RecyclerOperatorKind::MATERIALIZE) {
@@ -815,10 +883,10 @@ void PlanSignatures::RenderNode(const LogicalOperator &op, const Frame &frame, S
 	}
 	case LogicalOperatorType::LOGICAL_SAMPLE:
 		info.nondeterministic = true;
-		Refuse(info, "sample");
+		Refuse(info, RefusalReason::SAMPLED_SCAN);
 		break;
 	default:
-		Refuse(info, "unsupported operator");
+		Refuse(info, RefusalReason::OPERATOR);
 		break;
 	}
 	// output types (a block's output columns depend on what the query references, so not in shape mode)
@@ -857,6 +925,9 @@ void PlanSignatures::Compute(LogicalOperator &op) {
 	for (auto &child : op.children) {
 		auto &child_info = Get(*child);
 		info.refused = info.refused || child_info.refused;
+		if (info.refusal == RefusalReason::NONE) {
+			info.refusal = child_info.refusal;
+		}
 		info.nondeterministic = info.nondeterministic || child_info.nondeterministic;
 		info.unreliable_estimate = info.unreliable_estimate || child_info.unreliable_estimate;
 		info.runtime_filtered = info.runtime_filtered || child_info.runtime_filtered;

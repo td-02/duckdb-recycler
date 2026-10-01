@@ -1,4 +1,5 @@
 #include "recycler_operators.hpp"
+#include "recycler_state.hpp"
 
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/types/column/column_data_scan_states.hpp"
@@ -6,6 +7,8 @@
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/binder.hpp"
+
+#include <chrono>
 
 namespace duckdb {
 
@@ -151,6 +154,7 @@ InsertionOrderPreservingMap<string> PhysicalRecyclerScan::ParamsToString() const
 }
 
 unique_ptr<GlobalSourceState> PhysicalRecyclerScan::GetGlobalSourceState(ClientContext &context) const {
+	RecyclerClientState::Get(context).NoteTouched(entry);
 	return make_uniq<RecyclerScanGlobalState>(*entry->data, ordered, column_ids);
 }
 
@@ -175,9 +179,7 @@ RecyclerWriteSpec RecyclerWriteSpec::Make(RecyclerEntryKind kind, const SigHash 
 	spec.canonical = std::move(canonical);
 	spec.ordered = ordered;
 	spec.est_input_rows = est_input_rows;
-	spec.cap_rows = kind == RecyclerEntryKind::WHOLE_RESULT
-	                    ? MinValue<idx_t>(settings.whole_cap_rows, settings.entry_cap_rows)
-	                    : settings.entry_cap_rows;
+	spec.cap_rows = settings.CapRows(kind);
 	spec.cap_bytes = settings.entry_cap_bytes;
 	spec.budget_bytes = settings.budget_bytes;
 	return spec;
@@ -249,12 +251,21 @@ void LogicalRecyclerMaterialize::ResolveTypes() {
 class RecyclerMaterializeGlobalSinkState : public GlobalSinkState {
 public:
 	RecyclerMaterializeGlobalSinkState(ClientContext &context, const vector<LogicalType> &types)
-	    : collection(make_shared_ptr<ColumnDataCollection>(context, types)) {
+	    : collection(make_shared_ptr<ColumnDataCollection>(context, types)),
+	      start(std::chrono::steady_clock::now()) {
+	}
+
+	//! Wall time from the sink's creation to Finalize: the materialization cost when the query is not profiled
+	uint64_t ElapsedNs() const {
+		auto elapsed = std::chrono::steady_clock::now() - start;
+		return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
 	}
 
 	mutex glock;
 	shared_ptr<ColumnDataCollection> collection;
+	std::chrono::steady_clock::time_point start;
 	idx_t rows = 0;
+	idx_t sink_calls = 0;
 	bool too_big = false;
 };
 
@@ -267,6 +278,7 @@ public:
 
 	unique_ptr<ColumnDataCollection> collection;
 	ColumnDataAppendState append_state;
+	idx_t sink_calls = 0;
 };
 
 PhysicalRecyclerMaterialize::PhysicalRecyclerMaterialize(PhysicalPlan &physical_plan, vector<LogicalType> types_p,
@@ -303,6 +315,7 @@ SinkResultType PhysicalRecyclerMaterialize::Sink(ExecutionContext &context, Data
                                                  OperatorSinkInput &input) const {
 	auto &lstate = input.local_state.Cast<RecyclerMaterializeLocalSinkState>();
 	lstate.collection->Append(lstate.append_state, chunk);
+	lstate.sink_calls++;
 	return SinkResultType::NEED_MORE_INPUT;
 }
 
@@ -310,10 +323,11 @@ SinkCombineResultType PhysicalRecyclerMaterialize::Combine(ExecutionContext &con
                                                            OperatorSinkCombineInput &input) const {
 	auto &gstate = input.global_state.Cast<RecyclerMaterializeGlobalSinkState>();
 	auto &lstate = input.local_state.Cast<RecyclerMaterializeLocalSinkState>();
-	if (lstate.collection->Count() == 0) {
+	if (lstate.sink_calls == 0) {
 		return SinkCombineResultType::FINISHED;
 	}
 	lock_guard<mutex> guard(gstate.glock);
+	gstate.sink_calls += lstate.sink_calls;
 	gstate.rows += lstate.collection->Count();
 	gstate.collection->Combine(*lstate.collection);
 	if (gstate.rows > spec.cap_rows) {
@@ -327,8 +341,10 @@ SinkFinalizeType PhysicalRecyclerMaterialize::Finalize(Pipeline &pipeline, Event
 	auto &gstate = input.global_state.Cast<RecyclerMaterializeGlobalSinkState>();
 	auto rows = gstate.collection->Count();
 	idx_t bytes = gstate.collection->AllocationSize();
-	if (gstate.too_big || rows > spec.cap_rows || bytes > spec.cap_bytes) {
-		cache->NoteTooBig(spec.hash);
+	auto materialize_ns = gstate.ElapsedNs();
+	bool too_big = gstate.too_big || rows > spec.cap_rows || bytes > spec.cap_bytes;
+	cache->NoteMaterialized(spec.hash, rows, bytes, materialize_ns, too_big);
+	if (too_big) {
 		return SinkFinalizeType::READY;
 	}
 	auto entry = make_shared_ptr<CachedEntry>();
@@ -339,15 +355,22 @@ SinkFinalizeType PhysicalRecyclerMaterialize::Finalize(Pipeline &pipeline, Event
 	entry->types = types;
 	entry->rows = rows;
 	entry->bytes = bytes;
+	entry->used_bytes = gstate.collection->SizeInBytes();
+	entry->sink_calls = gstate.sink_calls;
+	entry->materialize_ns = materialize_ns;
 	entry->ordered = spec.ordered;
 	entry->est_input_rows = spec.est_input_rows;
+	bool stored;
 	if (spec.kind == RecyclerEntryKind::BLOCK) {
 		entry->columns = spec.columns;
 		entry->constraints = spec.constraints;
 		entry->conjuncts = spec.conjuncts;
-		cache->StoreBlock(std::move(entry), spec.budget_bytes);
+		stored = cache->StoreBlock(entry, spec.budget_bytes);
 	} else {
-		cache->Store(std::move(entry), spec.budget_bytes);
+		stored = cache->Store(entry, spec.budget_bytes);
+	}
+	if (stored) {
+		RecyclerClientState::Get(context).NoteTouched(std::move(entry));
 	}
 	return SinkFinalizeType::READY;
 }

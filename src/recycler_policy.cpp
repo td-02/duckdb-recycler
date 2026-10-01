@@ -44,7 +44,7 @@ static bool SpeculationAllowed(const LogicalOperator &op, const NodeInfo &info, 
 
 bool AdmitSubtreeWrite(ClientContext &context, const RecyclerCache &cache, const RecyclerSettings &settings,
                        LogicalOperator &op, const NodeInfo &info, bool under_delim_lhs, bool force_candidate) {
-	if (cache.IsTooBig(info.hash)) {
+	if (cache.TooBig(info.hash, settings.CapRows(RecyclerEntryKind::SUBTREE), settings.entry_cap_bytes)) {
 		return false;
 	}
 	auto est_in = info.est_leaf_rows;
@@ -84,12 +84,13 @@ bool AdmitSubtreeWrite(ClientContext &context, const RecyclerCache &cache, const
 bool AdmitBlockWrite(const RecyclerCache &cache, const RecyclerSettings &settings, const BlockShape &shape) {
 	// multi-table blocks only: the target is the FROM/WHERE part of dashboard-style queries, whose output is
 	// far smaller than the tables they join
-	return shape.joins >= 2 && shape.est_leaf_rows >= settings.min_input_rows && !cache.IsTooBig(shape.hash);
+	return shape.joins >= 2 && shape.est_leaf_rows >= settings.min_input_rows &&
+	       !cache.TooBig(shape.hash, settings.CapRows(RecyclerEntryKind::BLOCK), settings.entry_cap_bytes);
 }
 
 bool AdmitWholeWrite(ClientContext &context, const RecyclerCache &cache, const RecyclerSettings &settings,
                      LogicalOperator &root, const NodeInfo &root_info, const SigHash &hash) {
-	if (cache.IsTooBig(hash)) {
+	if (cache.TooBig(hash, settings.CapRows(RecyclerEntryKind::WHOLE_RESULT), settings.entry_cap_bytes)) {
 		return false;
 	}
 	if (root_info.refused || root_info.nondeterministic || root_info.unresolved_delim_get) {

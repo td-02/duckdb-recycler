@@ -1,0 +1,195 @@
+# name: test/sql/recycler/recycler_observability.test
+# description: measured costs from profiles, sink statistics, byte accounting, refusal reasons and the bounded history
+# group: [recycler]
+
+require waddle
+
+statement ok
+SET threads = 4;
+
+statement ok
+SET recycler_min_input_rows = 1;
+
+statement ok
+CREATE TABLE t AS SELECT range AS id, range % 7 AS g, range % 13 AS h FROM range(20000);
+
+# every query over recycler_stats() / recycler_entries() below is itself refused as a table function scan,
+# which the refused_table_function expectations account for
+
+# ---------------------------------------------------------------------------
+# a payer under EXPLAIN ANALYZE stores its aggregate (subtree) and its result (whole_result); both carry the
+# thread time of the subtree they wrapped, their own materialization time, the sink calls that built them and
+# the bytes their rows occupy
+# ---------------------------------------------------------------------------
+statement ok
+EXPLAIN ANALYZE SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g
+
+query I
+SELECT count(*) FROM recycler_entries()
+----
+2
+
+query I
+SELECT bool_and(measured_cost_ms > 0 AND materialize_ms > 0 AND hit_ms = 0 AND sink_calls >= 1 AND used_bytes > 0 AND used_bytes <= bytes AND stored_at > 0 AND last_used = stored_at)
+FROM recycler_entries()
+----
+true
+
+# a hit under EXPLAIN ANALYZE records the scan's time on the entry it served
+statement ok
+EXPLAIN ANALYZE SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g
+
+query II
+SELECT kind, hit_ms > 0 FROM recycler_entries() WHERE hits > 0
+----
+whole_result	true
+
+query II
+SELECT kind, hit_ms = 0 FROM recycler_entries() WHERE hits = 0
+----
+subtree	true
+
+# ---------------------------------------------------------------------------
+# without a profile the sink's own timer provides the materialization time and the subtree cost stays unset
+# ---------------------------------------------------------------------------
+statement ok
+PRAGMA recycler_clear
+
+statement ok
+SELECT g, count(*) AS c FROM t WHERE h > 1 GROUP BY g ORDER BY g
+
+query I
+SELECT count(*) FROM recycler_entries()
+----
+2
+
+query I
+SELECT bool_and(measured_cost_ms = 0 AND materialize_ms > 0 AND sink_calls >= 1 AND used_bytes > 0 AND used_bytes <= bytes)
+FROM recycler_entries()
+----
+true
+
+# ---------------------------------------------------------------------------
+# byte accounting: used bytes next to allocated bytes, swap of the process
+# ---------------------------------------------------------------------------
+query I
+SELECT s.value = e.total
+FROM recycler_stats() s, (SELECT sum(used_bytes) AS total FROM recycler_entries()) e
+WHERE s.name = 'bytes_used'
+----
+true
+
+query I
+SELECT u.value <= a.value FROM recycler_stats() u, recycler_stats() a WHERE u.name = 'bytes_used' AND a.name = 'bytes'
+----
+true
+
+query I
+SELECT value >= 0 FROM recycler_stats() WHERE name = 'swap_bytes'
+----
+true
+
+# ---------------------------------------------------------------------------
+# a too-big verdict is reconsidered when the caps change: the recorded size is compared with the current caps
+# ---------------------------------------------------------------------------
+statement ok
+SET recycler_entry_cap_rows = 1000
+
+statement ok
+SELECT id FROM t WHERE h = 0 ORDER BY id
+
+query II
+SELECT name, value FROM recycler_stats() WHERE name IN ('too_big', 'writes_planned') ORDER BY name
+----
+too_big	1
+writes_planned	5
+
+# the repeat is not materialized again under the same caps
+statement ok
+SELECT id FROM t WHERE h = 0 ORDER BY id
+
+query II
+SELECT name, value FROM recycler_stats() WHERE name IN ('too_big', 'writes_planned') ORDER BY name
+----
+too_big	1
+writes_planned	5
+
+statement ok
+SET recycler_entry_cap_rows = 4000000
+
+statement ok
+SELECT id FROM t WHERE h = 0 ORDER BY id
+
+query II
+SELECT name, value FROM recycler_stats() WHERE name IN ('too_big', 'writes_planned') ORDER BY name
+----
+too_big	1
+writes_planned	6
+
+query I
+SELECT count(*) FROM recycler_entries() WHERE rows > 1000
+----
+1
+
+# ---------------------------------------------------------------------------
+# refusal reasons: counted once per query root
+# ---------------------------------------------------------------------------
+query I
+SELECT value FROM recycler_stats() WHERE name = 'refused_volatile_function'
+----
+0
+
+statement ok
+SELECT g, count(*) + random() FROM t GROUP BY g
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'refused_volatile_function'
+----
+1
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'refused_limit_without_order'
+----
+0
+
+statement ok
+SELECT id FROM t LIMIT 3
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'refused_limit_without_order'
+----
+1
+
+# 18 introspection queries so far, including this one
+query I
+SELECT value FROM recycler_stats() WHERE name = 'refused_table_function'
+----
+18
+
+statement ok
+SELECT count(*) FROM range(100000)
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'refused_table_function'
+----
+20
+
+# ---------------------------------------------------------------------------
+# the history is bounded: 5000 distinct refused signatures leave the 4096 most recent ones
+# ---------------------------------------------------------------------------
+loop i 0 5000
+
+statement ok
+SELECT ${i} + random()
+
+endloop
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'history_entries'
+----
+4096
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'refused_volatile_function'
+----
+5001

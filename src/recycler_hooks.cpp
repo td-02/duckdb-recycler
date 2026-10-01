@@ -26,6 +26,7 @@
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/query_profiler.hpp"
 #include "duckdb/optimizer/column_binding_replacer.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/planner/binder.hpp"
@@ -79,10 +80,6 @@ RecyclerSettings LoadRecyclerSettings(ClientContext &context) {
 	s.speculate_bytes =
 	    GetIntSetting(context, "recycler_speculate_mb", s.speculate_bytes / (1024 * 1024)) * 1024 * 1024;
 	return s;
-}
-
-static shared_ptr<RecyclerClientState> GetClientState(ClientContext &context) {
-	return context.registered_state->GetOrCreate<RecyclerClientState>("recycler");
 }
 
 static RecyclerState *StateFromInput(OptimizerExtensionInput &input) {
@@ -555,15 +552,15 @@ void RecyclerPreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOpera
 	auto &context = input.context;
 	ScopedTimer timer(cache.stats.pre_ns);
 
-	auto client = GetClientState(context);
-	client->Reset();
-	auto root_slot = GateStatement(input, plan, cache, *client);
+	auto &client = RecyclerClientState::Get(context);
+	client.Reset();
+	auto root_slot = GateStatement(input, plan, cache, client);
 	if (!root_slot) {
 		return;
 	}
 	cache.stats.pre_calls++;
-	client->active = true;
-	auto &settings = client->settings;
+	client.active = true;
+	auto &settings = client.settings;
 	bool preserve_order = Settings::Get<PreserveInsertionOrderSetting>(context);
 
 	auto &root = **root_slot;
@@ -573,16 +570,17 @@ void RecyclerPreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOpera
 		sig.Analyze(root);
 	} catch (std::exception &) {
 		cache.stats.skip_analyze_failed++;
-		client->active = false;
+		client.active = false;
 		return;
 	}
 	auto &root_info = sig.Get(root);
 	if (!root_info.Cacheable()) {
 		cache.stats.root_not_cacheable++;
+		cache.NoteRefused(root_info.hash, root_info.Reason());
 	}
 
 	if (settings.whole_result && root_info.Cacheable()) {
-		if (ServeOrPlanWholeResult(input, *root_slot, cache, *client, sig, preserve_order)) {
+		if (ServeOrPlanWholeResult(input, *root_slot, cache, client, sig, preserve_order)) {
 			return;
 		}
 	}
@@ -713,12 +711,13 @@ void RecyclerOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator
 	auto &context = input.context;
 	ScopedTimer timer(cache->stats.post_ns);
 
-	auto client = GetClientState(context);
-	if (!client->active) {
+	auto &client = RecyclerClientState::Get(context);
+	if (!client.active) {
 		return;
 	}
-	client->active = false;
-	auto settings = client->settings;
+	client.active = false;
+	client.profiled = QueryProfiler::Get(context).IsEnabled();
+	auto settings = client.settings;
 
 	auto root_slot = FindQueryRoot(plan);
 	if (!root_slot) {
@@ -746,10 +745,10 @@ void RecyclerOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator
 	if (settings.subtrees) {
 		RewriteSubtrees(input, plan, *root_slot, *state, settings, sig);
 	}
-	if (settings.whole_result && client->has_pending_whole) {
-		WriteWholeResult(input, *root_slot, *state, *client, settings, root_info);
+	if (settings.whole_result && client.has_pending_whole) {
+		WriteWholeResult(input, *root_slot, *state, client, settings, root_info);
 	}
-	client->Reset();
+	client.Reset();
 }
 
 } // namespace duckdb

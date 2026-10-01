@@ -1,8 +1,10 @@
 //===----------------------------------------------------------------------===//
-// recycler_functions.cpp - registration, settings, and introspection functions
+// recycler_functions.cpp - registration, settings, introspection functions and the connection callbacks
 //===----------------------------------------------------------------------===//
 #include "recycler_state.hpp"
 
+#include "duckdb/common/error_data.hpp"
+#include "duckdb/common/types/value.hpp"
 #include "duckdb/function/pragma_function.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -11,8 +13,11 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/extension_callback_manager.hpp"
+#include "duckdb/main/profiling_node.hpp"
+#include "duckdb/main/query_profiler.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
 #include "duckdb/planner/extension_callback.hpp"
+#include "duckdb/storage/buffer_manager.hpp"
 
 namespace duckdb {
 
@@ -27,6 +32,121 @@ optional_ptr<RecyclerState> GetRecyclerState(ClientContext &context) {
 		}
 	}
 	return nullptr;
+}
+
+//===----------------------------------------------------------------------===//
+// Connection state and the end-of-query callback
+//===----------------------------------------------------------------------===//
+RecyclerClientState &RecyclerClientState::Get(ClientContext &context) {
+	return *context.registered_state->GetOrCreate<RecyclerClientState>("recycler");
+}
+
+void RecyclerClientState::NoteTouched(shared_ptr<CachedEntry> entry) {
+	if (!profiled) {
+		return;
+	}
+	std::lock_guard<std::mutex> guard(touched_lock);
+	touched.push_back(std::move(entry));
+}
+
+//! A RECYCLER_MATERIALIZE or RECYCLER_SCAN node of the profiler tree
+struct ProfiledOperator {
+	bool materialize;
+	SigHash hash;
+	//! Operator thread time of the node and of the operators below it, in nanoseconds
+	uint64_t own_ns;
+	uint64_t below_ns;
+};
+
+static uint64_t ToNs(double seconds) {
+	return uint64_t(seconds * 1e9);
+}
+
+//! The "Key" parameter of a recycler operator from the EXTRA_INFO map of its profiler node
+static bool ProfiledKey(const ProfilingInfo &info, SigHash &hash) {
+	auto extra = info.metrics.find(MetricType::EXTRA_INFO);
+	if (extra == info.metrics.end()) {
+		return false;
+	}
+	for (auto &pair : MapValue::GetChildren(extra->second)) {
+		auto &fields = StructValue::GetChildren(pair);
+		if (StringValue::Get(fields[0]) == "Key") {
+			return SigHash::TryParse(StringValue::Get(fields[1]), hash);
+		}
+	}
+	return false;
+}
+
+//! Collects the recycler operators of the subtree; returns the subtree's summed operator thread time in seconds
+static double CollectProfiledOperators(const ProfilingNode &node, vector<ProfiledOperator> &out) {
+	double below = 0;
+	for (auto &child : node.children) {
+		below += CollectProfiledOperators(*child, out);
+	}
+	auto &info = node.GetProfilingInfo();
+	auto timing = info.metrics.find(MetricType::OPERATOR_TIMING);
+	double own = timing == info.metrics.end() ? 0 : timing->second.GetValue<double>();
+	auto name = info.metrics.find(MetricType::OPERATOR_NAME);
+	if (name != info.metrics.end()) {
+		auto &op_name = StringValue::Get(name->second);
+		bool materialize = op_name == "RECYCLER_MATERIALIZE";
+		if (materialize || op_name == "RECYCLER_SCAN") {
+			ProfiledOperator op;
+			op.materialize = materialize;
+			if (ProfiledKey(info, op.hash)) {
+				op.own_ns = ToNs(own);
+				op.below_ns = ToNs(below);
+				out.push_back(op);
+			}
+		}
+	}
+	return below + own;
+}
+
+void RecyclerClientState::QueryEnd(ClientContext &context, optional_ptr<ErrorData> error) {
+	if (!profiled) {
+		return;
+	}
+	profiled = false;
+	vector<shared_ptr<CachedEntry>> entries;
+	{
+		std::lock_guard<std::mutex> guard(touched_lock);
+		entries.swap(touched);
+	}
+	if (error) {
+		return;
+	}
+	// runs after the query's latency was fixed (section 6.5 of the plan); the profiler's tree of this query stays
+	// readable until the next profiled query starts
+	try {
+		auto root = QueryProfiler::Get(context).GetRoot();
+		if (!root) {
+			// the plan had no operator the profiler covers
+			return;
+		}
+		vector<ProfiledOperator> operators;
+		CollectProfiledOperators(*root, operators);
+		auto &cache = *GetRecyclerState(context)->cache;
+		for (auto &op : operators) {
+			for (auto &entry : entries) {
+				if (entry->hash == op.hash) {
+					if (op.materialize) {
+						entry->measured_cost_ns = op.below_ns;
+						entry->materialize_ns = op.own_ns;
+					} else {
+						entry->hit_ns = op.own_ns;
+					}
+				}
+			}
+			if (op.materialize) {
+				cache.NoteMaterializeTime(op.hash, op.below_ns, op.own_ns);
+			} else {
+				cache.NoteHitTime(op.hash, op.own_ns);
+			}
+		}
+	} catch (std::exception &) {
+		// a profiler tree without the metrics we read; the measurement is a by-product, never a failure
+	}
 }
 
 //===----------------------------------------------------------------------===//
@@ -106,6 +226,13 @@ static unique_ptr<GlobalTableFunctionState> RecyclerStatsInit(ClientContext &con
 		add("skip_write_transaction", s.skip_write_transaction);
 		add("skip_analyze_failed", s.skip_analyze_failed);
 		add("root_not_cacheable", s.root_not_cacheable);
+		add("bytes_used", cache.UsedBytes());
+		add("swap_bytes", BufferManager::GetBufferManager(context).GetUsedSwap());
+		add("history_entries", cache.HistorySize());
+		for (idx_t reason = 1; reason < static_cast<idx_t>(RefusalReason::COUNT); reason++) {
+			result->rows.emplace_back(string("refused_") + RefusalReasonName(static_cast<RefusalReason>(reason)),
+			                          int64_t(s.refused[reason].load()));
+		}
 	}
 	return std::move(result);
 }
@@ -146,7 +273,25 @@ static unique_ptr<FunctionData> RecyclerEntriesBind(ClientContext &context, Tabl
 	return_types.emplace_back(LogicalType::BOOLEAN);
 	names.emplace_back("est_input_rows");
 	return_types.emplace_back(LogicalType::BIGINT);
+	names.emplace_back("used_bytes");
+	return_types.emplace_back(LogicalType::BIGINT);
+	names.emplace_back("measured_cost_ms");
+	return_types.emplace_back(LogicalType::DOUBLE);
+	names.emplace_back("materialize_ms");
+	return_types.emplace_back(LogicalType::DOUBLE);
+	names.emplace_back("hit_ms");
+	return_types.emplace_back(LogicalType::DOUBLE);
+	names.emplace_back("sink_calls");
+	return_types.emplace_back(LogicalType::BIGINT);
+	names.emplace_back("stored_at");
+	return_types.emplace_back(LogicalType::BIGINT);
+	names.emplace_back("last_used");
+	return_types.emplace_back(LogicalType::BIGINT);
 	return nullptr;
+}
+
+static Value Milliseconds(const std::atomic<uint64_t> &ns) {
+	return Value::DOUBLE(double(ns.load()) / 1e6);
 }
 
 static unique_ptr<GlobalTableFunctionState> RecyclerEntriesInit(ClientContext &context,
@@ -171,6 +316,13 @@ static void RecyclerEntriesFunction(ClientContext &context, TableFunctionInput &
 		output.SetValue(4, count, Value::BIGINT(int64_t(entry.hits.load())));
 		output.SetValue(5, count, Value::BOOLEAN(entry.ordered));
 		output.SetValue(6, count, Value::BIGINT(int64_t(entry.est_input_rows)));
+		output.SetValue(7, count, Value::BIGINT(int64_t(entry.used_bytes)));
+		output.SetValue(8, count, Milliseconds(entry.measured_cost_ns));
+		output.SetValue(9, count, Milliseconds(entry.materialize_ns));
+		output.SetValue(10, count, Milliseconds(entry.hit_ns));
+		output.SetValue(11, count, Value::BIGINT(int64_t(entry.sink_calls)));
+		output.SetValue(12, count, Value::BIGINT(int64_t(entry.stored_at)));
+		output.SetValue(13, count, Value::BIGINT(int64_t(entry.last_used.load())));
 		count++;
 	}
 	output.SetCardinality(count);

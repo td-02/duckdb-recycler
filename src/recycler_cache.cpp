@@ -97,8 +97,9 @@ void RecyclerCache::Erase(const CachedEntry &entry) {
 	} else {
 		Map(entry.kind).erase(entry.hash);
 	}
-	D_ASSERT(total_bytes >= entry.bytes);
+	D_ASSERT(total_bytes >= entry.bytes && total_used_bytes >= entry.used_bytes);
 	total_bytes -= entry.bytes;
+	total_used_bytes -= entry.used_bytes;
 	stats.evictions++;
 }
 
@@ -132,8 +133,10 @@ bool RecyclerCache::Store(shared_ptr<CachedEntry> entry, idx_t budget_bytes) {
 		stats.store_rejected++;
 		return false;
 	}
-	entry->last_used = NextSequence();
+	entry->stored_at = NextSequence();
+	entry->last_used = entry->stored_at;
 	total_bytes += entry->bytes;
+	total_used_bytes += entry->used_bytes;
 	map[entry->hash] = entry;
 	if (entry->kind == RecyclerEntryKind::WHOLE_RESULT) {
 		stats.whole_stores++;
@@ -160,8 +163,10 @@ bool RecyclerCache::StoreBlock(shared_ptr<CachedEntry> entry, idx_t budget_bytes
 		stats.store_rejected++;
 		return false;
 	}
-	entry->last_used = NextSequence();
+	entry->stored_at = NextSequence();
+	entry->last_used = entry->stored_at;
 	total_bytes += entry->bytes;
+	total_used_bytes += entry->used_bytes;
 	blocks[entry->hash].push_back(entry);
 	stats.block_stores++;
 	return true;
@@ -181,37 +186,94 @@ void RecyclerCache::Clear() {
 	whole.clear();
 	subtrees.clear();
 	blocks.clear();
-	seen.clear();
-	too_big.clear();
+	history.clear();
+	history_order.clear();
 	total_bytes = 0;
+	total_used_bytes = 0;
 	stats.clears++;
+}
+
+SignatureHistory &RecyclerCache::History(const SigHash &hash) {
+	auto node = history.find(hash);
+	if (node == history.end()) {
+		if (history.size() == HISTORY_BOUND) {
+			history.erase(history_order.back());
+			history_order.pop_back();
+		}
+		history_order.push_front(hash);
+		node = history.emplace(hash, HistoryNode {SignatureHistory(), history_order.begin()}).first;
+	} else {
+		history_order.splice(history_order.begin(), history_order, node->second.position);
+	}
+	node->second.history.last_seen = NextSequence();
+	return node->second.history;
 }
 
 idx_t RecyclerCache::NoteSeen(const SigHash &hash) {
 	std::lock_guard<std::mutex> guard(lock);
-	return ++seen[hash];
+	return ++History(hash).seen;
 }
 
 idx_t RecyclerCache::Seen(const SigHash &hash) const {
 	std::lock_guard<std::mutex> guard(lock);
-	auto entry = seen.find(hash);
-	return entry == seen.end() ? 0 : entry->second;
+	auto node = history.find(hash);
+	return node == history.end() ? 0 : node->second.history.seen;
 }
 
-void RecyclerCache::NoteTooBig(const SigHash &hash) {
+void RecyclerCache::NoteRefused(const SigHash &hash, RefusalReason reason) {
+	D_ASSERT(reason != RefusalReason::NONE);
+	stats.refused[static_cast<idx_t>(reason)]++;
 	std::lock_guard<std::mutex> guard(lock);
-	too_big.insert(hash);
-	stats.too_big++;
+	History(hash).reason = reason;
 }
 
-bool RecyclerCache::IsTooBig(const SigHash &hash) const {
+void RecyclerCache::NoteMaterialized(const SigHash &hash, idx_t rows, idx_t bytes, uint64_t materialize_ns,
+                                     bool too_big) {
+	if (too_big) {
+		stats.too_big++;
+	}
 	std::lock_guard<std::mutex> guard(lock);
-	return too_big.find(hash) != too_big.end();
+	auto &entry = History(hash);
+	entry.rows = rows;
+	entry.bytes = bytes;
+	entry.materialize_ns = materialize_ns;
+}
+
+bool RecyclerCache::TooBig(const SigHash &hash, idx_t cap_rows, idx_t cap_bytes) const {
+	std::lock_guard<std::mutex> guard(lock);
+	auto node = history.find(hash);
+	if (node == history.end()) {
+		return false;
+	}
+	auto &entry = node->second.history;
+	return entry.rows > cap_rows || entry.bytes > cap_bytes;
+}
+
+void RecyclerCache::NoteMaterializeTime(const SigHash &hash, uint64_t measured_cost_ns, uint64_t materialize_ns) {
+	std::lock_guard<std::mutex> guard(lock);
+	auto &entry = History(hash);
+	entry.measured_cost_ns = measured_cost_ns;
+	entry.materialize_ns = materialize_ns;
+}
+
+void RecyclerCache::NoteHitTime(const SigHash &hash, uint64_t hit_ns) {
+	std::lock_guard<std::mutex> guard(lock);
+	History(hash).hit_ns = hit_ns;
+}
+
+idx_t RecyclerCache::HistorySize() const {
+	std::lock_guard<std::mutex> guard(lock);
+	return history.size();
 }
 
 idx_t RecyclerCache::TotalBytes() const {
 	std::lock_guard<std::mutex> guard(lock);
 	return total_bytes;
+}
+
+idx_t RecyclerCache::UsedBytes() const {
+	std::lock_guard<std::mutex> guard(lock);
+	return total_used_bytes;
 }
 
 idx_t RecyclerCache::EntryCount() const {
