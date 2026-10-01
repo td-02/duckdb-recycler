@@ -253,9 +253,6 @@ query I nosort hits_txn
 SELECT sum(value) FROM recycler_stats() WHERE name IN ('whole_hits', 'block_hits', 'subtree_hits', 'subsumption_hits')
 
 statement ok
-SET VARIABLE skip_txn_before = (SELECT value FROM recycler_stats() WHERE name = 'skip_write_transaction');
-
-statement ok
 BEGIN TRANSACTION;
 
 statement ok
@@ -265,6 +262,9 @@ query I
 SELECT count(*) FROM recycler_entries()
 ----
 0
+
+statement ok
+SET VARIABLE skip_txn_before = (SELECT value FROM recycler_stats() WHERE name = 'skip_write_transaction');
 
 query II
 SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g DESC
@@ -304,6 +304,13 @@ SELECT count(*) FROM t WHERE g = 2
 ----
 42858
 
+# the four reads over t since the snapshot were skipped because the transaction has written; the count includes
+# this query itself, whose hook runs before it executes
+query I
+SELECT value = getvariable('skip_txn_before') + 5 FROM recycler_stats() WHERE name = 'skip_write_transaction'
+----
+true
+
 query I
 SELECT count(*) FROM recycler_entries()
 ----
@@ -312,16 +319,12 @@ SELECT count(*) FROM recycler_entries()
 query I nosort hits_txn
 SELECT sum(value) FROM recycler_stats() WHERE name IN ('whole_hits', 'block_hits', 'subtree_hits', 'subsumption_hits')
 
-# every read since BEGIN was skipped because the transaction has written: the four reads over t, the two
-# recycler_entries() checks, the hit-counter snapshot above, and this query itself (its hook runs before it executes)
-query I
-SELECT value = getvariable('skip_txn_before') + 8 FROM recycler_stats() WHERE name = 'skip_write_transaction'
-----
-true
-
 # ---------------------------------------------------------------------------
 # 5. after a rollback the cache is still cleared: the rolled-back row is gone, the first re-read is a miss,
 #    and the recycler starts storing again
+#    (BEGIN and ROLLBACK are themselves classified as modifying statements today, so no entry can survive into
+#    or out of the transaction; what this section proves is that the rolled-back row is never served and that
+#    caching resumes afterwards)
 # ---------------------------------------------------------------------------
 statement ok
 ROLLBACK;

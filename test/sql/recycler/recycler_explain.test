@@ -117,6 +117,9 @@ SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
 
 # plain EXPLAIN does not execute anything: it is neither served nor stored, and nothing breaks
 statement ok
+SET VARIABLE skip_not_query_before = (SELECT value FROM recycler_stats() WHERE name = 'skip_not_query');
+
+statement ok
 EXPLAIN SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g DESC
 
 query I
@@ -125,7 +128,7 @@ SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
 5
 
 query I
-SELECT value >= 1 FROM recycler_stats() WHERE name = 'skip_not_query'
+SELECT value = getvariable('skip_not_query_before') + 1 FROM recycler_stats() WHERE name = 'skip_not_query'
 ----
 true
 

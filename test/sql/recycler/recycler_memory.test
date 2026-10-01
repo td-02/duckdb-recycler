@@ -102,6 +102,17 @@ SELECT count(*) FROM recycler_entries()
 query II nosort res_b
 SELECT id, h FROM t WHERE g = 1 AND h < 12 ORDER BY id
 
+# the second store evicted the first entry rather than being refused
+query I
+SELECT count(*) FROM recycler_entries()
+----
+1
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'evictions'
+----
+1
+
 query II nosort res_c
 SELECT id, h FROM t WHERE g = 2 AND h < 10 ORDER BY id
 
@@ -109,9 +120,9 @@ SELECT id, h FROM t WHERE g = 2 AND h < 10 ORDER BY id
 # 3. recycler_stats() reports the evictions, and the cache never holds more than the budget
 # ---------------------------------------------------------------------------
 query I
-SELECT value > 0 FROM recycler_stats() WHERE name = 'evictions'
+SELECT value FROM recycler_stats() WHERE name = 'evictions'
 ----
-true
+2
 
 query I
 SELECT value <= 1048576 FROM recycler_stats() WHERE name = 'bytes'
@@ -119,9 +130,9 @@ SELECT value <= 1048576 FROM recycler_stats() WHERE name = 'bytes'
 true
 
 query I
-SELECT count(*) >= 1 FROM recycler_entries()
+SELECT count(*) FROM recycler_entries()
 ----
-true
+1
 
 # ---------------------------------------------------------------------------
 # 4. after eviction every answer is unchanged: the surviving entry is served, the evicted ones are recomputed
@@ -171,6 +182,9 @@ query II nosort entries_disabled
 SELECT count(*), coalesce(sum(bytes), 0) FROM recycler_entries()
 
 statement ok
+SET VARIABLE skip_disabled_before = (SELECT value FROM recycler_stats() WHERE name = 'skip_disabled');
+
+statement ok
 SET recycler_enabled = false;
 
 query II nosort res_a
@@ -193,8 +207,9 @@ SELECT sum(value) FROM recycler_stats() WHERE name IN ('writes_planned', 'whole_
 query II nosort entries_disabled
 SELECT count(*), coalesce(sum(bytes), 0) FROM recycler_entries()
 
+# the four reads over t, the two snapshot queries above and this query itself were all skipped while disabled
 query I
-SELECT value >= 4 FROM recycler_stats() WHERE name = 'skip_disabled'
+SELECT value = getvariable('skip_disabled_before') + 7 FROM recycler_stats() WHERE name = 'skip_disabled'
 ----
 true
 
@@ -240,6 +255,3 @@ query I
 SELECT value >= 2 FROM recycler_stats() WHERE name = 'whole_hits'
 ----
 true
-
-statement ok
-SET recycler_budget_mb = 2000;
