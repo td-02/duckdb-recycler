@@ -9,6 +9,13 @@
 
 namespace duckdb {
 
+optional_ptr<const LogicalRecyclerOperator> AsRecyclerOperator(const LogicalOperator &op) {
+	if (op.type != LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR) {
+		return nullptr;
+	}
+	return dynamic_cast<const LogicalRecyclerOperator *>(&op);
+}
+
 //===----------------------------------------------------------------------===//
 // Shared scan state
 //===----------------------------------------------------------------------===//
@@ -62,10 +69,10 @@ static SourceResultType ScanCollection(const ColumnDataCollection &collection, D
 //===----------------------------------------------------------------------===//
 // LogicalRecyclerScan
 //===----------------------------------------------------------------------===//
-LogicalRecyclerScan::LogicalRecyclerScan(idx_t table_index, vector<LogicalType> types_p, shared_ptr<CachedEntry> entry_p,
-                                         bool ordered, vector<column_t> column_ids_p)
-    : LogicalExtensionOperator(), table_index(table_index), scan_types(std::move(types_p)), entry(std::move(entry_p)),
-      ordered(ordered), column_ids(std::move(column_ids_p)) {
+LogicalRecyclerScan::LogicalRecyclerScan(idx_t table_index, vector<LogicalType> types_p,
+                                         shared_ptr<CachedEntry> entry_p, bool ordered, vector<column_t> column_ids_p)
+    : LogicalRecyclerOperator(RecyclerOperatorKind::SCAN), table_index(table_index), scan_types(std::move(types_p)),
+      entry(std::move(entry_p)), ordered(ordered), column_ids(std::move(column_ids_p)) {
 	if (column_ids.empty()) {
 		for (idx_t i = 0; i < scan_types.size(); i++) {
 			column_ids.push_back(i);
@@ -160,9 +167,25 @@ SourceResultType PhysicalRecyclerScan::GetDataInternal(ExecutionContext &context
 //===----------------------------------------------------------------------===//
 // LogicalRecyclerMaterialize
 //===----------------------------------------------------------------------===//
+RecyclerWriteSpec RecyclerWriteSpec::Make(RecyclerEntryKind kind, const SigHash &hash, string canonical, bool ordered,
+                                          idx_t est_input_rows, const RecyclerSettings &settings) {
+	RecyclerWriteSpec spec;
+	spec.kind = kind;
+	spec.hash = hash;
+	spec.canonical = std::move(canonical);
+	spec.ordered = ordered;
+	spec.est_input_rows = est_input_rows;
+	spec.cap_rows = kind == RecyclerEntryKind::WHOLE_RESULT
+	                    ? MinValue<idx_t>(settings.whole_cap_rows, settings.entry_cap_rows)
+	                    : settings.entry_cap_rows;
+	spec.cap_bytes = settings.entry_cap_bytes;
+	spec.budget_bytes = settings.budget_bytes;
+	return spec;
+}
+
 LogicalRecyclerMaterialize::LogicalRecyclerMaterialize(RecyclerWriteSpec spec_p, shared_ptr<RecyclerCache> cache_p,
                                                        unique_ptr<LogicalOperator> child)
-    : LogicalExtensionOperator(), spec(std::move(spec_p)), cache(std::move(cache_p)) {
+    : LogicalRecyclerOperator(RecyclerOperatorKind::MATERIALIZE), spec(std::move(spec_p)), cache(std::move(cache_p)) {
 	children.push_back(std::move(child));
 	if (children[0]->has_estimated_cardinality) {
 		SetEstimatedCardinality(children[0]->estimated_cardinality);

@@ -2,6 +2,10 @@
 //===----------------------------------------------------------------------===//
 // recycler_operators.hpp - the two operator pairs of the recycler
 //
+//  Both logical operators derive from LogicalRecyclerOperator, so "is this one
+//  of ours" is a single dynamic_cast (AsRecyclerOperator) and `kind` tells
+//  which one it is.
+//
 //  * LogicalRecyclerScan / PhysicalRecyclerScan: a cache hit. A childless
 //    source that replays a cached ColumnDataCollection, in parallel or in the
 //    stored order. It is an EXTENSION operator on purpose: DuckDB's profiler
@@ -19,10 +23,29 @@ namespace duckdb {
 
 class PhysicalPlanGenerator;
 
+enum class RecyclerOperatorKind : uint8_t { SCAN, MATERIALIZE };
+
+//! Common base of the recycler's logical operators
+class LogicalRecyclerOperator : public LogicalExtensionOperator {
+public:
+	explicit LogicalRecyclerOperator(RecyclerOperatorKind kind) : LogicalExtensionOperator(), kind(kind) {
+	}
+
+	const RecyclerOperatorKind kind;
+
+public:
+	bool SupportSerialization() const override {
+		return false;
+	}
+};
+
+//! `op` as one of our operators; nullptr for every other operator, including foreign extension operators
+optional_ptr<const LogicalRecyclerOperator> AsRecyclerOperator(const LogicalOperator &op);
+
 //===----------------------------------------------------------------------===//
 // Scan (hit)
 //===----------------------------------------------------------------------===//
-class LogicalRecyclerScan : public LogicalExtensionOperator {
+class LogicalRecyclerScan : public LogicalRecyclerOperator {
 public:
 	//! `column_ids` selects the stored columns to emit (empty = all, in stored order); `types` are their types
 	LogicalRecyclerScan(idx_t table_index, vector<LogicalType> types, shared_ptr<CachedEntry> entry, bool ordered,
@@ -43,9 +66,6 @@ public:
 	vector<idx_t> GetTableIndex() const override;
 	unique_ptr<LogicalOperator> Copy(ClientContext &context) const override;
 	idx_t EstimateCardinality(ClientContext &context) override;
-	bool SupportSerialization() const override {
-		return false;
-	}
 
 protected:
 	void ResolveTypes() override;
@@ -101,9 +121,14 @@ struct RecyclerWriteSpec {
 	vector<string> conjuncts;
 	std::unordered_map<idx_t, idx_t> table_ids;
 	vector<ColumnIdentity> columns;
+
+	//! The write of one entry under the session's caps (the kind decides the row cap); BLOCK writes add their shape
+	//! fields afterwards
+	static RecyclerWriteSpec Make(RecyclerEntryKind kind, const SigHash &hash, string canonical, bool ordered,
+	                              idx_t est_input_rows, const RecyclerSettings &settings);
 };
 
-class LogicalRecyclerMaterialize : public LogicalExtensionOperator {
+class LogicalRecyclerMaterialize : public LogicalRecyclerOperator {
 public:
 	LogicalRecyclerMaterialize(RecyclerWriteSpec spec, shared_ptr<RecyclerCache> cache,
 	                           unique_ptr<LogicalOperator> child);
@@ -120,9 +145,6 @@ public:
 	vector<idx_t> GetTableIndex() const override;
 	unique_ptr<LogicalOperator> Copy(ClientContext &context) const override;
 	idx_t EstimateCardinality(ClientContext &context) override;
-	bool SupportSerialization() const override {
-		return false;
-	}
 
 protected:
 	void ResolveTypes() override;

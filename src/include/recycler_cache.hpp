@@ -9,7 +9,6 @@
 #include "duckdb/common/types/column/column_data_collection.hpp"
 
 #include <atomic>
-#include <functional>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -101,16 +100,18 @@ struct RecyclerStats {
 
 class RecyclerCache {
 public:
-	//! Look up an entry; the hash match is confirmed by comparing the canonical rendering (computed lazily)
-	shared_ptr<CachedEntry> Lookup(RecyclerEntryKind kind, const SigHash &hash,
-	                               const std::function<string()> &render_canonical);
+	//! Look up the entry for the subtree rooted at `op`; a hash match is confirmed by rendering the subtree and
+	//! comparing the canonical byte string
+	shared_ptr<CachedEntry> Lookup(RecyclerEntryKind kind, const SigHash &hash, const PlanSignatures &sig,
+	                               const LogicalOperator &op);
 	//! Insert an entry (never overwrites); evicts lower-benefit entries to respect the budget. Returns success.
 	bool Store(shared_ptr<CachedEntry> entry, idx_t budget_bytes);
 	//! Insert a BLOCK entry under its shape hash (several entries per shape may coexist)
 	bool StoreBlock(shared_ptr<CachedEntry> entry, idx_t budget_bytes);
 	//! All BLOCK entries with this shape hash
 	vector<shared_ptr<CachedEntry>> LookupBlocks(const SigHash &hash) const;
-	//! Account a reuse of an entry that was found through LookupBlocks
+	//! Account a reuse of an entry (also for entries found through LookupBlocks). Runs outside the cache lock, which is
+	//! why `hits` and `last_used` are atomics
 	void NoteHit(CachedEntry &entry);
 	void Clear();
 

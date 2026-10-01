@@ -29,8 +29,8 @@ idx_t RecyclerCache::NextSequence() {
 	return ++sequence;
 }
 
-shared_ptr<CachedEntry> RecyclerCache::Lookup(RecyclerEntryKind kind, const SigHash &hash,
-                                              const std::function<string()> &render_canonical) {
+shared_ptr<CachedEntry> RecyclerCache::Lookup(RecyclerEntryKind kind, const SigHash &hash, const PlanSignatures &sig,
+                                              const LogicalOperator &op) {
 	shared_ptr<CachedEntry> candidate;
 	{
 		std::lock_guard<std::mutex> guard(lock);
@@ -43,7 +43,7 @@ shared_ptr<CachedEntry> RecyclerCache::Lookup(RecyclerEntryKind kind, const SigH
 		candidate = entry->second;
 	}
 	// confirm the match outside of the lock (rendering walks the plan)
-	auto canonical = render_canonical();
+	auto canonical = sig.Render(op);
 	if (canonical != candidate->canonical) {
 		stats.hash_collisions++;
 		stats.misses++;
@@ -97,7 +97,8 @@ void RecyclerCache::Erase(const CachedEntry &entry) {
 	} else {
 		Map(entry.kind).erase(entry.hash);
 	}
-	total_bytes -= MinValue<idx_t>(total_bytes, entry.bytes);
+	D_ASSERT(total_bytes >= entry.bytes);
+	total_bytes -= entry.bytes;
 	stats.evictions++;
 }
 

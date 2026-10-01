@@ -794,20 +794,21 @@ void PlanSignatures::RenderNode(const LogicalOperator &op, const Frame &frame, S
 		break;
 	}
 	case LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR: {
-		if (dynamic_cast<const LogicalRecyclerMaterialize *>(&op)) {
+		auto ours = AsRecyclerOperator(op);
+		if (!ours) {
+			Refuse(info, "foreign extension operator");
+			break;
+		}
+		if (ours->kind == RecyclerOperatorKind::MATERIALIZE) {
 			// a planted block marker is a transparent wrapper around its child
 			sink.Tag("RMAT");
 			break;
 		}
-		auto scan = dynamic_cast<const LogicalRecyclerScan *>(&op);
-		if (!scan) {
-			Refuse(info, "foreign extension operator");
-			break;
-		}
-		RenderOwnIndex(scan->table_index, frame, sink);
-		sink.Hash(scan->entry->hash);
-		sink.U64(scan->column_ids.size());
-		for (auto col : scan->column_ids) {
+		auto &scan = op.Cast<LogicalRecyclerScan>();
+		RenderOwnIndex(scan.table_index, frame, sink);
+		sink.Hash(scan.entry->hash);
+		sink.U64(scan.column_ids.size());
+		for (auto col : scan.column_ids) {
 			sink.U64(col);
 		}
 		break;

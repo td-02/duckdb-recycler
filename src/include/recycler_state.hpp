@@ -23,7 +23,9 @@ struct RecyclerState : public OptimizerExtensionInfo {
 struct RecyclerClientState : public ClientContextState {
 	//! The pre hook decided this statement takes part in recycling
 	bool active = false;
-	//! Settings are re-read only after a SET/RESET/PRAGMA statement ran on this connection
+	//! Settings are re-read only after a SET/RESET/PRAGMA statement ran on this connection (the pre hook sees the
+	//! statement before it executes and drops the cached copy). A SET GLOBAL on another connection therefore takes
+	//! effect here only after this connection's next SET/RESET/PRAGMA.
 	bool settings_loaded = false;
 	RecyclerSettings settings;
 	//! Whole-result write requested by the pre hook (a miss on an admissible query)
