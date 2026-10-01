@@ -198,6 +198,7 @@ static unique_ptr<GlobalTableFunctionState> RecyclerStatsInit(ClientContext &con
 		};
 		add("entries", cache.EntryCount());
 		add("bytes", cache.TotalBytes());
+		add("bytes_used", cache.UsedBytes());
 		add("pre_calls", s.pre_calls);
 		add("post_calls", s.post_calls);
 		add("whole_hits", s.whole_hits);
@@ -225,7 +226,6 @@ static unique_ptr<GlobalTableFunctionState> RecyclerStatsInit(ClientContext &con
 		add("skip_write_transaction", s.skip_write_transaction);
 		add("skip_analyze_failed", s.skip_analyze_failed);
 		add("root_not_cacheable", s.root_not_cacheable);
-		add("bytes_used", cache.UsedBytes());
 		add("swap_bytes", BufferManager::GetBufferManager(context).GetUsedSwap());
 		add("history_entries", cache.HistorySize());
 		for (idx_t reason = 1; reason < static_cast<idx_t>(RefusalReason::COUNT); reason++) {
