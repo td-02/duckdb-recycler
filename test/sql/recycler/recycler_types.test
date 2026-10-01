@@ -1,0 +1,188 @@
+# name: test/sql/recycler/recycler_types.test
+# description: results over every column type are stored and replayed without loss, including empty results
+# group: [recycler]
+
+require waddle
+
+statement ok
+SET threads = 4;
+
+statement ok
+SET recycler_min_input_rows = 1;
+
+statement ok
+CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');
+
+statement ok
+CREATE TABLE all_types AS
+SELECT range AS id,
+       range % 3 AS g,
+       range % 2 = 0 AS b,
+       (range % 100 - 50)::TINYINT AS i8,
+       (range % 30000 - 15000)::SMALLINT AS i16,
+       (range * 1000 - 500000)::INTEGER AS i32,
+       (range * 1000000007 - 3)::BIGINT AS i64,
+       (range::HUGEINT * 1000000000000000000 - 1)::HUGEINT AS i128,
+       (range::UHUGEINT * 1000000000000000000)::UHUGEINT AS u128,
+       (range % 200)::UTINYINT AS u8,
+       (range % 60000)::USMALLINT AS u16,
+       (range * 1000)::UINTEGER AS u32,
+       (range * 1000000007)::UBIGINT AS u64,
+       (range / 3.0)::FLOAT AS f32,
+       (range / 7.0)::DOUBLE AS f64,
+       (range / 1000.0)::DECIMAL(18, 3) AS dec18,
+       (range / 1000000.0)::DECIMAL(38, 10) AS dec38,
+       'short' || range % 5 AS s_short,
+       'a long string beyond the inline limit ' || range AS s_long,
+       'ünïcödé ' || chr((945 + range % 20)::INTEGER) || ' ' || range AS s_uni,
+       encode('blob ' || range) AS bl,
+       DATE '2000-01-01' + (range % 400)::INTEGER AS d,
+       TIME '12:00:00' + INTERVAL (range % 86400) SECOND AS tm,
+       TIMESTAMP '2000-01-01 00:00:00' + INTERVAL (range % 100000) SECOND AS ts,
+       (TIMESTAMP '2000-01-01 00:00:00' + INTERVAL (range % 100000) SECOND)::TIMESTAMPTZ AS tstz,
+       INTERVAL (range % 50) DAY + INTERVAL (range % 3) MONTH AS iv,
+       ('00000000-0000-0000-0000-' || lpad(range::VARCHAR, 12, '0'))::UUID AS u,
+       (CASE range % 3 WHEN 0 THEN 'sad' WHEN 1 THEN 'ok' ELSE 'happy' END)::mood AS mood_col,
+       [range, range + 1, NULL] AS l,
+       {'a': range, 'b': 'x' || range} AS st,
+       MAP {'k' || range % 3: range} AS m,
+       [range::INTEGER, (range + 1)::INTEGER, (range + 2)::INTEGER]::INTEGER[3] AS arr,
+       [{'x': range, 'y': 'y' || range}, {'x': range + 1, 'y': NULL}] AS ls,
+       NULL::INTEGER AS n
+FROM range(5000);
+
+statement ok
+CREATE TABLE empty_t AS SELECT * FROM all_types WHERE false;
+
+statement ok
+CREATE TABLE dim AS SELECT range AS id, 'name' || range AS name FROM range(3);
+
+# ---------------------------------------------------------------------------
+# whole result over every column: stored on the first run, served on the second, identical rows
+# ---------------------------------------------------------------------------
+query IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII nosort all_columns
+SELECT * FROM all_types WHERE id % 97 = 0 ORDER BY id
+----
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_stores'
+----
+1
+
+query IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII nosort all_columns
+SELECT * FROM all_types WHERE id % 97 = 0 ORDER BY id
+----
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+1
+
+# the served values, spelled out for the types whose storage is not a plain fixed-width vector
+query IIIIIIIIIIIIIIIII
+SELECT id, i128, u128, dec38, s_long, s_uni, bl, tstz, iv, u, mood_col, l, st, m, arr, ls, n FROM all_types WHERE id IN (0, 4999) ORDER BY id
+----
+0	-1	0	0.0000000000	a long string beyond the inline limit 0	ünïcödé α 0	blob 0	2000-01-01 00:00:00+00	00:00:00	00000000-0000-0000-0000-000000000000	sad	[0, 1, NULL]	{'a': 0, 'b': x0}	{k0=0}	[0, 1, 2]	[{'x': 0, 'y': y0}, {'x': 1, 'y': NULL}]	NULL
+4999	4998999999999999999999	4999000000000000000000	0.0049990000	a long string beyond the inline limit 4999	ünïcödé τ 4999	blob 4999	2000-01-01 01:23:19+00	1 month 49 days	00000000-0000-0000-0000-000000004999	ok	[4999, 5000, NULL]	{'a': 4999, 'b': x4999}	{k1=4999}	[4999, 5000, 5001]	[{'x': 4999, 'y': y4999}, {'x': 5000, 'y': NULL}]	NULL
+
+query IIIIIIIIIIIIIIIII
+SELECT id, i128, u128, dec38, s_long, s_uni, bl, tstz, iv, u, mood_col, l, st, m, arr, ls, n FROM all_types WHERE id IN (0, 4999) ORDER BY id
+----
+0	-1	0	0.0000000000	a long string beyond the inline limit 0	ünïcödé α 0	blob 0	2000-01-01 00:00:00+00	00:00:00	00000000-0000-0000-0000-000000000000	sad	[0, 1, NULL]	{'a': 0, 'b': x0}	{k0=0}	[0, 1, 2]	[{'x': 0, 'y': y0}, {'x': 1, 'y': NULL}]	NULL
+4999	4998999999999999999999	4999000000000000000000	0.0049990000	a long string beyond the inline limit 4999	ünïcödé τ 4999	blob 4999	2000-01-01 01:23:19+00	1 month 49 days	00000000-0000-0000-0000-000000004999	ok	[4999, 5000, NULL]	{'a': 4999, 'b': x4999}	{k1=4999}	[4999, 5000, 5001]	[{'x': 4999, 'y': y4999}, {'x': 5000, 'y': NULL}]	NULL
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+2
+
+# ---------------------------------------------------------------------------
+# subtree: a join and aggregation over every type is reused under a different ORDER BY
+# ---------------------------------------------------------------------------
+query IIIIIIIIIIIIIIIIIIIIIII nosort agg_asc
+SELECT dim.name, count(*), sum(i64), max(s_long), min(s_uni), max(bl), max(d), max(tm), max(ts), max(tstz), max(iv), max(u), max(mood_col), max(l), max(st), max(arr), max(ls), count(n), sum(dec38), max(i128), min(u128), max(f32), sum(dec18)
+FROM all_types JOIN dim ON all_types.g = dim.id GROUP BY dim.name ORDER BY dim.name
+----
+name0	1667	4165833029155830	a long string beyond the inline limit 999	ünïcödé α 0	blob 999	2001-02-03	13:23:18	2000-01-01 01:23:18	2000-01-01 01:23:18+00	49 days	00000000-0000-0000-0000-000000004998	sad	[4998, 4999, NULL]	{'a': 4998, 'b': x4998}	[4998, 4999, 5000]	[{'x': 4998, 'y': y4998}, {'x': 4999, 'y': NULL}]	0	4.1658330000	4997999999999999999999	0	1666.0	4165.833
+name1	1667	4167500029167499	a long string beyond the inline limit 997	ünïcödé α 100	blob 997	2001-02-03	13:23:19	2000-01-01 01:23:19	2000-01-01 01:23:19+00	1 month 49 days	00000000-0000-0000-0000-000000004999	ok	[4999, 5000, NULL]	{'a': 4999, 'b': x4999}	[4999, 5000, 5001]	[{'x': 4999, 'y': y4999}, {'x': 5000, 'y': NULL}]	0	4.1675000000	4998999999999999999999	1000000000000000000	1666.3334	4167.500
+name2	1666	4164167029144171	a long string beyond the inline limit 998	ünïcödé α 1040	blob 998	2001-02-03	13:23:17	2000-01-01 01:23:17	2000-01-01 01:23:17+00	2 months 49 days	00000000-0000-0000-0000-000000004997	happy	[4997, 4998, NULL]	{'a': 4997, 'b': x4997}	[4997, 4998, 4999]	[{'x': 4997, 'y': y4997}, {'x': 4998, 'y': NULL}]	0	4.1641670000	4996999999999999999999	2000000000000000000	1665.6666	4164.167
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'subtree_stores'
+----
+1
+
+query IIIIIIIIIIIIIIIIIIIIIII nosort agg_desc
+SELECT dim.name, count(*), sum(i64), max(s_long), min(s_uni), max(bl), max(d), max(tm), max(ts), max(tstz), max(iv), max(u), max(mood_col), max(l), max(st), max(arr), max(ls), count(n), sum(dec38), max(i128), min(u128), max(f32), sum(dec18)
+FROM all_types JOIN dim ON all_types.g = dim.id GROUP BY dim.name ORDER BY dim.name DESC
+----
+name2	1666	4164167029144171	a long string beyond the inline limit 998	ünïcödé α 1040	blob 998	2001-02-03	13:23:17	2000-01-01 01:23:17	2000-01-01 01:23:17+00	2 months 49 days	00000000-0000-0000-0000-000000004997	happy	[4997, 4998, NULL]	{'a': 4997, 'b': x4997}	[4997, 4998, 4999]	[{'x': 4997, 'y': y4997}, {'x': 4998, 'y': NULL}]	0	4.1641670000	4996999999999999999999	2000000000000000000	1665.6666	4164.167
+name1	1667	4167500029167499	a long string beyond the inline limit 997	ünïcödé α 100	blob 997	2001-02-03	13:23:19	2000-01-01 01:23:19	2000-01-01 01:23:19+00	1 month 49 days	00000000-0000-0000-0000-000000004999	ok	[4999, 5000, NULL]	{'a': 4999, 'b': x4999}	[4999, 5000, 5001]	[{'x': 4999, 'y': y4999}, {'x': 5000, 'y': NULL}]	0	4.1675000000	4998999999999999999999	1000000000000000000	1666.3334	4167.500
+name0	1667	4165833029155830	a long string beyond the inline limit 999	ünïcödé α 0	blob 999	2001-02-03	13:23:18	2000-01-01 01:23:18	2000-01-01 01:23:18+00	49 days	00000000-0000-0000-0000-000000004998	sad	[4998, 4999, NULL]	{'a': 4998, 'b': x4998}	[4998, 4999, 5000]	[{'x': 4998, 'y': y4998}, {'x': 4999, 'y': NULL}]	0	4.1658330000	4997999999999999999999	0	1666.0	4165.833
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'subtree_hits'
+----
+1
+
+query IIIIIIIIIIIIIIIIIIIIIII nosort agg_asc
+SELECT dim.name, count(*), sum(i64), max(s_long), min(s_uni), max(bl), max(d), max(tm), max(ts), max(tstz), max(iv), max(u), max(mood_col), max(l), max(st), max(arr), max(ls), count(n), sum(dec38), max(i128), min(u128), max(f32), sum(dec18)
+FROM all_types JOIN dim ON all_types.g = dim.id GROUP BY dim.name ORDER BY dim.name
+----
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+3
+
+# ---------------------------------------------------------------------------
+# zero-row results: an empty filter result over a real table is stored and served; an empty table
+# estimates zero input rows, which stays below the admission floor until that floor is zero
+# ---------------------------------------------------------------------------
+query II
+SELECT id, s_uni FROM all_types WHERE id < 0 ORDER BY id
+----
+
+query II
+SELECT id, s_uni FROM all_types WHERE id < 0 ORDER BY id
+----
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+4
+
+query IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
+SELECT * FROM empty_t ORDER BY id
+----
+
+query IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
+SELECT * FROM empty_t ORDER BY id
+----
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+4
+
+statement ok
+SET recycler_min_input_rows = 0;
+
+query IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
+SELECT * FROM empty_t ORDER BY id
+----
+
+query IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
+SELECT * FROM empty_t ORDER BY id
+----
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+5
+
+query III
+SELECT kind, rows, bytes FROM recycler_entries() WHERE rows = 0
+----
+whole_result	0	0
+whole_result	0	0

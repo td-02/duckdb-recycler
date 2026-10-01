@@ -1,0 +1,137 @@
+# name: test/sql/recycler/recycler_explain.test
+# description: EXPLAIN ANALYZE shows recycler hits in its profile; plain EXPLAIN neither stores nor serves
+# group: [recycler]
+
+require waddle
+
+statement ok
+SET threads = 4;
+
+statement ok
+SET recycler_min_input_rows = 1;
+
+statement ok
+CREATE TABLE t AS SELECT range AS id, range % 7 AS g, range % 13 AS h FROM range(20000);
+
+statement ok
+CREATE TABLE d AS SELECT range AS id, 'role' || range AS role FROM range(7);
+
+# ---------------------------------------------------------------------------
+# plain EXPLAIN of a never-seen query: no store, no hit, nothing in the cache
+# ---------------------------------------------------------------------------
+query II
+EXPLAIN SELECT g, count(*) FROM t GROUP BY g ORDER BY g
+----
+physical_plan	<!REGEX>:.*RECYCLER.*
+
+query I
+SELECT count(*) FROM recycler_entries()
+----
+0
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'writes_planned'
+----
+0
+
+# ---------------------------------------------------------------------------
+# whole-result hit: the profile is a complete JSON document with a single RECYCLER_SCAN
+# ---------------------------------------------------------------------------
+query II
+SELECT g, count(*) FROM t GROUP BY g ORDER BY g
+----
+0	2858
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT g, count(*) FROM t GROUP BY g ORDER BY g
+----
+analyzed_plan	<REGEX>:(?s).*"latency": [0-9].*"operator_name": "RECYCLER_SCAN".*"Kind": "whole_result".*"Rows": "7".*"Ordered": "true".*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT g, count(*) FROM t GROUP BY g ORDER BY g
+----
+analyzed_plan	<!REGEX>:(?s).*"operator_name": "(HASH_GROUP_BY|PERFECT_HASH_GROUP_BY|SEQ_SCAN|ORDER_BY)".*
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+2
+
+# ---------------------------------------------------------------------------
+# subtree hit: the same join and aggregate under a different ORDER BY is served below a sort
+# ---------------------------------------------------------------------------
+query TI
+SELECT d.role, count(*) FROM t JOIN d ON t.g = d.id GROUP BY d.role ORDER BY d.role
+----
+role0	2858
+role1	2857
+role2	2857
+role3	2857
+role4	2857
+role5	2857
+role6	2857
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT d.role, count(*) FROM t JOIN d ON t.g = d.id GROUP BY d.role ORDER BY d.role DESC
+----
+analyzed_plan	<REGEX>:(?s).*"latency": [0-9].*"operator_name": "ORDER_BY".*"operator_name": "RECYCLER_SCAN".*"Kind": "subtree".*"Rows": "7".*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT d.role, count(*) FROM t JOIN d ON t.g = d.id GROUP BY d.role ORDER BY d.role DESC
+----
+analyzed_plan	<!REGEX>:(?s).*"operator_name": "(HASH_JOIN|SEQ_SCAN)".*
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'subtree_hits'
+----
+1
+
+# the first EXPLAIN ANALYZE was admitted like any query: the second one is a whole-result hit
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT d.role, count(*) FROM t JOIN d ON t.g = d.id GROUP BY d.role ORDER BY d.role DESC
+----
+analyzed_plan	<!REGEX>:(?s).*"operator_name": "(ORDER_BY|HASH_JOIN|SEQ_SCAN)".*
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+4
+
+# ---------------------------------------------------------------------------
+# plain EXPLAIN of a cached query shows the vanilla plan and leaves the counters alone
+# ---------------------------------------------------------------------------
+query II
+EXPLAIN SELECT g, count(*) FROM t GROUP BY g ORDER BY g
+----
+physical_plan	<!REGEX>:.*RECYCLER.*
+
+query II
+EXPLAIN SELECT g, count(*) FROM t GROUP BY g ORDER BY g
+----
+physical_plan	<REGEX>:.*GROUP_BY.*
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+4
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'subtree_hits'
+----
+1
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'skip_not_query'
+----
+3
+
+query I
+SELECT count(*) FROM recycler_entries()
+----
+5

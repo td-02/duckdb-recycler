@@ -1,0 +1,270 @@
+# name: test/sql/recycler/recycler_connections.test
+# description: the cache is shared between connections; writes and transactions on one connection never poison another
+# group: [recycler]
+
+require waddle
+
+statement ok con1
+SET recycler_min_input_rows = 1;
+
+statement ok con2
+SET recycler_min_input_rows = 1;
+
+statement ok con1
+CREATE TABLE t AS SELECT range AS id, range % 7 AS g FROM range(20000);
+
+statement ok con1
+CREATE TABLE d AS SELECT range AS id, 'role' || range AS role FROM range(7);
+
+# ---------------------------------------------------------------------------
+# a result cached on con1 is served on con2
+# ---------------------------------------------------------------------------
+query II con1
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g
+----
+0	2858
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+query I con2
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+0
+
+query II con2
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g
+----
+0	2858
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+1
+
+# ---------------------------------------------------------------------------
+# an INSERT on con2 drops the cache; con1's next query sees the new rows
+# ---------------------------------------------------------------------------
+statement ok con2
+INSERT INTO t VALUES (20000, 0), (20001, 0);
+
+query I con1
+SELECT count(*) FROM recycler_entries()
+----
+0
+
+query II con1
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g
+----
+0	2860
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+query II con2
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g
+----
+0	2860
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+query I con2
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+2
+
+# ---------------------------------------------------------------------------
+# a write inside an explicit transaction on con1 is visible to con1 only; con2 keeps the committed answer
+# ---------------------------------------------------------------------------
+statement ok con1
+BEGIN TRANSACTION;
+
+statement ok con1
+INSERT INTO t VALUES (20002, 1), (20003, 1), (20004, 1);
+
+query II con1
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g
+----
+0	2860
+1	2860
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+query II con2
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g
+----
+0	2860
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+query II con1
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g
+----
+0	2860
+1	2860
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+query I con1
+SELECT value >= 1 FROM recycler_stats() WHERE name = 'skip_write_transaction'
+----
+true
+
+statement ok con1
+ROLLBACK;
+
+query II con1
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g
+----
+0	2860
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+query II con2
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g
+----
+0	2860
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+# the same transaction shape, committed this time
+statement ok con1
+BEGIN TRANSACTION;
+
+statement ok con1
+INSERT INTO t VALUES (20005, 2);
+
+query II con1
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g
+----
+0	2860
+1	2857
+2	2858
+3	2857
+4	2857
+5	2857
+6	2857
+
+query II con2
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g
+----
+0	2860
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+statement ok con1
+COMMIT;
+
+query II con2
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g
+----
+0	2860
+1	2857
+2	2858
+3	2857
+4	2857
+5	2857
+6	2857
+
+query II con1
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g
+----
+0	2860
+1	2857
+2	2858
+3	2857
+4	2857
+5	2857
+6	2857
+
+# ---------------------------------------------------------------------------
+# PRAGMA recycler_clear from con2 while con1 holds cached entries
+# ---------------------------------------------------------------------------
+query TI con1
+SELECT d.role, count(*) AS c FROM t JOIN d ON t.g = d.id GROUP BY d.role ORDER BY d.role
+----
+role0	2860
+role1	2857
+role2	2858
+role3	2857
+role4	2857
+role5	2857
+role6	2857
+
+query I con1
+SELECT count(*) >= 2 FROM recycler_entries()
+----
+true
+
+statement ok con2
+PRAGMA recycler_clear;
+
+query I con1
+SELECT count(*) FROM recycler_entries()
+----
+0
+
+query TI con1
+SELECT d.role, count(*) AS c FROM t JOIN d ON t.g = d.id GROUP BY d.role ORDER BY d.role
+----
+role0	2860
+role1	2857
+role2	2858
+role3	2857
+role4	2857
+role5	2857
+role6	2857
+
+query TI con2
+SELECT d.role, count(*) AS c FROM t JOIN d ON t.g = d.id GROUP BY d.role ORDER BY d.role
+----
+role0	2860
+role1	2857
+role2	2858
+role3	2857
+role4	2857
+role5	2857
+role6	2857
+
+query I con2
+SELECT value >= 1 FROM recycler_stats() WHERE name = 'clears'
+----
+true
