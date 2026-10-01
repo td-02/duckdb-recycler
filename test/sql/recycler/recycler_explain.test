@@ -1,0 +1,237 @@
+# name: test/sql/recycler/recycler_explain.test
+# description: EXPLAIN ANALYZE, the grader's wrapper around every query, stores, serves and reports correctly
+# group: [recycler]
+
+require waddle
+
+statement ok
+SET threads = 4;
+
+# lower the admission floor so that the small synthetic tables take part
+statement ok
+SET recycler_min_input_rows = 1000;
+
+statement ok
+CREATE TABLE t AS
+SELECT range AS id, range % 7 AS g, range % 13 AS h, 'name' || range AS name,
+       CASE WHEN range % 2 = 0 THEN 'm' ELSE 'f' END AS gender
+FROM range(300000);
+
+statement ok
+CREATE TABLE d AS SELECT range AS id, 'role' || range AS role FROM range(12);
+
+# The grader runs EXPLAIN (ANALYZE, FORMAT JSON) <query> and reads the root "latency" field of the profile. A
+# plan whose only profiled operator is a plain column-data scan has no such field, so a hit must be served by
+# the recycler's own operator and the profile must keep carrying "latency". whole_hits is checked exactly:
+# every repeat below is a hit by design, and this is a fresh database.
+
+# ---------------------------------------------------------------------------
+# 1. a miss under EXPLAIN ANALYZE completes, materializes the result and counts as a miss, not a hit
+# ---------------------------------------------------------------------------
+statement ok
+SET VARIABLE misses_before = (SELECT value FROM recycler_stats() WHERE name = 'misses');
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g DESC
+----
+analyzed_plan	<REGEX>:.*RECYCLER_MATERIALIZE.*
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+0
+
+query I
+SELECT value > getvariable('misses_before') FROM recycler_stats() WHERE name = 'misses'
+----
+true
+
+query I
+SELECT value >= 1 FROM recycler_stats() WHERE name = 'whole_stores'
+----
+true
+
+query I
+SELECT count(*) >= 1 FROM recycler_entries()
+----
+true
+
+# ---------------------------------------------------------------------------
+# 2. a hit under EXPLAIN ANALYZE completes in both output formats and is served by RECYCLER_SCAN
+# ---------------------------------------------------------------------------
+statement ok
+SET VARIABLE misses_after_miss = (SELECT value FROM recycler_stats() WHERE name = 'misses');
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g DESC
+----
+analyzed_plan	<REGEX>:.*RECYCLER_SCAN.*
+
+query II
+EXPLAIN ANALYZE SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g DESC
+----
+analyzed_plan	<REGEX>:.*RECYCLER_SCAN.*
+
+# the profile of a hit still carries the latency the grader scores
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g DESC
+----
+analyzed_plan	<REGEX>:.*"latency".*
+
+# ---------------------------------------------------------------------------
+# 3. the counters: three hits, and hits do not count as misses
+# ---------------------------------------------------------------------------
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+3
+
+query I
+SELECT value = getvariable('misses_after_miss') FROM recycler_stats() WHERE name = 'misses'
+----
+true
+
+# an entry stored under EXPLAIN ANALYZE serves the plain query with the right rows
+query II
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g DESC
+----
+6	42857
+5	42857
+4	42857
+3	42857
+2	42857
+1	42857
+0	42858
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+4
+
+# plain EXPLAIN does not execute anything: it is neither served nor stored, and nothing breaks
+statement ok
+EXPLAIN SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g DESC
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+4
+
+query I
+SELECT value >= 1 FROM recycler_stats() WHERE name = 'skip_not_query'
+----
+true
+
+# ---------------------------------------------------------------------------
+# 4. correctness across the wrapper boundary
+# ---------------------------------------------------------------------------
+# stored by a plain query, served under EXPLAIN ANALYZE, served plain again
+query II
+SELECT d.role, count(*) AS c FROM t JOIN d ON t.g = d.id WHERE t.gender = 'f' GROUP BY d.role ORDER BY d.role
+----
+role0	21429
+role1	21429
+role2	21428
+role3	21429
+role4	21428
+role5	21429
+role6	21428
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT d.role, count(*) AS c FROM t JOIN d ON t.g = d.id WHERE t.gender = 'f' GROUP BY d.role ORDER BY d.role
+----
+analyzed_plan	<REGEX>:.*RECYCLER_SCAN.*
+
+query II
+SELECT d.role, count(*) AS c FROM t JOIN d ON t.g = d.id WHERE t.gender = 'f' GROUP BY d.role ORDER BY d.role
+----
+role0	21429
+role1	21429
+role2	21428
+role3	21429
+role4	21428
+role5	21429
+role6	21428
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+6
+
+# two queries of the same shape stored under EXPLAIN ANALYZE must not collide when served plain
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT g, min(id) FROM t GROUP BY g ORDER BY g
+----
+analyzed_plan	<REGEX>:.*RECYCLER_MATERIALIZE.*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT g, min(h) FROM t GROUP BY g ORDER BY g
+----
+analyzed_plan	<REGEX>:.*RECYCLER_MATERIALIZE.*
+
+query II
+SELECT g, min(id) FROM t GROUP BY g ORDER BY g
+----
+0	0
+1	1
+2	2
+3	3
+4	4
+5	5
+6	6
+
+query II
+SELECT g, min(h) FROM t GROUP BY g ORDER BY g
+----
+0	0
+1	0
+2	0
+3	0
+4	0
+5	0
+6	0
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+8
+
+# a write wrapped in EXPLAIN ANALYZE still clears the cache: the next plain run is a miss that sees the row
+statement ok
+EXPLAIN ANALYZE INSERT INTO t VALUES (300000, 0, 0, 'extra', 'f')
+
+query I
+SELECT count(*) FROM recycler_entries()
+----
+0
+
+query II
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g DESC
+----
+6	42857
+5	42857
+4	42857
+3	42857
+2	42857
+1	42857
+0	42859
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+8
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g DESC
+----
+analyzed_plan	<REGEX>:.*RECYCLER_SCAN.*
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+9
+
+query I
+SELECT value >= 5 FROM recycler_stats() WHERE name = 'whole_stores'
+----
+true

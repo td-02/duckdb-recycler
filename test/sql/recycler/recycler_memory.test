@@ -1,0 +1,239 @@
+# name: test/sql/recycler/recycler_memory.test
+# description: a tiny budget evicts without changing answers; recycler_enabled = false and PRAGMA recycler_clear behave
+# group: [recycler]
+
+require waddle
+
+statement ok
+SET threads = 4;
+
+# lower the admission floor so that the small synthetic tables take part
+statement ok
+SET recycler_min_input_rows = 1000;
+
+statement ok
+CREATE TABLE t AS
+SELECT range AS id, range % 7 AS g, range % 13 AS h, 'name' || range AS name,
+       CASE WHEN range % 2 = 0 THEN 'm' ELSE 'f' END AS gender
+FROM range(300000);
+
+# The three ordered queries below each return two BIGINT columns and between 32,966 and 42,858 rows, so a
+# cached copy of any of them occupies three 256 KB collection blocks (768 KB): one fits in a 1 MB budget,
+# two do not. Each query returns fewer rows than the one before, which gives its entry a higher benefit
+# density than the previous one, so the budget is made by evicting rather than by refusing the store.
+# Labelled queries are compared by hash against their first execution, so each result is checked against
+# the answer computed before any entry existed.
+
+# ---------------------------------------------------------------------------
+# reference answers under the default budget
+# ---------------------------------------------------------------------------
+query III
+SELECT count(*), min(id), max(id) FROM t WHERE g = 0
+----
+42858	0	299999
+
+query III
+SELECT count(*), min(id), max(id) FROM t WHERE g = 1 AND h < 12
+----
+39561	1	299993
+
+query III
+SELECT count(*), min(id), max(id) FROM t WHERE g = 2 AND h < 10
+----
+32966	2	299994
+
+query II nosort res_a
+SELECT id, h FROM t WHERE g = 0 ORDER BY id
+
+query II nosort res_b
+SELECT id, h FROM t WHERE g = 1 AND h < 12 ORDER BY id
+
+query II nosort res_c
+SELECT id, h FROM t WHERE g = 2 AND h < 10 ORDER BY id
+
+query I
+SELECT count(*) >= 3 FROM recycler_entries()
+----
+true
+
+# ---------------------------------------------------------------------------
+# 5a. PRAGMA recycler_clear wipes every entry and the byte accounting
+# ---------------------------------------------------------------------------
+statement ok
+PRAGMA recycler_clear;
+
+query I
+SELECT count(*) FROM recycler_entries()
+----
+0
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'bytes'
+----
+0
+
+query I
+SELECT value >= 1 FROM recycler_stats() WHERE name = 'clears'
+----
+true
+
+# ---------------------------------------------------------------------------
+# 1. a tiny budget: the second and third stores each evict the previous entry
+# ---------------------------------------------------------------------------
+statement ok
+SET recycler_budget_mb = 1;
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'evictions'
+----
+0
+
+query II nosort res_a
+SELECT id, h FROM t WHERE g = 0 ORDER BY id
+
+query I
+SELECT count(*) FROM recycler_entries()
+----
+1
+
+query II nosort res_b
+SELECT id, h FROM t WHERE g = 1 AND h < 12 ORDER BY id
+
+query II nosort res_c
+SELECT id, h FROM t WHERE g = 2 AND h < 10 ORDER BY id
+
+# ---------------------------------------------------------------------------
+# 3. recycler_stats() reports the evictions, and the cache never holds more than the budget
+# ---------------------------------------------------------------------------
+query I
+SELECT value > 0 FROM recycler_stats() WHERE name = 'evictions'
+----
+true
+
+query I
+SELECT value <= 1048576 FROM recycler_stats() WHERE name = 'bytes'
+----
+true
+
+query I
+SELECT count(*) >= 1 FROM recycler_entries()
+----
+true
+
+# ---------------------------------------------------------------------------
+# 2. after eviction every answer is unchanged: the surviving entry is served, the evicted ones are recomputed
+# ---------------------------------------------------------------------------
+query II nosort res_c
+SELECT id, h FROM t WHERE g = 2 AND h < 10 ORDER BY id
+
+query I
+SELECT value >= 1 FROM recycler_stats() WHERE name = 'whole_hits'
+----
+true
+
+query II nosort res_a
+SELECT id, h FROM t WHERE g = 0 ORDER BY id
+
+query II nosort res_b
+SELECT id, h FROM t WHERE g = 1 AND h < 12 ORDER BY id
+
+query III
+SELECT count(*), min(id), max(id) FROM t WHERE g = 0
+----
+42858	0	299999
+
+query III
+SELECT count(*), min(id), max(id) FROM t WHERE g = 1 AND h < 12
+----
+39561	1	299993
+
+query III
+SELECT count(*), min(id), max(id) FROM t WHERE g = 2 AND h < 10
+----
+32966	2	299994
+
+query I
+SELECT value <= 1048576 FROM recycler_stats() WHERE name = 'bytes'
+----
+true
+
+# ---------------------------------------------------------------------------
+# 4. recycler_enabled = false: nothing is planned, stored or evicted, the cache content is frozen,
+#    and the answers equal the recycled ones
+# ---------------------------------------------------------------------------
+query I nosort planned_disabled
+SELECT sum(value) FROM recycler_stats() WHERE name IN ('writes_planned', 'whole_stores', 'subtree_stores', 'block_stores', 'evictions', 'whole_hits', 'block_hits', 'subtree_hits', 'subsumption_hits')
+
+query II nosort entries_disabled
+SELECT count(*), coalesce(sum(bytes), 0) FROM recycler_entries()
+
+statement ok
+SET recycler_enabled = false;
+
+query II nosort res_a
+SELECT id, h FROM t WHERE g = 0 ORDER BY id
+
+query II nosort res_b
+SELECT id, h FROM t WHERE g = 1 AND h < 12 ORDER BY id
+
+query II nosort res_c
+SELECT id, h FROM t WHERE g = 2 AND h < 10 ORDER BY id
+
+query III
+SELECT count(*), min(id), max(id) FROM t WHERE g = 2 AND h < 10
+----
+32966	2	299994
+
+query I nosort planned_disabled
+SELECT sum(value) FROM recycler_stats() WHERE name IN ('writes_planned', 'whole_stores', 'subtree_stores', 'block_stores', 'evictions', 'whole_hits', 'block_hits', 'subtree_hits', 'subsumption_hits')
+
+query II nosort entries_disabled
+SELECT count(*), coalesce(sum(bytes), 0) FROM recycler_entries()
+
+query I
+SELECT value >= 4 FROM recycler_stats() WHERE name = 'skip_disabled'
+----
+true
+
+statement ok
+SET recycler_enabled = true;
+
+# ---------------------------------------------------------------------------
+# 5b. PRAGMA recycler_clear wipes the cache again, and the recycler keeps working afterwards
+# ---------------------------------------------------------------------------
+statement ok
+PRAGMA recycler_clear;
+
+query I
+SELECT count(*) FROM recycler_entries()
+----
+0
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'bytes'
+----
+0
+
+query I
+SELECT value >= 2 FROM recycler_stats() WHERE name = 'clears'
+----
+true
+
+query II nosort res_c
+SELECT id, h FROM t WHERE g = 2 AND h < 10 ORDER BY id
+
+query I
+SELECT count(*) FROM recycler_entries()
+----
+1
+
+query II nosort res_c
+SELECT id, h FROM t WHERE g = 2 AND h < 10 ORDER BY id
+
+query I
+SELECT value >= 2 FROM recycler_stats() WHERE name = 'whole_hits'
+----
+true
+
+statement ok
+SET recycler_budget_mb = 2000;
