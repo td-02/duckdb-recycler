@@ -259,6 +259,16 @@ idx_t RecyclerCache::HistorySize() const {
 	return history.size();
 }
 
+vector<std::pair<SigHash, SignatureHistory>> RecyclerCache::HistoryEntries() const {
+	std::lock_guard<std::mutex> guard(lock);
+	vector<std::pair<SigHash, SignatureHistory>> result;
+	result.reserve(history.size());
+	for (auto &hash : history_order) {
+		result.emplace_back(hash, history.find(hash)->second.history);
+	}
+	return result;
+}
+
 idx_t RecyclerCache::TotalBytes() const {
 	std::lock_guard<std::mutex> guard(lock);
 	return total_bytes;

@@ -164,6 +164,8 @@ public:
 	void NoteMaterializeTime(const SigHash &hash, uint64_t measured_cost_ns, uint64_t materialize_ns);
 	void NoteHitTime(const SigHash &hash, uint64_t hit_ns);
 	idx_t HistorySize() const;
+	//! Every signature in the history, most recently noted first
+	vector<std::pair<SigHash, SignatureHistory>> HistoryEntries() const;
 
 	idx_t TotalBytes() const;
 	idx_t UsedBytes() const;

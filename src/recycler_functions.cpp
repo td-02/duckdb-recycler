@@ -289,8 +289,8 @@ static unique_ptr<FunctionData> RecyclerEntriesBind(ClientContext &context, Tabl
 	return nullptr;
 }
 
-static Value Milliseconds(const std::atomic<uint64_t> &ns) {
-	return Value::DOUBLE(double(ns.load()) / 1e6);
+static Value Milliseconds(uint64_t ns) {
+	return Value::DOUBLE(double(ns) / 1e6);
 }
 
 static unique_ptr<GlobalTableFunctionState> RecyclerEntriesInit(ClientContext &context,
@@ -322,6 +322,64 @@ static void RecyclerEntriesFunction(ClientContext &context, TableFunctionInput &
 		output.SetValue(11, count, Value::BIGINT(int64_t(entry.sink_calls)));
 		output.SetValue(12, count, Value::BIGINT(int64_t(entry.stored_at)));
 		output.SetValue(13, count, Value::BIGINT(int64_t(entry.last_used.load())));
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
+//===----------------------------------------------------------------------===//
+// recycler_history()
+//===----------------------------------------------------------------------===//
+struct RecyclerHistoryGlobalState : public GlobalTableFunctionState {
+	vector<std::pair<SigHash, SignatureHistory>> entries;
+	idx_t offset = 0;
+};
+
+static unique_ptr<FunctionData> RecyclerHistoryBind(ClientContext &context, TableFunctionBindInput &input,
+                                                    vector<LogicalType> &return_types, vector<string> &names) {
+	names.emplace_back("key");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("seen");
+	return_types.emplace_back(LogicalType::BIGINT);
+	names.emplace_back("last_seen");
+	return_types.emplace_back(LogicalType::BIGINT);
+	names.emplace_back("rows");
+	return_types.emplace_back(LogicalType::BIGINT);
+	names.emplace_back("bytes");
+	return_types.emplace_back(LogicalType::BIGINT);
+	names.emplace_back("measured_cost_ms");
+	return_types.emplace_back(LogicalType::DOUBLE);
+	names.emplace_back("materialize_ms");
+	return_types.emplace_back(LogicalType::DOUBLE);
+	names.emplace_back("hit_ms");
+	return_types.emplace_back(LogicalType::DOUBLE);
+	return nullptr;
+}
+
+static unique_ptr<GlobalTableFunctionState> RecyclerHistoryInit(ClientContext &context,
+                                                                TableFunctionInitInput &input) {
+	auto result = make_uniq<RecyclerHistoryGlobalState>();
+	auto state = GetRecyclerState(context);
+	if (state) {
+		result->entries = state->cache->HistoryEntries();
+	}
+	return std::move(result);
+}
+
+static void RecyclerHistoryFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &data = data_p.global_state->Cast<RecyclerHistoryGlobalState>();
+	idx_t count = 0;
+	while (data.offset < data.entries.size() && count < STANDARD_VECTOR_SIZE) {
+		auto &entry = data.entries[data.offset++];
+		auto &history = entry.second;
+		output.SetValue(0, count, Value(entry.first.ToString()));
+		output.SetValue(1, count, Value::BIGINT(int64_t(history.seen)));
+		output.SetValue(2, count, Value::BIGINT(int64_t(history.last_seen)));
+		output.SetValue(3, count, Value::BIGINT(int64_t(history.rows)));
+		output.SetValue(4, count, Value::BIGINT(int64_t(history.bytes)));
+		output.SetValue(5, count, Milliseconds(history.measured_cost_ns));
+		output.SetValue(6, count, Milliseconds(history.materialize_ns));
+		output.SetValue(7, count, Milliseconds(history.hit_ns));
 		count++;
 	}
 	output.SetCardinality(count);
@@ -382,6 +440,8 @@ void LoadRecycler(ExtensionLoader &loader) {
 	                                      RecyclerStatsInit));
 	loader.RegisterFunction(TableFunction("recycler_entries", {}, RecyclerEntriesFunction, RecyclerEntriesBind,
 	                                      RecyclerEntriesInit));
+	loader.RegisterFunction(TableFunction("recycler_history", {}, RecyclerHistoryFunction, RecyclerHistoryBind,
+	                                      RecyclerHistoryInit));
 	loader.RegisterFunction(PragmaFunction::PragmaStatement("recycler_clear", RecyclerClearPragma));
 }
 

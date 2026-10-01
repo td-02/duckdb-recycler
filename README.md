@@ -189,6 +189,7 @@ collections are buffer-managed and bounded by `recycler_budget_mb` with benefit-
 Settings: `recycler_enabled`, `recycler_whole_result`, `recycler_blocks`, `recycler_subtrees`, `recycler_subsumption`,
 `recycler_budget_mb`, `recycler_entry_cap_mb`, `recycler_entry_cap_rows`, `recycler_min_input_rows`,
 `recycler_speculate_mb`. Introspection: `SELECT * FROM recycler_stats()`, `SELECT * FROM recycler_entries()`,
+`SELECT * FROM recycler_history()` (what is known about a signature whether or not its result is cached),
 `PRAGMA recycler_clear`. Tests: `test/sql/recycler/`. Differential check against vanilla over the whole
 workload in several orders: `python3 ./scripts/recycler_diff.py`. The design and roadmap are in
 `docs/SOLUTION_PLAN.md`.

@@ -1,5 +1,5 @@
 # name: test/sql/recycler/recycler_observability.test
-# description: measured costs from profiles, sink statistics, byte accounting, refusal reasons and the bounded history
+# description: measured costs from profiles, sink statistics, byte accounting, refusal reasons and the signature history
 # group: [recycler]
 
 require waddle
@@ -13,8 +13,8 @@ SET recycler_min_input_rows = 1;
 statement ok
 CREATE TABLE t AS SELECT range AS id, range % 7 AS g, range % 13 AS h FROM range(20000);
 
-# every query over recycler_stats() / recycler_entries() is itself refused as a table function scan: this first
-# one counts itself
+# every query over recycler_stats() / recycler_entries() / recycler_history() is itself refused as a table
+# function scan: this first one counts itself
 query I
 SELECT value FROM recycler_stats() WHERE name = 'refused_table_function'
 ----
@@ -47,6 +47,18 @@ FROM recycler_entries()
 ----
 true
 
+# the history carries the same measurements under the entries' signatures
+query I
+SELECT count(*) FROM recycler_entries() e JOIN recycler_history() h ON h.key = e.key
+----
+2
+
+query I
+SELECT bool_and(h.rows = e.rows AND h.bytes = e.bytes AND h.measured_cost_ms = e.measured_cost_ms AND h.materialize_ms = e.materialize_ms AND h.hit_ms = 0 AND h.last_seen >= e.stored_at)
+FROM recycler_entries() e JOIN recycler_history() h ON h.key = e.key
+----
+true
+
 # a hit under EXPLAIN ANALYZE records the scan's time on the entry it served
 statement ok
 EXPLAIN ANALYZE SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g
@@ -61,11 +73,22 @@ SELECT kind, hit_ms = 0 FROM recycler_entries() WHERE hits = 0
 ----
 subtree	true
 
+# the hit is noted in the history as well
+query II
+SELECT h.hit_ms > 0, h.last_seen > e.stored_at FROM recycler_entries() e JOIN recycler_history() h ON h.key = e.key WHERE e.hits > 0
+----
+true	true
+
 # ---------------------------------------------------------------------------
 # without a profile the sink's wall time stands in for the subtree cost and the materialization time stays unset
 # ---------------------------------------------------------------------------
 statement ok
 PRAGMA recycler_clear
+
+query I
+SELECT count(*) FROM recycler_history()
+----
+0
 
 statement ok
 SELECT g, count(*) AS c FROM t WHERE h > 1 GROUP BY g ORDER BY g
@@ -115,6 +138,12 @@ SELECT name, value FROM recycler_stats() WHERE name IN ('too_big', 'writes_plann
 ----
 too_big	1
 writes_planned	5
+
+# the history keeps the size of the materialization the caps stopped
+query II
+SELECT rows > 1000, bytes > 0 FROM recycler_history() WHERE rows > 1000
+----
+true	true
 
 # the repeat is not materialized again under the same caps
 statement ok
