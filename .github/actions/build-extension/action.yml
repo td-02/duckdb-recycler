@@ -1,0 +1,72 @@
+#
+# The build that every build job of tests.yml shares: the pinned duckdb submodule compiled with
+# the extension-ci-tools makefile under ccache, exactly like a developer's "make <target>".
+#
+# The caller checks the repository out with its submodules first (a local action only exists
+# after the checkout) and puts any makefile switch the target needs (THREADSAN, DISABLE_SANITIZER,
+# CC/CXX) in its job env, which these steps inherit.
+#
+name: Build the extension
+description: Verify the duckdb submodule pin, restore ccache, run one make target, save ccache
+
+inputs:
+  target:
+    description: The makefile target to build (release, debug, relassert, reldebug)
+    required: true
+  duckdb-tag:
+    description: The duckdb tag the submodule must be checked out at
+    required: true
+  extra-packages:
+    description: apt packages the target needs beyond ninja-build and ccache
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    # The shallow submodule checkout carries no tags, so this fetches the one tag: duckdb's CMake
+    # derives the version from `git describe`, and stock DuckDB refuses to load an extension
+    # stamped with another version.
+    - name: Check the duckdb submodule is at the pinned tag
+      shell: bash
+      env:
+        TAG: ${{ inputs.duckdb-tag }}
+      run: |
+        git -C duckdb fetch --quiet --depth=1 origin tag "$TAG"
+        test "$(git -C duckdb rev-parse "$TAG^{commit}")" = "$(git -C duckdb rev-parse HEAD)"
+
+    - name: Install build tools
+      shell: bash
+      env:
+        EXTRA: ${{ inputs.extra-packages }}
+      run: sudo apt-get update -y -qq && sudo apt-get install -y -qq ninja-build ccache $EXTRA
+
+    - name: Submodule commit for the cache key
+      id: pin
+      shell: bash
+      run: echo "duckdb=$(git rev-parse HEAD:duckdb)" >> "$GITHUB_OUTPUT"
+
+    - name: Restore ccache
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ github.workspace }}/.ccache
+        key: ccache-${{ github.job }}-${{ steps.pin.outputs.duckdb }}-${{ github.run_id }}
+        restore-keys: |
+          ccache-${{ github.job }}-${{ steps.pin.outputs.duckdb }}-
+          ccache-${{ github.job }}-
+
+    # duckdb's CMakeLists.txt picks ccache up as the compiler launcher whenever it is on PATH.
+    - name: Build
+      shell: bash
+      env:
+        GEN: ninja
+        CCACHE_DIR: ${{ github.workspace }}/.ccache
+        CCACHE_MAXSIZE: 2G
+        TARGET: ${{ inputs.target }}
+      run: make "$TARGET" && ccache --show-stats
+
+    # Saved before the caller's tests so that a red test run still warms the next build.
+    - name: Save ccache
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ github.workspace }}/.ccache
+        key: ccache-${{ github.job }}-${{ steps.pin.outputs.duckdb }}-${{ github.run_id }}

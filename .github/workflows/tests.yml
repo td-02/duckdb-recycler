@@ -2,10 +2,10 @@
 # Correctness gate for the recycler (docs/PRODUCTION_PLAN.md section 9.4, docs/CI.md).
 #
 # MainDistributionPipeline.yml stays the only producer of graded binaries; nothing here is
-# published. Every build job compiles the pinned duckdb submodule with the extension-ci-tools
-# makefile, exactly like a developer's "make release", and runs the recycler sqllogictests
-# against the resulting unittest binary. The slow jobs (debug, asan-ubsan, tsan) run for every
-# pull request and, by hand, only when the "full" input is set.
+# published. Every build job compiles the pinned duckdb submodule through
+# .github/actions/build-extension (the extension-ci-tools makefile under ccache) and runs the recycler
+# sqllogictests against the resulting unittest binary. The slow jobs (debug, asan-ubsan, tsan)
+# run for every pull request and, by hand, only when the "full" input is set.
 #
 name: Tests
 
@@ -28,13 +28,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  GEN: ninja
-  # The tag MainDistributionPipeline.yml pins. The shallow submodule checkout carries no tags, so
-  # every build job fetches this one: duckdb's CMake derives the version from `git describe`, and
-  # stock DuckDB refuses to load an extension stamped with another version.
+  # The tag MainDistributionPipeline.yml pins; .github/actions/build-extension checks the submodule is at it.
   DUCKDB_TAG: v1.5.5
-  CCACHE_DIR: ${{ github.workspace }}/.ccache
-  CCACHE_MAXSIZE: 1G
 
 jobs:
   build-test:
@@ -46,36 +41,10 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Check the duckdb submodule is at the pinned tag
-        run: |
-          git -C duckdb fetch --quiet --depth=1 origin tag "$DUCKDB_TAG"
-          test "$(git -C duckdb rev-parse "$DUCKDB_TAG^{commit}")" = "$(git -C duckdb rev-parse HEAD)"
-
-      - name: Install build tools
-        run: sudo apt-get update -y -qq && sudo apt-get install -y -qq ninja-build ccache
-
-      - name: Submodule commit for the cache key
-        id: pin
-        run: echo "duckdb=$(git rev-parse HEAD:duckdb)" >> "$GITHUB_OUTPUT"
-
-      - name: Restore ccache
-        uses: actions/cache/restore@v4
+      - uses: ./.github/actions/build-extension
         with:
-          path: ${{ env.CCACHE_DIR }}
-          key: ccache-${{ github.job }}-${{ steps.pin.outputs.duckdb }}-${{ github.run_id }}
-          restore-keys: |
-            ccache-${{ github.job }}-${{ steps.pin.outputs.duckdb }}-
-            ccache-${{ github.job }}-
-
-      - name: Build
-        run: make release && ccache --show-stats
-
-      # Saved before the tests so that a red test run still warms the next build.
-      - name: Save ccache
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ env.CCACHE_DIR }}
-          key: ccache-${{ github.job }}-${{ steps.pin.outputs.duckdb }}-${{ github.run_id }}
+          target: release
+          duckdb-tag: ${{ env.DUCKDB_TAG }}
 
       - name: Recycler suites
         run: |
@@ -103,35 +72,10 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Check the duckdb submodule is at the pinned tag
-        run: |
-          git -C duckdb fetch --quiet --depth=1 origin tag "$DUCKDB_TAG"
-          test "$(git -C duckdb rev-parse "$DUCKDB_TAG^{commit}")" = "$(git -C duckdb rev-parse HEAD)"
-
-      - name: Install build tools
-        run: sudo apt-get update -y -qq && sudo apt-get install -y -qq ninja-build ccache
-
-      - name: Submodule commit for the cache key
-        id: pin
-        run: echo "duckdb=$(git rev-parse HEAD:duckdb)" >> "$GITHUB_OUTPUT"
-
-      - name: Restore ccache
-        uses: actions/cache/restore@v4
+      - uses: ./.github/actions/build-extension
         with:
-          path: ${{ env.CCACHE_DIR }}
-          key: ccache-${{ github.job }}-${{ steps.pin.outputs.duckdb }}-${{ github.run_id }}
-          restore-keys: |
-            ccache-${{ github.job }}-${{ steps.pin.outputs.duckdb }}-
-            ccache-${{ github.job }}-
-
-      - name: Build
-        run: make debug && ccache --show-stats
-
-      - name: Save ccache
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ env.CCACHE_DIR }}
-          key: ccache-${{ github.job }}-${{ steps.pin.outputs.duckdb }}-${{ github.run_id }}
+          target: debug
+          duckdb-tag: ${{ env.DUCKDB_TAG }}
 
       - name: Recycler suites
         run: |
@@ -150,39 +94,14 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Check the duckdb submodule is at the pinned tag
-        run: |
-          git -C duckdb fetch --quiet --depth=1 origin tag "$DUCKDB_TAG"
-          test "$(git -C duckdb rev-parse "$DUCKDB_TAG^{commit}")" = "$(git -C duckdb rev-parse HEAD)"
-
-      - name: Install build tools
-        run: sudo apt-get update -y -qq && sudo apt-get install -y -qq ninja-build ccache
-
-      - name: Submodule commit for the cache key
-        id: pin
-        run: echo "duckdb=$(git rev-parse HEAD:duckdb)" >> "$GITHUB_OUTPUT"
-
-      - name: Restore ccache
-        uses: actions/cache/restore@v4
-        with:
-          path: ${{ env.CCACHE_DIR }}
-          key: ccache-${{ github.job }}-${{ steps.pin.outputs.duckdb }}-${{ github.run_id }}
-          restore-keys: |
-            ccache-${{ github.job }}-${{ steps.pin.outputs.duckdb }}-
-            ccache-${{ github.job }}-
-
       # The makefile has no variable that adds sanitizers to a Release build (DISABLE_SANITIZER
       # and DISABLE_UBSAN only remove them). Its relassert target is RelWithDebInfo with
       # FORCE_ASSERT=1, under which duckdb/CMakeLists.txt compiles with -fsanitize=address and
       # -fsanitize=undefined -fno-sanitize-recover=all; DuckDB's own Main.yml uses the same target.
-      - name: Build
-        run: make relassert && ccache --show-stats
-
-      - name: Save ccache
-        uses: actions/cache/save@v4
+      - uses: ./.github/actions/build-extension
         with:
-          path: ${{ env.CCACHE_DIR }}
-          key: ccache-${{ github.job }}-${{ steps.pin.outputs.duckdb }}-${{ github.run_id }}
+          target: relassert
+          duckdb-tag: ${{ env.DUCKDB_TAG }}
 
       - name: Recycler suites
         run: |
@@ -206,35 +125,11 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Check the duckdb submodule is at the pinned tag
-        run: |
-          git -C duckdb fetch --quiet --depth=1 origin tag "$DUCKDB_TAG"
-          test "$(git -C duckdb rev-parse "$DUCKDB_TAG^{commit}")" = "$(git -C duckdb rev-parse HEAD)"
-
-      - name: Install build tools
-        run: sudo apt-get update -y -qq && sudo apt-get install -y -qq ninja-build ccache clang
-
-      - name: Submodule commit for the cache key
-        id: pin
-        run: echo "duckdb=$(git rev-parse HEAD:duckdb)" >> "$GITHUB_OUTPUT"
-
-      - name: Restore ccache
-        uses: actions/cache/restore@v4
+      - uses: ./.github/actions/build-extension
         with:
-          path: ${{ env.CCACHE_DIR }}
-          key: ccache-${{ github.job }}-${{ steps.pin.outputs.duckdb }}-${{ github.run_id }}
-          restore-keys: |
-            ccache-${{ github.job }}-${{ steps.pin.outputs.duckdb }}-
-            ccache-${{ github.job }}-
-
-      - name: Build
-        run: make reldebug && ccache --show-stats
-
-      - name: Save ccache
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ env.CCACHE_DIR }}
-          key: ccache-${{ github.job }}-${{ steps.pin.outputs.duckdb }}-${{ github.run_id }}
+          target: reldebug
+          duckdb-tag: ${{ env.DUCKDB_TAG }}
+          extra-packages: clang
 
       # The unittest runner exits 0 when a pattern matches no test, so the file is checked first.
       - name: Stress test
