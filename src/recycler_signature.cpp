@@ -7,6 +7,7 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/common/enums/order_type.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/types/column/column_data_scan_states.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
@@ -264,11 +265,13 @@ idx_t RecyclerEstimateRowWidth(const vector<LogicalType> &types) {
 // PlanSignatures
 //===----------------------------------------------------------------------===//
 //! Session settings that change a query's result although the renderer sees the same plan: ICU reads TimeZone and
-//! Calendar into function bind data (not rendered), and ieee_floating_point_ops swaps the callback of the same "/"
-//! function without bind data (BindBinaryFloatingPoint). Everything else that affects a result is bound into the
-//! plan and rendered: integer_division is a parser option ("/" becomes "//"), ordering defaults, collations,
-//! search_path and casts are in the operators; threads and memory_limit change speed only. The values are read once
-//! per statement after binding, so a SET GLOBAL on another connection between the bind and the pre hook is not
+//! Calendar into function bind data (not rendered), list_sort's family (list_sort, list_reverse_sort, list_grade_up)
+//! resolves its ORDER_DEFAULT through default_order and default_null_order into bind data (an ORDER BY clause is
+//! resolved by the binder, so a sort's direction is in the operator), and ieee_floating_point_ops swaps the callback
+//! of the same "/" function without bind data (BindBinaryFloatingPoint). Everything else that affects a result is
+//! bound into the plan and rendered: integer_division is a parser option ("/" becomes "//"), collations, search_path
+//! and casts are in the operators; threads and memory_limit change speed only. The values are read once per
+//! statement after binding, so a SET GLOBAL on another connection between the bind and the pre hook is not
 //! detected, as for the recycler's own settings (RecyclerClientState::settings_loaded). Documented in the README; a
 //! new entry here needs a sqllogictest.
 static const char *const ICU_SETTINGS[] = {"TimeZone", "Calendar"};
@@ -282,6 +285,8 @@ string PlanSignatures::SettingsSalt(const ClientContext &context) {
 		sink.Str(context.TryGetCurrentSetting(name, value) && !value.IsNull() ? value.ToString() : string());
 	}
 	sink.Bool(Settings::Get<IeeeFloatingPointOpsSetting>(context));
+	sink.U8(static_cast<uint8_t>(Settings::Get<DefaultOrderSetting>(context)));
+	sink.U8(static_cast<uint8_t>(Settings::Get<DefaultNullOrderSetting>(context)));
 	return salt;
 }
 

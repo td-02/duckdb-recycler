@@ -1,5 +1,5 @@
 # name: test/sql/recycler/recycler_settings.test
-# description: ieee_floating_point_ops (a result-affecting setting the renderer cannot see) is part of every key
+# description: the result-affecting settings the renderer cannot see (ieee_floating_point_ops, default_order, default_null_order) are part of every key
 # group: [recycler]
 
 require waddle
@@ -265,3 +265,120 @@ query I
 SELECT value FROM recycler_stats() WHERE name = 'whole_stores'
 ----
 10
+
+# ---------------------------------------------------------------------------
+# default_order: list_sort resolves its direction at bind time into bind data the renderer does not see, so the first
+# element is the group's smallest id under ASC and its largest under DESC; the ORDER BY is explicit so that the bound
+# plan is the same under both values (an ORDER BY without a direction is resolved by the binder)
+# ---------------------------------------------------------------------------
+statement ok
+SET default_order = 'ASC';
+
+statement ok
+SET disabled_optimizers = 'extension';
+
+query II nosort first_asc
+SELECT g, list_sort(list(id))[1] AS first FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+
+statement ok
+SET disabled_optimizers = '';
+
+query II nosort first_asc
+SELECT g, list_sort(list(id))[1] AS first FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+
+query II nosort first_asc
+SELECT g, list_sort(list(id))[1] AS first FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+
+statement ok
+SET default_order = 'DESC';
+
+statement ok
+SET disabled_optimizers = 'extension';
+
+query II nosort first_desc
+SELECT g, list_sort(list(id))[1] AS first FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+
+statement ok
+SET disabled_optimizers = '';
+
+# a miss: the entry stored under ASC is not served
+query II nosort first_desc
+SELECT g, list_sort(list(id))[1] AS first FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+
+query II nosort first_desc
+SELECT g, list_sort(list(id))[1] AS first FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_stores'
+----
+12
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+7
+
+# ---------------------------------------------------------------------------
+# default_null_order: the same bind data decides where list_sort puts NULLs, so the first element is the group's
+# smallest odd id under NULLS_LAST and NULL under NULLS_FIRST
+# ---------------------------------------------------------------------------
+statement ok
+SET default_order = 'ASC';
+
+statement ok
+SET default_null_order = 'NULLS_LAST';
+
+statement ok
+SET disabled_optimizers = 'extension';
+
+query II nosort nulls_last
+SELECT g, list_sort(list(CASE WHEN id % 2 = 0 THEN NULL ELSE id END))[1] AS first FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+
+statement ok
+SET disabled_optimizers = '';
+
+query II nosort nulls_last
+SELECT g, list_sort(list(CASE WHEN id % 2 = 0 THEN NULL ELSE id END))[1] AS first FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+
+query II nosort nulls_last
+SELECT g, list_sort(list(CASE WHEN id % 2 = 0 THEN NULL ELSE id END))[1] AS first FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+
+statement ok
+SET default_null_order = 'NULLS_FIRST';
+
+statement ok
+SET disabled_optimizers = 'extension';
+
+query II nosort nulls_first
+SELECT g, list_sort(list(CASE WHEN id % 2 = 0 THEN NULL ELSE id END))[1] AS first FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+
+statement ok
+SET disabled_optimizers = '';
+
+query II nosort nulls_first
+SELECT g, list_sort(list(CASE WHEN id % 2 = 0 THEN NULL ELSE id END))[1] AS first FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+
+query II nosort nulls_first
+SELECT g, list_sort(list(CASE WHEN id % 2 = 0 THEN NULL ELSE id END))[1] AS first FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_stores'
+----
+14
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+9
