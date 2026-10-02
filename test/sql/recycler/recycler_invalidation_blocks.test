@@ -1,0 +1,271 @@
+# name: test/sql/recycler/recycler_invalidation_blocks.test
+# description: subsumption blocks follow the table versions like every other entry: a block is not served while
+# another connection writes one of its tables, no block is planted then, a commit to any of its tables evicts it, and
+# a block store the budget refuses after evicting the other blocks of its shape leaves a consistent cache
+# group: [recycler]
+
+require waddle
+
+# one thread: the entry sizes the budget section relies on do not depend on how the sink splits the rows
+statement ok con1
+SET threads = 1;
+
+statement ok con1
+SET preserve_insertion_order = false;
+
+statement ok con1
+SET recycler_min_input_rows = 1000;
+
+statement ok con1
+CREATE TABLE t AS
+SELECT range AS id, range % 7 AS g, 1990 + range % 30 AS y, range % 13 AS h,
+       CASE WHEN range % 2 = 0 THEN 'm' ELSE 'f' END AS gender
+FROM range(300000);
+
+statement ok con1
+CREATE TABLE d AS SELECT range AS id, 'role' || range AS role FROM range(12);
+
+statement ok con1
+CREATE TABLE k AS SELECT range AS id, 'kind' || range AS kind FROM range(7);
+
+# ---------------------------------------------------------------------------
+# (a) a wide payer stores its block, and a narrower query is served from it
+# ---------------------------------------------------------------------------
+query ITIII con1
+SELECT g, gender, count(*) AS c, count(DISTINCT h) AS nh, max(y) AS my FROM t JOIN d ON t.g = d.id JOIN k ON k.id = t.g WHERE y IS NOT NULL AND d.id < 3 GROUP BY g, gender ORDER BY g, gender
+----
+0	f	21429	13	2019
+0	m	21429	13	2018
+1	f	21429	13	2019
+1	m	21428	13	2018
+2	f	21428	13	2019
+2	m	21429	13	2018
+
+query II con1
+SELECT name, value FROM recycler_stats() WHERE name IN ('block_stores', 'blocks_planted') ORDER BY name
+----
+block_stores	1
+blocks_planted	1
+
+query II con1
+SELECT g, count(*) AS c FROM t JOIN d ON t.g = d.id JOIN k ON k.id = t.g WHERE y BETWEEN 2000 AND 2005 AND d.id < 3 GROUP BY g ORDER BY g
+----
+0	8572
+1	8571
+2	8571
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'subsumption_hits'
+----
+1
+
+# ---------------------------------------------------------------------------
+# (b) while con2 updates t, the block is not served, and a payer of another shape plants no block; after the
+# rollback the block is served again, and the payer plants its block
+# ---------------------------------------------------------------------------
+statement ok con2
+BEGIN TRANSACTION;
+
+statement ok con2
+UPDATE t SET h = h WHERE id = 0;
+
+query TI con1
+SELECT gender, count(*) AS c FROM t JOIN d ON t.g = d.id JOIN k ON k.id = t.g WHERE y > 2015 AND d.id < 3 GROUP BY gender ORDER BY gender
+----
+f	8571
+m	8572
+
+query II con1
+SELECT g, count(*) AS c FROM t JOIN d ON t.g = d.id JOIN k ON k.id = t.g WHERE y BETWEEN 2000 AND 2005 AND d.id < 3 AND k.kind <> 'kind5' GROUP BY g ORDER BY g
+----
+0	8572
+1	8571
+2	8571
+
+query II con1
+SELECT name, value FROM recycler_stats() WHERE name IN ('blocks_planted', 'subsumption_hits') ORDER BY name
+----
+blocks_planted	1
+subsumption_hits	1
+
+statement ok con2
+ROLLBACK;
+
+query TI con1
+SELECT gender, count(DISTINCT h) AS n FROM t JOIN d ON t.g = d.id JOIN k ON k.id = t.g WHERE y = 2001 AND d.id < 3 GROUP BY gender ORDER BY gender
+----
+f	13
+
+query II con1
+SELECT g, count(*) AS c FROM t JOIN d ON t.g = d.id JOIN k ON k.id = t.g WHERE y BETWEEN 2000 AND 2005 AND d.id < 3 AND k.kind <> 'kind5' GROUP BY g ORDER BY g
+----
+0	8572
+1	8571
+2	8571
+
+query II con1
+SELECT name, value FROM recycler_stats() WHERE name IN ('block_stores', 'blocks_planted', 'subsumption_hits') ORDER BY name
+----
+block_stores	2
+blocks_planted	2
+subsumption_hits	2
+
+# ---------------------------------------------------------------------------
+# (c) an insert into a join partner of the block evicts it with every other entry over k; the narrower query is
+# answered by vanilla, not from the block
+# ---------------------------------------------------------------------------
+query I con1
+SELECT count(*) FROM recycler_entries() WHERE kind = 'block'
+----
+2
+
+statement ok con2
+INSERT INTO k VALUES (1, 'kind1');
+
+query I con1
+SELECT count(*) FROM recycler_entries()
+----
+0
+
+statement ok con1
+SET recycler_enabled = false;
+
+query II con1 c0
+SELECT g, count(*) AS c FROM t JOIN d ON t.g = d.id JOIN k ON k.id = t.g WHERE y BETWEEN 2000 AND 2005 AND d.id < 3 GROUP BY g ORDER BY g
+----
+0	8572
+1	17142
+2	8571
+
+statement ok con1
+RESET recycler_enabled;
+
+query II con1 c0
+SELECT g, count(*) AS c FROM t JOIN d ON t.g = d.id JOIN k ON k.id = t.g WHERE y BETWEEN 2000 AND 2005 AND d.id < 3 GROUP BY g ORDER BY g
+----
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'subsumption_hits'
+----
+2
+
+# ---------------------------------------------------------------------------
+# (d) under a tight budget, a block store first evicts the cheaper block of its own shape and is then refused by
+# the more valuable entries: the refusal reads nothing of the evicted shape
+# ---------------------------------------------------------------------------
+statement ok con1
+PRAGMA recycler_clear;
+
+# a 4 MB block over y in 1990..2015
+query II con1
+SELECT g, count(*) AS c FROM t JOIN d ON t.g = d.id JOIN k ON k.id = t.g WHERE y BETWEEN 1990 AND 2015 AND d.id < 3 GROUP BY g ORDER BY g
+----
+0	37143
+1	74286
+2	37143
+
+# small results that save a scan of t each: worth more per byte than any block
+query II con1
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g
+----
+0	42858
+1	42857
+2	42857
+3	42857
+4	42857
+5	42857
+6	42857
+
+query II con1
+SELECT h, count(*) AS c FROM t GROUP BY h ORDER BY h
+----
+0	23077
+1	23077
+2	23077
+3	23077
+4	23077
+5	23077
+6	23077
+7	23077
+8	23077
+9	23077
+10	23077
+11	23077
+12	23076
+
+query TI con1
+SELECT gender, count(*) AS c FROM t GROUP BY gender ORDER BY gender
+----
+f	150000
+m	150000
+
+query II con1
+SELECT kind, count(*) FROM recycler_entries() GROUP BY kind ORDER BY kind
+----
+block	1
+subtree	4
+whole_result	4
+
+query II con1
+SELECT name, value FROM recycler_stats() WHERE name IN ('block_stores', 'evictions', 'store_rejected') ORDER BY name
+----
+block_stores	4
+evictions	0
+store_rejected	0
+
+statement ok con1
+SET recycler_budget_mb = 2;
+
+# the block over y in 2016..2019 has the shape of the stored one and does not fit: its store evicts the stored block
+# and the cheaper aggregate, and is refused by the next victim
+query II con1
+SELECT g, count(*) AS c FROM t JOIN d ON t.g = d.id JOIN k ON k.id = t.g WHERE y BETWEEN 2016 AND 2019 AND d.id < 3 GROUP BY g ORDER BY g
+----
+0	5715
+1	11428
+2	5714
+
+query II con1
+SELECT name, value FROM recycler_stats() WHERE name IN ('block_stores', 'evictions', 'store_rejected') ORDER BY name
+----
+block_stores	4
+evictions	3
+store_rejected	1
+
+query II con1
+SELECT kind, count(*) FROM recycler_entries() GROUP BY kind ORDER BY kind
+----
+subtree	3
+whole_result	5
+
+# the cache stays usable: once the budget allows it, a block of the shape is stored again
+statement ok con1
+RESET recycler_budget_mb;
+
+statement ok con1
+SET recycler_enabled = false;
+
+query II con1 d0
+SELECT g, count(*) AS c FROM t JOIN d ON t.g = d.id JOIN k ON k.id = t.g WHERE y BETWEEN 2017 AND 2019 AND d.id < 3 GROUP BY g ORDER BY g
+----
+0	4286
+1	8572
+2	4286
+
+statement ok con1
+RESET recycler_enabled;
+
+query II con1 d0
+SELECT g, count(*) AS c FROM t JOIN d ON t.g = d.id JOIN k ON k.id = t.g WHERE y BETWEEN 2017 AND 2019 AND d.id < 3 GROUP BY g ORDER BY g
+----
+
+query II con1
+SELECT name, value FROM recycler_stats() WHERE name IN ('block_stores', 'store_rejected') ORDER BY name
+----
+block_stores	5
+store_rejected	1
+
+query I con1
+SELECT count(*) FROM recycler_entries() WHERE kind = 'block'
+----
+1
