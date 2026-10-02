@@ -19,6 +19,13 @@ optional_ptr<const LogicalRecyclerOperator> AsRecyclerOperator(const LogicalOper
 	return dynamic_cast<const LogicalRecyclerOperator *>(&op);
 }
 
+optional_ptr<const PhysicalRecyclerOperator> AsRecyclerOperator(const PhysicalOperator &op) {
+	if (op.type != PhysicalOperatorType::EXTENSION) {
+		return nullptr;
+	}
+	return dynamic_cast<const PhysicalRecyclerOperator *>(&op);
+}
+
 //===----------------------------------------------------------------------===//
 // Shared scan state
 //===----------------------------------------------------------------------===//
@@ -139,8 +146,8 @@ void LogicalRecyclerScan::ResolveTypes() {
 PhysicalRecyclerScan::PhysicalRecyclerScan(PhysicalPlan &physical_plan, vector<LogicalType> types_p,
                                            idx_t estimated_cardinality, idx_t id, shared_ptr<CachedEntry> entry_p,
                                            bool ordered, vector<column_t> column_ids_p)
-    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types_p), estimated_cardinality),
-      id(id), entry(std::move(entry_p)), ordered(ordered), column_ids(std::move(column_ids_p)) {
+    : PhysicalRecyclerOperator(physical_plan, std::move(types_p), estimated_cardinality, id),
+      entry(std::move(entry_p)), ordered(ordered), column_ids(std::move(column_ids_p)) {
 }
 
 string PhysicalRecyclerScan::GetName() const {
@@ -293,8 +300,8 @@ PhysicalRecyclerMaterialize::PhysicalRecyclerMaterialize(PhysicalPlan &physical_
                                                          idx_t estimated_cardinality, idx_t id,
                                                          RecyclerWriteSpec spec_p, shared_ptr<RecyclerCache> cache_p,
                                                          PhysicalOperator &child)
-    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types_p), estimated_cardinality),
-      id(id), spec(std::move(spec_p)), cache(std::move(cache_p)) {
+    : PhysicalRecyclerOperator(physical_plan, std::move(types_p), estimated_cardinality, id), spec(std::move(spec_p)),
+      cache(std::move(cache_p)) {
 	// the child lives in `children`, so the default BuildPipelines/GetSources/GetChildren and every planner walk
 	// (delim scan gathering, order preservation, thread estimation) see it
 	children.push_back(child);

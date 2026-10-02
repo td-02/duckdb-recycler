@@ -4,7 +4,8 @@
 //
 //  Both logical operators derive from LogicalRecyclerOperator, so "is this one
 //  of ours" is a single dynamic_cast (AsRecyclerOperator) and `kind` tells
-//  which one it is.
+//  which one it is; both physical operators derive from
+//  PhysicalRecyclerOperator.
 //
 //  * LogicalRecyclerScan / PhysicalRecyclerScan: a cache hit. A childless
 //    source that replays a cached ColumnDataCollection, in parallel or in the
@@ -42,6 +43,22 @@ public:
 //! `op` as one of our operators; nullptr for every other operator, including foreign extension operators
 optional_ptr<const LogicalRecyclerOperator> AsRecyclerOperator(const LogicalOperator &op);
 
+//! Common base of the recycler's physical operators
+class PhysicalRecyclerOperator : public PhysicalOperator {
+public:
+	PhysicalRecyclerOperator(PhysicalPlan &physical_plan, vector<LogicalType> types, idx_t estimated_cardinality,
+	                         idx_t id)
+	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types), estimated_cardinality),
+	      id(id) {
+	}
+
+	//! RecyclerClientState::NextOperatorId at planning
+	idx_t id;
+};
+
+//! `op` as one of our physical operators; nullptr for every other operator
+optional_ptr<const PhysicalRecyclerOperator> AsRecyclerOperator(const PhysicalOperator &op);
+
 //===----------------------------------------------------------------------===//
 // Scan (hit)
 //===----------------------------------------------------------------------===//
@@ -75,15 +92,13 @@ protected:
 	void ResolveTypes() override;
 };
 
-class PhysicalRecyclerScan : public PhysicalOperator {
+class PhysicalRecyclerScan : public PhysicalRecyclerOperator {
 public:
 	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::INVALID;
 
 	PhysicalRecyclerScan(PhysicalPlan &physical_plan, vector<LogicalType> types, idx_t estimated_cardinality, idx_t id,
 	                     shared_ptr<CachedEntry> entry, bool ordered, vector<column_t> column_ids);
 
-	//! RecyclerClientState::NextOperatorId at planning
-	idx_t id;
 	shared_ptr<CachedEntry> entry;
 	bool ordered;
 	vector<column_t> column_ids;
@@ -159,7 +174,7 @@ protected:
 	void ResolveTypes() override;
 };
 
-class PhysicalRecyclerMaterialize : public PhysicalOperator {
+class PhysicalRecyclerMaterialize : public PhysicalRecyclerOperator {
 public:
 	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::INVALID;
 
@@ -167,8 +182,6 @@ public:
 	                            idx_t id, RecyclerWriteSpec spec, shared_ptr<RecyclerCache> cache,
 	                            PhysicalOperator &child);
 
-	//! RecyclerClientState::NextOperatorId at planning
-	idx_t id;
 	RecyclerWriteSpec spec;
 	shared_ptr<RecyclerCache> cache;
 

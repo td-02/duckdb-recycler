@@ -231,8 +231,7 @@ void RecyclerClientState::QueryBegin(ClientContext &context) {
 }
 
 static bool HasRecyclerOperator(const PhysicalOperator &op) {
-	if (op.type == PhysicalOperatorType::EXTENSION && (dynamic_cast<const PhysicalRecyclerScan *>(&op) ||
-	                                                   dynamic_cast<const PhysicalRecyclerMaterialize *>(&op))) {
+	if (AsRecyclerOperator(op)) {
 		return true;
 	}
 	for (auto &child : op.GetChildren()) {
