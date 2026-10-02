@@ -169,7 +169,9 @@ void RecyclerCache::Erase(const CachedEntry &entry) {
 		}
 	} else {
 		auto &map = Map(entry.kind);
-		map.erase(map.find(entry.hash));
+		auto stored = map.find(entry.hash);
+		D_ASSERT(stored != map.end() && stored->second.get() == &entry);
+		map.erase(stored);
 	}
 }
 
