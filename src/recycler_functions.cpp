@@ -2,9 +2,11 @@
 // recycler_functions.cpp - registration, settings, introspection functions and the connection callbacks
 //===----------------------------------------------------------------------===//
 #include "recycler_state.hpp"
+#include "recycler_operators.hpp"
 
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/function/pragma_function.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/attached_database.hpp"
@@ -228,6 +230,19 @@ void RecyclerClientState::QueryBegin(ClientContext &context) {
 	}
 }
 
+static bool HasRecyclerOperator(const PhysicalOperator &op) {
+	if (op.type == PhysicalOperatorType::EXTENSION && (dynamic_cast<const PhysicalRecyclerScan *>(&op) ||
+	                                                   dynamic_cast<const PhysicalRecyclerMaterialize *>(&op))) {
+		return true;
+	}
+	for (auto &child : op.GetChildren()) {
+		if (HasRecyclerOperator(child.get())) {
+			return true;
+		}
+	}
+	return false;
+}
+
 RebindQueryInfo RecyclerClientState::OnExecutePrepared(ClientContext &context, PreparedStatementCallbackInfo &info,
                                                        RebindQueryInfo current_rebind) {
 	// the physical plan names no logical write target, so every database the statement modifies is announced as a
@@ -238,6 +253,15 @@ RebindQueryInfo RecyclerClientState::OnExecutePrepared(ClientContext &context, P
 		for (auto &database : modified) {
 			AnnounceWrite(cache, PendingWrite {database.second.identity.catalog_oid, string()});
 		}
+	}
+	// the hooks rewrote the plan under the snapshot of the transaction that prepared it: a scan would keep serving
+	// its entry after a commit evicted it, and a write would record that snapshot. Planned again, the hooks decide
+	// under the executing transaction's. A statement prepared before all its parameters were bound, or whose plan
+	// DuckDB refuses to cache, has no physical plan: RequireRebind already asked to plan it again.
+	auto &plan = info.prepared_statement.physical_plan;
+	D_ASSERT(plan || current_rebind == RebindQueryInfo::ATTEMPT_TO_REBIND);
+	if (plan && HasRecyclerOperator(plan->Root())) {
+		return RebindQueryInfo::ATTEMPT_TO_REBIND;
 	}
 	return current_rebind;
 }

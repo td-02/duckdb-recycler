@@ -7,7 +7,9 @@ The grader consumes the extension exactly like this: a stock `duckdb` wheel, `al
 `LOAD`. Every query runs REPEATS times on a connection with the extension loaded and once on a plain
 connection holding the same deterministic tables; the rows must be identical as sequences, which the
 queries make meaningful by ordering on a key. The recycler must also report at least one whole-result
-hit, otherwise a silently inactive extension would pass.
+hit, otherwise a silently inactive extension would pass. The parameterized queries run through
+executemany, which prepares once and executes the prepared statement: the client-API path (also taken by
+the C API and JDBC) that the sqllogictest runner, which sends SQL text, cannot reach.
 """
 
 import sys
@@ -30,6 +32,16 @@ QUERIES = [
     "SELECT * FROM (SELECT g, count(*) AS c FROM t GROUP BY g) sub WHERE sub.g IN (0, 6) ORDER BY sub.g",
 ]
 
+# prepared with an unbound parameter, so DuckDB keeps no physical plan and plans each execution again; and prepared
+# without one once QUERIES has cached the result, so the prepared plan scans the cache entry and the extension asks
+# DuckDB to plan each execution again
+PARAMETERIZED = [
+    ("SELECT g, count(*) AS c FROM t WHERE h < ? GROUP BY g ORDER BY g", [5]),
+    ("SELECT d.role, count(*) FROM t JOIN d ON t.g = d.id WHERE t.h < ? GROUP BY d.role ORDER BY d.role", [9]),
+    (QUERIES[0], []),
+    (QUERIES[2], []),
+]
+
 
 def connect(extension_path):
     con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
@@ -43,6 +55,18 @@ def connect(extension_path):
     return con
 
 
+def mismatches(sql, plain, recycled, run):
+    """Runs `run(connection)` once on the plain connection and REPEATS times on the recycled one"""
+    expected = run(plain)
+    failures = 0
+    for repeat in range(REPEATS):
+        actual = run(recycled)
+        if actual != expected:
+            failures += 1
+            print("MISMATCH (run %d): %s\n  expected %r\n  got      %r" % (repeat + 1, sql, expected, actual))
+    return failures
+
+
 def main(extension_path):
     plain = connect(None)
     recycled = connect(extension_path)
@@ -52,19 +76,16 @@ def main(extension_path):
 
     failures = 0
     for sql in QUERIES:
-        expected = plain.execute(sql).fetchall()
-        for repeat in range(REPEATS):
-            actual = recycled.execute(sql).fetchall()
-            if actual != expected:
-                failures += 1
-                print("MISMATCH (run %d): %s\n  expected %r\n  got      %r" % (repeat + 1, sql, expected, actual))
+        failures += mismatches(sql, plain, recycled, lambda con: con.execute(sql).fetchall())
+    for sql, parameters in PARAMETERIZED:
+        failures += mismatches(sql, plain, recycled, lambda con: con.executemany(sql, [parameters]).fetchall())
 
     stats = dict(recycled.execute("SELECT name, value FROM recycler_stats()").fetchall())
     print("recycler_stats", {k: stats[k] for k in ("whole_hits", "subtree_hits", "misses", "whole_stores")})
     if stats["whole_hits"] < 1:
         failures += 1
         print("FAIL: the recycler served no repeated query")
-    print("%d queries x %d runs, %d failures" % (len(QUERIES), REPEATS, failures))
+    print("%d queries x %d runs, %d failures" % (len(QUERIES) + len(PARAMETERIZED), REPEATS, failures))
     return 1 if failures else 0
 
 

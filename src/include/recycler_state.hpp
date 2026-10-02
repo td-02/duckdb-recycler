@@ -115,7 +115,8 @@ struct RecyclerClientState : public ClientContextState {
 	//! Announces an unplanned write for a statement the extension optimizer will not see, and the database the
 	//! transaction modified without an announcement
 	void QueryBegin(ClientContext &context) override;
-	//! Announces the writes of a statement prepared through the client API, which runs without the pre hook
+	//! Announces the writes of a statement prepared through the client API, which runs without the pre hook, and
+	//! asks for a rebind when the hooks rewrote its plan
 	RebindQueryInfo OnExecutePrepared(ClientContext &context, PreparedStatementCallbackInfo &info,
 	                                  RebindQueryInfo current_rebind) override;
 	//! Records measured costs from the profiler tree on the touched entries and in the history

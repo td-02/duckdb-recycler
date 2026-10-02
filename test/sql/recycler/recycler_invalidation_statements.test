@@ -243,8 +243,9 @@ SELECT value FROM recycler_stats() WHERE name = 'clears'
 # (e) EXECUTE of a prepared write names no table: it is announced for the whole database. In a transaction that
 # also announced a, the write to b still invalidates b's entries. A statement prepared through the client API
 # (Connection::Prepare, the C API, parameters in Python or JDBC) runs without the pre hook and is announced by
-# OnExecutePrepared instead; this runner sends every statement as SQL text, so its PREPARE and EXECUTE reach the
-# pre hook (LOGICAL_EXECUTE) and that path cannot be tested here.
+# OnExecutePrepared instead, which also has a plan holding a recycler operator planned again, so that a prepared
+# SELECT is not served an entry a commit evicted after the PREPARE; this runner sends every statement as SQL text,
+# so its PREPARE and EXECUTE reach the pre hook (LOGICAL_EXECUTE) and that path cannot be tested here.
 # ---------------------------------------------------------------------------
 statement ok con2
 PREPARE insert_b AS INSERT INTO b VALUES ($1, $2);
