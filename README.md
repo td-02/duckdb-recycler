@@ -183,8 +183,11 @@ or served inside a transaction that has written. The values of the result-affect
 execution time without changing the bound plan: ICU and the `list_sort` family read them into function bind data, and
 the flag picks the division callback; `integer_division` is a parser option and an ORDER BY clause is resolved by the
 binder, so both already change the plan) are part of every key, so a statement is never served an entry computed under
-other values; `current_setting()`, whose bind data holds the value of whichever setting it names, is refused. Cached
-collections are buffer-managed and bounded by `recycler_budget_mb` with benefit-density eviction.
+other values. Functions DuckDB declares consistent although their result depends on the session or the transaction
+are refused: `current_setting()`, whose bind data holds the value of whichever setting it names, `age()` with one
+argument, which measures from the transaction's start date, and ICU's `current_localtimestamp()` and
+`current_localtime()`, which hold the transaction's start. Cached collections are buffer-managed and bounded by
+`recycler_budget_mb` with benefit-density eviction.
 
 Settings: `recycler_enabled`, `recycler_whole_result`, `recycler_blocks`, `recycler_subtrees`, `recycler_subsumption`,
 `recycler_budget_mb`, `recycler_entry_cap_mb`, `recycler_entry_cap_rows`, `recycler_min_input_rows`,

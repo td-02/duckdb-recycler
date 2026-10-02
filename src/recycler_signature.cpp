@@ -202,13 +202,28 @@ static void Refuse(NodeInfo &info, RefusalReason reason) {
 	}
 }
 
+//! Functions registered as CONSISTENT whose result is a function of the session or the transaction, not of the
+//! arguments the renderer sees (audit of src/function/scalar, core_functions and ICU in v1.5.5): current_setting()
+//! folds the named setting's value into bind data, rendered only as current_setting('name'); age() with one argument
+//! measures from the transaction's start date (AgeFunctionStandard, ICU's unary ICUCalendarAge);
+//! current_localtimestamp() and current_localtime() (ICU) hold the transaction's start in bind data and reach the
+//! renderer when expression_rewriter, which folds them into constants, is disabled. The other session functions are
+//! not CONSISTENT and are refused as volatile (current_date, now, current_database, current_schema(s),
+//! in_search_path, txid_current, current_query, nextval, currval, random, uuid), and getvariable() and
+//! can_cast_implicitly() bind to a constant. Documented in the README; a new name here needs a sqllogictest.
+static bool IsSessionBound(const BoundFunctionExpression &func) {
+	auto &name = func.function.name;
+	if (name == "age") {
+		return func.children.size() == 1;
+	}
+	return name == "current_setting" || name == "current_localtimestamp" || name == "current_localtime";
+}
+
 //! Refuse a function whose result is not a function of its rendered arguments alone, whatever its children
 static void RefuseFunction(const BoundFunctionExpression &func, NodeInfo &info) {
 	if (func.function.GetStability() != FunctionStability::CONSISTENT) {
 		Refuse(info, RefusalReason::VOLATILE_FUNCTION);
-	} else if (func.function.name == "current_setting") {
-		// CONSISTENT, but CurrentSettingBind folds the named setting's value into bind data, which is rendered only
-		// as current_setting('name'): the result is a function of the session, not of the arguments
+	} else if (IsSessionBound(func)) {
 		Refuse(info, RefusalReason::SESSION_BOUND_FUNCTION);
 	}
 }
@@ -289,7 +304,7 @@ idx_t RecyclerEstimateRowWidth(const vector<LogicalType> &types) {
 //! of the same "/" function without bind data (BindBinaryFloatingPoint). Everything else that affects a result is
 //! bound into the plan and rendered: integer_division is a parser option ("/" becomes "//"), collations, search_path
 //! and casts are in the operators; threads and memory_limit change speed only. current_setting(), whose bind data
-//! holds the value of whichever setting it names, is refused instead (RefuseFunction). The values are read once
+//! holds the value of whichever setting it names, is refused instead (IsSessionBound). The values are read once
 //! per statement after binding, so a SET GLOBAL on another connection between the bind and the pre hook is not
 //! detected, as for the recycler's own settings (RecyclerClientState::settings_loaded). Documented in the README; a
 //! new entry here needs a sqllogictest.

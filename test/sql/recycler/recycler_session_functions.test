@@ -55,3 +55,98 @@ WHERE name IN ('refused_volatile_function', 'subtree_stores', 'whole_stores') OR
 refused_volatile_function	2
 subtree_stores	0
 whole_stores	0
+
+statement ok
+RESET search_path;
+
+# ---------------------------------------------------------------------------
+# age() with one argument is CONSISTENT, but measures from the start date of the transaction (AgeFunctionStandard):
+# refused in an aggregate and in a predicate pushed into the scan, so no statement is served an age computed in an
+# earlier transaction; age() with two arguments is a function of its arguments and is served
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE e AS
+SELECT range AS id, range % 7 AS g, TIMESTAMP '1990-01-01' + to_days(range % 3000) AS ts
+FROM range(20000);
+
+query IIT
+SELECT g, count(*) AS c, min(age(ts)) > INTERVAL 20 YEAR AS old FROM e GROUP BY g ORDER BY g
+----
+0	2858	true
+1	2857	true
+2	2857	true
+3	2857	true
+4	2857	true
+5	2857	true
+6	2857	true
+
+query IIT
+SELECT g, count(*) AS c, min(age(ts)) > INTERVAL 20 YEAR AS old FROM e GROUP BY g ORDER BY g
+----
+0	2858	true
+1	2857	true
+2	2857	true
+3	2857	true
+4	2857	true
+5	2857	true
+6	2857	true
+
+query II
+SELECT g, count(*) AS c FROM e WHERE age(ts) > INTERVAL 20 YEAR GROUP BY g ORDER BY g
+----
+0	2858
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+query II
+SELECT g, count(*) AS c FROM e WHERE age(ts) > INTERVAL 20 YEAR GROUP BY g ORDER BY g
+----
+0	2858
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+query II
+SELECT name, value FROM recycler_stats() WHERE name IN ('refused_session_bound_function', 'whole_hits', 'whole_stores')
+ORDER BY name
+----
+refused_session_bound_function	4
+whole_hits	0
+whole_stores	0
+
+query IT
+SELECT g, max(age(TIMESTAMP '2030-01-01', ts)) AS a FROM e GROUP BY g ORDER BY g
+----
+0	40 years
+1	39 years 11 months 30 days
+2	39 years 11 months 30 days
+3	39 years 11 months 30 days
+4	40 years
+5	39 years 11 months 30 days
+6	39 years 11 months 30 days
+
+query IT
+SELECT g, max(age(TIMESTAMP '2030-01-01', ts)) AS a FROM e GROUP BY g ORDER BY g
+----
+0	40 years
+1	39 years 11 months 30 days
+2	39 years 11 months 30 days
+3	39 years 11 months 30 days
+4	40 years
+5	39 years 11 months 30 days
+6	39 years 11 months 30 days
+
+query II
+SELECT name, value FROM recycler_stats() WHERE name IN ('refused_session_bound_function', 'whole_hits', 'whole_stores')
+ORDER BY name
+----
+refused_session_bound_function	4
+whole_hits	1
+whole_stores	1
