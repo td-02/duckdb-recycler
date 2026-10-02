@@ -27,6 +27,7 @@
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/common/limits.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/settings.hpp"
@@ -41,6 +42,7 @@
 #include "duckdb/planner/logical_operator_visitor.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
+#include "duckdb/planner/operator/logical_distinct.hpp"
 #include "duckdb/planner/operator/logical_explain.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
@@ -75,6 +77,14 @@ static idx_t GetIntSetting(ClientContext &context, const char *name, idx_t defau
 	return default_value;
 }
 
+//! A setting given in MB, as bytes: clamped so that scaling it cannot wrap (a wrapped cap of 0 would silently
+//! disable every store)
+static idx_t GetByteSetting(ClientContext &context, const char *name, idx_t default_bytes) {
+	static constexpr idx_t MB = 1024 * 1024;
+	auto mb = GetIntSetting(context, name, default_bytes / MB);
+	return MinValue<idx_t>(mb, NumericLimits<idx_t>::Maximum() / MB) * MB;
+}
+
 RecyclerSettings LoadRecyclerSettings(ClientContext &context) {
 	RecyclerSettings s;
 	s.enabled = GetBoolSetting(context, "recycler_enabled", s.enabled);
@@ -83,15 +93,12 @@ RecyclerSettings LoadRecyclerSettings(ClientContext &context) {
 	s.subtrees = GetBoolSetting(context, "recycler_subtrees", s.subtrees);
 	s.subsumption = GetBoolSetting(context, "recycler_subsumption", s.subsumption);
 	// cached results compete with the queries for memory: whatever the setting says, at most a quarter of the limit
-	s.budget_bytes =
-	    MinValue<idx_t>(GetIntSetting(context, "recycler_budget_mb", s.budget_bytes / (1024 * 1024)) * 1024 * 1024,
-	                    BufferManager::GetBufferManager(context).GetMaxMemory() / 4);
-	s.entry_cap_bytes =
-	    GetIntSetting(context, "recycler_entry_cap_mb", s.entry_cap_bytes / (1024 * 1024)) * 1024 * 1024;
+	s.budget_bytes = MinValue<idx_t>(GetByteSetting(context, "recycler_budget_mb", s.budget_bytes),
+	                                 BufferManager::GetBufferManager(context).GetMaxMemory() / 4);
+	s.entry_cap_bytes = GetByteSetting(context, "recycler_entry_cap_mb", s.entry_cap_bytes);
 	s.entry_cap_rows = GetIntSetting(context, "recycler_entry_cap_rows", s.entry_cap_rows);
 	s.min_input_rows = GetIntSetting(context, "recycler_min_input_rows", s.min_input_rows);
-	s.speculate_bytes =
-	    GetIntSetting(context, "recycler_speculate_mb", s.speculate_bytes / (1024 * 1024)) * 1024 * 1024;
+	s.speculate_bytes = GetByteSetting(context, "recycler_speculate_mb", s.speculate_bytes);
 	s.compact_rows = GetIntSetting(context, "recycler_compact_rows", s.compact_rows);
 	return s;
 }
@@ -274,10 +281,33 @@ struct BlockMatcher {
 //===----------------------------------------------------------------------===//
 using binding_set_t = std::unordered_set<ColumnBinding, ColumnBindingHashFunction, ColumnBindingEquality>;
 
+//! Operators that consume their child's output by position and rebind it: what they need from the child appears in
+//! no expression of theirs, so a reference collector never sees it
+static bool ConsumesChildrenPositionally(const LogicalOperator &op) {
+	switch (op.type) {
+	case LogicalOperatorType::LOGICAL_UNION:
+	case LogicalOperatorType::LOGICAL_EXCEPT:
+	case LogicalOperatorType::LOGICAL_INTERSECT:
+	case LogicalOperatorType::LOGICAL_RECURSIVE_CTE:
+	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
+	case LogicalOperatorType::LOGICAL_PIVOT:
+	case LogicalOperatorType::LOGICAL_INSERT:
+	case LogicalOperatorType::LOGICAL_CREATE_TABLE:
+	case LogicalOperatorType::LOGICAL_COPY_TO_FILE:
+		return true;
+	case LogicalOperatorType::LOGICAL_DISTINCT:
+		// without targets, DISTINCT is over every column of the child
+		return op.Cast<LogicalDistinct>().distinct_targets.empty();
+	default:
+		return false;
+	}
+}
+
 //! Collects every column binding referenced by operators outside of `block`
 class ExternalReferenceCollector : public LogicalOperatorVisitor {
 public:
-	explicit ExternalReferenceCollector(const LogicalOperator &block) : block(block) {
+	ExternalReferenceCollector(const LogicalOperator &block, const vector<ColumnBinding> &block_bindings)
+	    : block(block), block_bindings(block_bindings.begin(), block_bindings.end()) {
 	}
 
 	void VisitOperator(LogicalOperator &op) override {
@@ -285,6 +315,17 @@ public:
 			return;
 		}
 		VisitOperatorExpressions(op);
+		if (ConsumesChildrenPositionally(op)) {
+			// the block's own columns still reach this operator (nothing in between rebound them), and it reads
+			// them by position without naming them in an expression
+			for (auto &child : op.children) {
+				for (auto &binding : child->GetColumnBindings()) {
+					if (block_bindings.find(binding) != block_bindings.end()) {
+						opaque_parent = true;
+					}
+				}
+			}
+		}
 		VisitOperatorChildren(op);
 	}
 
@@ -294,7 +335,11 @@ public:
 	}
 
 	const LogicalOperator &block;
+	binding_set_t block_bindings;
 	binding_set_t references;
+	//! An operator above consumes the block's columns by position: `references` does not describe what the rest of
+	//! the query needs from the block, so no column may be dropped on its word
+	bool opaque_parent = false;
 };
 
 static void CollectBindings(const Expression &expr, vector<ColumnBinding> &out) {
@@ -389,8 +434,11 @@ struct SubsumptionPass {
 		auto bindings = root.GetColumnBindings();
 		auto &types = root.types;
 		// which of the block's output columns does the rest of the query need?
-		ExternalReferenceCollector collector(root);
+		ExternalReferenceCollector collector(root, bindings);
 		collector.VisitOperator(plan);
+		if (collector.opaque_parent) {
+			return false;
+		}
 		for (auto &entry : entries) {
 			if (entry->canonical != shape.canonical) {
 				continue;
@@ -511,7 +559,8 @@ static unique_ptr<LogicalOperator> *GateStatement(OptimizerExtensionInput &input
 	// (LOGICAL_EXECUTE) carries the prepared statement's modified databases. PREPARE (LOGICAL_PREPARE) runs
 	// nothing and modifies nothing. A plain EXPLAIN writes nothing, but DuckDB marks the databases the explained
 	// statement modifies as modified, and so commits them.
-	auto &statement = plan->type == LogicalOperatorType::LOGICAL_EXPLAIN ? *plan->children[0] : *plan;
+	auto explained = plan->type == LogicalOperatorType::LOGICAL_EXPLAIN && plan->children.size() == 1;
+	auto &statement = explained ? *plan->children[0] : *plan;
 	auto target = WriteTarget(statement);
 	auto &modified = input.optimizer.binder.GetStatementProperties().modified_databases;
 	client.AnnounceStatement(context, cache, target, modified);

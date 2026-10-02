@@ -248,6 +248,10 @@ bool RecyclerCache::IsCurrent(const CachedEntry &entry, const vector<reference<c
                               const TableSnapshot &snapshot) {
 	// a confirmed match pairs the entry's tables with the reader's by position
 	D_ASSERT(entry.tables.size() == tables.size());
+	if (entry.tables.size() != tables.size()) {
+		// the invariant rests on the rendering being entry-identifying: a miss, never a read past the vector
+		return false;
+	}
 	std::lock_guard<std::mutex> guard(lock);
 	for (idx_t i = 0; i < tables.size(); i++) {
 		auto &stored = entry.tables[i];

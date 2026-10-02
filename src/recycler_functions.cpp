@@ -4,6 +4,7 @@
 #include "recycler_state.hpp"
 #include "recycler_operators.hpp"
 
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/execution/operator/persistent/physical_batch_insert.hpp"
@@ -194,14 +195,18 @@ void RecyclerClientState::AnnounceStatement(
 		AnnounceWrite(cache, PendingWrite {target->catalog.GetOid(), TableKey(*target)});
 	}
 	for (auto &database : modified) {
-		auto catalog = database.second.identity.catalog_oid;
+		// the oid comes from the database attached under this name now, not from the one bind recorded: the
+		// tracked decision and the announcement (which CommitWriter looks the version up by) must name the
+		// same catalog, or a detach and re-attach in between would announce one and write another
+		auto db = DatabaseManager::Get(context).GetDatabase(context, database.first);
+		if (!db || !IsTrackedDatabase(*db)) {
+			continue;
+		}
+		auto catalog = db->GetCatalog().GetOid();
 		if (target && catalog == target->catalog.GetOid()) {
 			continue;
 		}
-		auto db = DatabaseManager::Get(context).GetDatabase(context, database.first);
-		if (db && IsTrackedDatabase(*db)) {
-			AnnounceWrite(cache, PendingWrite {catalog, string()});
-		}
+		AnnounceWrite(cache, PendingWrite {catalog, string()});
 	}
 }
 
