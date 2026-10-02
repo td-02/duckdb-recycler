@@ -195,7 +195,8 @@ BEGIN TRANSACTION;
 statement ok con2
 INSERT INTO a VALUES (20002, 1);
 
-# vanilla answers con1 (the whole result and the aggregate are withheld), and nothing is stored
+# vanilla answers con1 (the whole result and the aggregate are withheld, and refused again as writes), and nothing
+# is stored
 query II con1 a0
 SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
 ----
@@ -203,7 +204,7 @@ SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
 query I con1
 SELECT value FROM recycler_stats() WHERE name = 'blocked_by_version'
 ----
-2
+4
 
 query I con1
 SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
@@ -308,7 +309,7 @@ RESET recycler_enabled;
 query I con1
 SELECT value FROM recycler_stats() WHERE name = 'blocked_by_version'
 ----
-4
+8
 
 query I con1
 SELECT count(*) FROM recycler_entries()
@@ -354,7 +355,7 @@ SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
 query I con1
 SELECT value FROM recycler_stats() WHERE name = 'blocked_by_version'
 ----
-6
+12
 
 statement ok con2
 ROLLBACK;

@@ -184,8 +184,8 @@ struct RecyclerStats {
 	std::atomic<uint64_t> clears {0};
 	//! entries evicted because a writer of one of their tables (or of the whole catalog) committed
 	std::atomic<uint64_t> invalidated_entries {0};
-	//! lookups and stores refused by the table versions: an uncommitted writer, a commit the snapshot predates, or
-	//! a catalog the reader does not share
+	//! lookups, admissions and stores refused by the table versions: an uncommitted writer, a commit the snapshot
+	//! predates, or a catalog the reader does not share
 	std::atomic<uint64_t> blocked_by_version {0};
 	//! write statements whose target table the pre hook named (INSERT, UPDATE, DELETE, MERGE), also when their
 	//! transaction had already announced that table
@@ -231,7 +231,7 @@ public:
 	               const TableSnapshot &snapshot);
 	//! Whether a statement with this snapshot may store a result over `tables` now (Store checks again when the
 	//! result is ready)
-	bool Admissible(const vector<reference<const TableCatalogEntry>> &tables, const TableSnapshot &snapshot) const;
+	bool Admissible(const vector<reference<const TableCatalogEntry>> &tables, const TableSnapshot &snapshot);
 
 	//! A transaction is about to write (announced before the write runs, so that no reader can see the commit
 	//! before the cache knows about it)

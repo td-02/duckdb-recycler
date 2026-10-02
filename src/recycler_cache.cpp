@@ -265,10 +265,11 @@ bool RecyclerCache::IsCurrent(const CachedEntry &entry, const vector<reference<c
 }
 
 bool RecyclerCache::Admissible(const vector<reference<const TableCatalogEntry>> &tables,
-                               const TableSnapshot &snapshot) const {
+                               const TableSnapshot &snapshot) {
 	std::lock_guard<std::mutex> guard(lock);
 	for (auto &table : tables) {
 		if (!Fresh(snapshot.at(table))) {
+			stats.blocked_by_version++;
 			return false;
 		}
 	}
