@@ -208,9 +208,10 @@ void RecyclerClientState::AnnounceStatement(
 void RecyclerClientState::QueryBegin(ClientContext &context) {
 	// a statement the extension optimizer does not see runs without the pre hook, so which tables it writes is
 	// unknown: every database it may write is announced as a whole, so that until its transaction ends no connection
-	// is served or stores over them, and the commit stamps the one it modified. The optimizer reads
-	// disabled_optimizers again when it runs: a SET GLOBAL on another connection in between lets a write run without
-	// either announcement, and its commit evicts nothing.
+	// is served or stores over them, and the commit stamps the one it modified. Two windows let a write run without
+	// either announcement, and its commit evict nothing: the optimizer reads disabled_optimizers again when it runs, so
+	// a SET GLOBAL on another connection in between; and a database another connection attaches between this callback
+	// and the statement's bind.
 	if (ClientConfig::GetConfig(context).enable_optimizer &&
 	    !Optimizer::OptimizerDisabled(context, OptimizerType::EXTENSION)) {
 		return;
