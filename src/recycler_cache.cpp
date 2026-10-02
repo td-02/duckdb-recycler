@@ -280,37 +280,6 @@ void RecyclerCache::AnnounceWriter(const PendingWrite &write) {
 	Version(write).writers++;
 }
 
-//! An entry over `table` whose snapshot does not exceed `commit`, or nullptr
-static const CachedEntry *StaleEntry(const string &table, const std::unordered_set<const CachedEntry *> &entries,
-                                     transaction_t commit) {
-	for (auto entry : entries) {
-		for (auto &dependency : entry->tables) {
-			if (dependency.table == table && dependency.start_time <= commit) {
-				return entry;
-			}
-		}
-	}
-	return nullptr;
-}
-
-const CachedEntry *RecyclerCache::FirstStale(const PendingWrite &write, transaction_t commit) const {
-	auto catalog = dependents.find(write.catalog);
-	if (catalog == dependents.end()) {
-		return nullptr;
-	}
-	if (!write.table.empty()) {
-		auto table = catalog->second.find(write.table);
-		return table == catalog->second.end() ? nullptr : StaleEntry(table->first, table->second, commit);
-	}
-	for (auto &table : catalog->second) {
-		auto stale = StaleEntry(table.first, table.second, commit);
-		if (stale) {
-			return stale;
-		}
-	}
-	return nullptr;
-}
-
 void RecyclerCache::CommitWriter(const PendingWrite &write, transaction_t commit) {
 	std::lock_guard<std::mutex> guard(lock);
 	auto catalog_versions = versions.find(write.catalog);
@@ -320,9 +289,20 @@ void RecyclerCache::CommitWriter(const PendingWrite &write, transaction_t commit
 	// two writers of one table read their stamps before taking this lock, so the later caller may hold the
 	// smaller one
 	version.last_commit = MaxValue(version.last_commit, commit);
-	// one entry at a time: collecting them would allocate, and Erase may remove the lists they are found in
-	for (auto stale = FirstStale(write, commit); stale; stale = FirstStale(write, commit)) {
-		Erase(*stale);
+	// the announcement stopped every store over the written tables, so every entry listed under them was stored by
+	// a reader whose snapshot predates the commit. They are evicted one at a time: collecting them would allocate,
+	// and Erase may remove the lists they are found in.
+	while (true) {
+		auto catalog = dependents.find(write.catalog);
+		if (catalog == dependents.end()) {
+			break;
+		}
+		auto &tables = catalog->second;
+		auto table = write.table.empty() ? tables.begin() : tables.find(write.table);
+		if (table == tables.end()) {
+			break;
+		}
+		Erase(**table->second.begin());
 		stats.invalidated_entries++;
 	}
 }

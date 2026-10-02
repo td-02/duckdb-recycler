@@ -236,9 +236,8 @@ public:
 	//! A transaction is about to write (announced before the write runs, so that no reader can see the commit
 	//! before the cache knows about it)
 	void AnnounceWriter(const PendingWrite &write);
-	//! The writer's transaction committed with a commit id of at most `commit`: entries over the written tables
-	//! whose snapshot does not exceed it are evicted. Allocates nothing, since it runs after DuckDB made the commit
-	//! durable.
+	//! The writer's transaction committed with a commit id of at most `commit`: the entries over the written tables
+	//! are evicted. Allocates nothing, since it runs after DuckDB made the commit durable.
 	void CommitWriter(const PendingWrite &write, transaction_t commit);
 	//! The writer's transaction rolled back, or did not write the database. Allocates nothing.
 	void RetractWriter(const PendingWrite &write);
@@ -301,8 +300,6 @@ private:
 	//! Erases the versions of the catalog without a writer and whose last commit is 0 or below
 	//! `lowest_active_start`, and the catalog's versions once none remains (caller holds the lock)
 	void Forget(VersionMap::iterator catalog, transaction_t lowest_active_start);
-	//! An entry the commit of `write` outdates, or nullptr (caller holds the lock)
-	const CachedEntry *FirstStale(const PendingWrite &write, transaction_t commit) const;
 	//! No uncommitted writer of the table or its catalog and no commit of either the snapshot predates (caller holds
 	//! the lock)
 	bool Fresh(const TableDependency &dependency) const;
