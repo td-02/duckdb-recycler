@@ -363,22 +363,23 @@ bool RecyclerCache::Store(shared_ptr<CachedEntry> entry, idx_t budget_bytes) {
 
 bool RecyclerCache::StoreBlock(shared_ptr<CachedEntry> entry, idx_t budget_bytes) {
 	std::lock_guard<std::mutex> guard(lock);
-	auto &list = blocks[entry->hash];
-	for (auto &existing : list) {
-		if (existing->canonical == entry->canonical && existing->conjuncts == entry->conjuncts &&
-		    existing->columns == entry->columns) {
-			stats.store_rejected++;
-			return false;
+	auto shape = blocks.find(entry->hash);
+	if (shape != blocks.end()) {
+		for (auto &existing : shape->second) {
+			if (existing->canonical == entry->canonical && existing->conjuncts == entry->conjuncts &&
+			    existing->columns == entry->columns) {
+				stats.store_rejected++;
+				return false;
+			}
 		}
 	}
-	bool fresh = Fresh(entry->tables);
-	if (!fresh || !MakeRoom(*entry, budget_bytes)) {
-		if (list.empty()) {
-			blocks.erase(entry->hash);
-		}
-		if (!fresh) {
-			stats.blocked_by_version++;
-		}
+	if (!Fresh(entry->tables)) {
+		stats.blocked_by_version++;
+		stats.store_rejected++;
+		return false;
+	}
+	// MakeRoom may evict the other blocks of this shape and erase their list
+	if (!MakeRoom(*entry, budget_bytes)) {
 		stats.store_rejected++;
 		return false;
 	}
