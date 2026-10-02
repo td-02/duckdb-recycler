@@ -190,7 +190,9 @@ argument, which measures from the transaction's start date, and ICU's `current_l
 `current_localtime()`, which hold the transaction's start. Cached collections are buffer-managed, except that an
 entry of at most `recycler_compact_rows` rows (8,192) is copied into memory allocated with its data when that takes
 less than its buffer blocks (at least one 256 KiB block per writer thread, however few the rows); the cache is
-bounded by `recycler_budget_mb` with benefit-density eviction.
+bounded with benefit-density eviction by the smaller of `recycler_budget_mb` and a quarter of `memory_limit`, which a
+connection evaluates when it reloads its settings (after a SET, RESET or PRAGMA of its own) and `recycler_stats()`
+reports as `budget_bytes`.
 
 Settings: `recycler_enabled`, `recycler_whole_result`, `recycler_blocks`, `recycler_subtrees`, `recycler_subsumption`,
 `recycler_budget_mb`, `recycler_entry_cap_mb`, `recycler_entry_cap_rows`, `recycler_min_input_rows`,

@@ -54,7 +54,8 @@ struct RecyclerClientState : public ClientContextState {
 	bool active = false;
 	//! Settings are re-read only after a SET/RESET/PRAGMA statement ran on this connection (the pre hook sees the
 	//! statement before it executes and drops the cached copy). A SET GLOBAL on another connection therefore takes
-	//! effect here only after this connection's next SET/RESET/PRAGMA.
+	//! effect here only after this connection's next SET/RESET/PRAGMA; so does a memory_limit set there (a global
+	//! option), which the budget follows.
 	bool settings_loaded = false;
 	RecyclerSettings settings;
 	//! The result-affecting session settings as the pre hook read them (PlanSignatures::SettingsSalt); the post hook
@@ -100,6 +101,8 @@ struct RecyclerClientState : public ClientContextState {
 	idx_t NextOperatorId() {
 		return ++operator_ids;
 	}
+	//! `settings`, loaded first if a SET/RESET/PRAGMA dropped them
+	const RecyclerSettings &GetSettings(ClientContext &context);
 	void NoteTouched(idx_t operator_id, shared_ptr<CachedEntry> entry);
 	//! Adds the write to pending_writes and announces it, unless the transaction already did
 	void AnnounceWrite(RecyclerCache &cache, PendingWrite write);

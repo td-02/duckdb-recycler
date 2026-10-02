@@ -399,6 +399,7 @@ static unique_ptr<GlobalTableFunctionState> RecyclerStatsInit(ClientContext &con
 		add("entries", cache.EntryCount());
 		add("bytes", cache.TotalBytes());
 		add("bytes_used", cache.UsedBytes());
+		add("budget_bytes", RecyclerClientState::Get(context).GetSettings(context).budget_bytes);
 		add("pre_calls", s.pre_calls);
 		add("post_calls", s.post_calls);
 		add("whole_hits", s.whole_hits);

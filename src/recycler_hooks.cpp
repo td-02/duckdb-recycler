@@ -46,6 +46,7 @@
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_merge_into.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
+#include "duckdb/storage/buffer_manager.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 
 #include <algorithm>
@@ -81,7 +82,10 @@ RecyclerSettings LoadRecyclerSettings(ClientContext &context) {
 	s.blocks = GetBoolSetting(context, "recycler_blocks", s.blocks);
 	s.subtrees = GetBoolSetting(context, "recycler_subtrees", s.subtrees);
 	s.subsumption = GetBoolSetting(context, "recycler_subsumption", s.subsumption);
-	s.budget_bytes = GetIntSetting(context, "recycler_budget_mb", s.budget_bytes / (1024 * 1024)) * 1024 * 1024;
+	// cached results compete with the queries for memory: whatever the setting says, at most a quarter of the limit
+	s.budget_bytes =
+	    MinValue<idx_t>(GetIntSetting(context, "recycler_budget_mb", s.budget_bytes / (1024 * 1024)) * 1024 * 1024,
+	                    BufferManager::GetBufferManager(context).GetMaxMemory() / 4);
 	s.entry_cap_bytes =
 	    GetIntSetting(context, "recycler_entry_cap_mb", s.entry_cap_bytes / (1024 * 1024)) * 1024 * 1024;
 	s.entry_cap_rows = GetIntSetting(context, "recycler_entry_cap_rows", s.entry_cap_rows);
@@ -90,6 +94,14 @@ RecyclerSettings LoadRecyclerSettings(ClientContext &context) {
 	    GetIntSetting(context, "recycler_speculate_mb", s.speculate_bytes / (1024 * 1024)) * 1024 * 1024;
 	s.compact_rows = GetIntSetting(context, "recycler_compact_rows", s.compact_rows);
 	return s;
+}
+
+const RecyclerSettings &RecyclerClientState::GetSettings(ClientContext &context) {
+	if (!settings_loaded) {
+		settings = LoadRecyclerSettings(context);
+		settings_loaded = true;
+	}
+	return settings;
 }
 
 static RecyclerState *StateFromInput(OptimizerExtensionInput &input) {
@@ -526,11 +538,7 @@ static unique_ptr<LogicalOperator> *GateStatement(OptimizerExtensionInput &input
 		cache.stats.skip_not_read++;
 		return nullptr;
 	}
-	if (!client.settings_loaded) {
-		client.settings = LoadRecyclerSettings(context);
-		client.settings_loaded = true;
-	}
-	if (!client.settings.enabled) {
+	if (!client.GetSettings(context).enabled) {
 		cache.stats.skip_disabled++;
 		return nullptr;
 	}
