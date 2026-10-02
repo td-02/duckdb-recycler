@@ -584,3 +584,75 @@ query I con1
 SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
 ----
 8
+
+# ---------------------------------------------------------------------------
+# (i) a plain EXPLAIN writes nothing, but DuckDB commits the database the explained write modifies: the write is
+# announced for the table it names, so a connection that explained a write and stays idle stops no other connection
+# from being served, and the entries over other tables stay
+# ---------------------------------------------------------------------------
+statement ok con1
+SET recycler_enabled = false;
+
+query II con1 b2
+SELECT g, count(*) AS c FROM b GROUP BY g ORDER BY g
+----
+0	4002
+1	4001
+2	4000
+3	4000
+4	4000
+
+statement ok con1
+RESET recycler_enabled;
+
+query II con1 b2
+SELECT g, count(*) AS c FROM b GROUP BY g ORDER BY g
+----
+
+# the entries over a and over b
+query I con1
+SELECT count(*) FROM recycler_entries()
+----
+4
+
+statement ok con2
+EXPLAIN INSERT INTO a VALUES (40000, 0);
+
+query II con1 b2
+SELECT g, count(*) AS c FROM b GROUP BY g ORDER BY g
+----
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+9
+
+# the commit evicted the entries over a only
+query I con1
+SELECT count(*) FROM recycler_entries()
+----
+2
+
+query I con1
+SELECT count(*) FROM a WHERE id = 40000
+----
+0
+
+# in an open transaction, the explained write blocks a, not b
+statement ok con2
+BEGIN TRANSACTION;
+
+statement ok con2
+EXPLAIN DELETE FROM a;
+
+query II con1 b2
+SELECT g, count(*) AS c FROM b GROUP BY g ORDER BY g
+----
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+10
+
+statement ok con2
+COMMIT;

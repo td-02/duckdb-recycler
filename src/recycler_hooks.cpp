@@ -491,18 +491,14 @@ static unique_ptr<LogicalOperator> *GateStatement(OptimizerExtensionInput &input
 	    plan->type == LogicalOperatorType::LOGICAL_PRAGMA) {
 		client.settings_loaded = false;
 	}
-	auto root_slot = FindQueryRoot(plan);
-	if (!root_slot) {
-		cache.stats.skip_not_query++;
-		return nullptr;
-	}
-	auto &root = **root_slot;
 	// announced before the write runs, whatever this session's settings say: a reader that starts after the commit
 	// must never find an entry the cache has not yet heard about (the stamp follows at commit). A database the
 	// statement modifies without a table named here is announced as a whole: DDL, and EXECUTE, whose root
 	// (LOGICAL_EXECUTE) carries the prepared statement's modified databases. PREPARE (LOGICAL_PREPARE) runs
-	// nothing and modifies nothing.
-	auto target = WriteTarget(root);
+	// nothing and modifies nothing. A plain EXPLAIN writes nothing, but DuckDB marks the databases the explained
+	// statement modifies as modified, and so commits them.
+	auto &statement = plan->type == LogicalOperatorType::LOGICAL_EXPLAIN ? *plan->children[0] : *plan;
+	auto target = WriteTarget(statement);
 	if (target) {
 		client.AnnounceWrite(cache, PendingWrite {target->catalog.GetOid(), TableKey(*target)});
 	}
@@ -513,6 +509,12 @@ static unique_ptr<LogicalOperator> *GateStatement(OptimizerExtensionInput &input
 			client.AnnounceWrite(cache, PendingWrite {catalog, string()});
 		}
 	}
+	auto root_slot = FindQueryRoot(plan);
+	if (!root_slot) {
+		cache.stats.skip_not_query++;
+		return nullptr;
+	}
+	auto &root = **root_slot;
 	if (target) {
 		cache.stats.announced_table_writes++;
 		return nullptr;
