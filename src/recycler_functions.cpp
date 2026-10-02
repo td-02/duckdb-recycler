@@ -6,6 +6,10 @@
 
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "duckdb/execution/operator/persistent/physical_batch_insert.hpp"
+#include "duckdb/execution/operator/persistent/physical_delete.hpp"
+#include "duckdb/execution/operator/persistent/physical_insert.hpp"
+#include "duckdb/execution/operator/persistent/physical_update.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/function/pragma_function.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -181,13 +185,23 @@ void RecyclerClientState::AnnounceWrite(RecyclerCache &cache, PendingWrite write
 	cache.AnnounceWriter(pending_writes.back());
 }
 
-void RecyclerClientState::AnnounceDatabase(ClientContext &context, RecyclerCache &cache, const string &name,
-                                           idx_t catalog) {
+void RecyclerClientState::AnnounceStatement(
+    ClientContext &context, RecyclerCache &cache, optional_ptr<TableCatalogEntry> target,
+    const unordered_map<string, StatementProperties::ModificationInfo> &modified) {
 	// writes to the temporary and the system database, and to foreign ones, invalidate nothing: no entry reads their
 	// tables
-	auto db = DatabaseManager::Get(context).GetDatabase(context, name);
-	if (db && IsTrackedDatabase(*db)) {
-		AnnounceWrite(cache, PendingWrite {catalog, string()});
+	if (target && IsTrackedDatabase(target->catalog.GetAttached())) {
+		AnnounceWrite(cache, PendingWrite {target->catalog.GetOid(), TableKey(*target)});
+	}
+	for (auto &database : modified) {
+		auto catalog = database.second.identity.catalog_oid;
+		if (target && catalog == target->catalog.GetOid()) {
+			continue;
+		}
+		auto db = DatabaseManager::Get(context).GetDatabase(context, database.first);
+		if (db && IsTrackedDatabase(*db)) {
+			AnnounceWrite(cache, PendingWrite {catalog, string()});
+		}
 	}
 }
 
@@ -221,26 +235,40 @@ static bool HasRecyclerOperator(const PhysicalOperator &op) {
 	return false;
 }
 
+//! The table a physical plan writes, found as WriteTarget finds it in a logical plan
+static optional_ptr<TableCatalogEntry> PhysicalWriteTarget(const PhysicalOperator &op) {
+	switch (op.type) {
+	case PhysicalOperatorType::PROJECTION:
+		return op.children.size() == 1 ? PhysicalWriteTarget(op.children[0]) : nullptr;
+	case PhysicalOperatorType::INSERT:
+		return op.Cast<PhysicalInsert>().insert_table;
+	case PhysicalOperatorType::BATCH_INSERT:
+		return op.Cast<PhysicalBatchInsert>().insert_table;
+	case PhysicalOperatorType::DELETE_OPERATOR:
+		return &op.Cast<PhysicalDelete>().tableref;
+	case PhysicalOperatorType::UPDATE:
+		return &op.Cast<PhysicalUpdate>().tableref;
+	default:
+		return nullptr;
+	}
+}
+
 RebindQueryInfo RecyclerClientState::OnExecutePrepared(ClientContext &context, PreparedStatementCallbackInfo &info,
                                                        RebindQueryInfo current_rebind) {
-	// the physical plan names no logical write target, so every database the statement modifies is announced as a
-	// whole; when DuckDB rebinds the statement, the pre hook announces again (AnnounceWrite deduplicates)
-	auto &modified = info.prepared_statement.properties.modified_databases;
-	if (!modified.empty()) {
-		auto &cache = *GetRecyclerState(context)->cache;
-		for (auto &database : modified) {
-			AnnounceDatabase(context, cache, database.first, database.second.identity.catalog_oid);
-		}
-	}
 	// the hooks rewrote the plan under the snapshot of the transaction that prepared it: a scan would keep serving
 	// its entry after a commit evicted it, and a write would record that snapshot. Planned again, the hooks decide
-	// under the executing transaction's. A statement prepared before all its parameters were bound, or whose plan
-	// DuckDB refuses to cache, has no physical plan: RequireRebind already asked to plan it again.
-	auto &plan = info.prepared_statement.physical_plan;
-	D_ASSERT(plan || current_rebind == RebindQueryInfo::ATTEMPT_TO_REBIND);
-	if (plan && HasRecyclerOperator(plan->Root())) {
+	// under the executing transaction's, and the pre hook (or QueryBegin, with the optimizer off) announces the
+	// statement's writes. A statement prepared before all its parameters were bound, or whose plan DuckDB refuses to
+	// cache, has no physical plan: RequireRebind already asked to plan it again.
+	auto &prepared = info.prepared_statement;
+	D_ASSERT(prepared.physical_plan || current_rebind == RebindQueryInfo::ATTEMPT_TO_REBIND);
+	if (current_rebind == RebindQueryInfo::ATTEMPT_TO_REBIND || HasRecyclerOperator(prepared.physical_plan->Root())) {
 		return RebindQueryInfo::ATTEMPT_TO_REBIND;
 	}
+	// the prepared physical plan runs without the pre hook
+	auto &root = prepared.physical_plan->Root();
+	AnnounceStatement(context, *GetRecyclerState(context)->cache, PhysicalWriteTarget(root),
+	                  prepared.properties.modified_databases);
 	return current_rebind;
 }
 

@@ -500,16 +500,8 @@ static unique_ptr<LogicalOperator> *GateStatement(OptimizerExtensionInput &input
 	// statement modifies as modified, and so commits them.
 	auto &statement = plan->type == LogicalOperatorType::LOGICAL_EXPLAIN ? *plan->children[0] : *plan;
 	auto target = WriteTarget(statement);
-	if (target && IsTrackedDatabase(target->catalog.GetAttached())) {
-		client.AnnounceWrite(cache, PendingWrite {target->catalog.GetOid(), TableKey(*target)});
-	}
 	auto &modified = input.optimizer.binder.GetStatementProperties().modified_databases;
-	for (auto &database : modified) {
-		auto catalog = database.second.identity.catalog_oid;
-		if (!target || catalog != target->catalog.GetOid()) {
-			client.AnnounceDatabase(context, cache, database.first, catalog);
-		}
-	}
+	client.AnnounceStatement(context, cache, target, modified);
 	auto root_slot = FindQueryRoot(plan);
 	if (!root_slot) {
 		cache.stats.skip_not_query++;

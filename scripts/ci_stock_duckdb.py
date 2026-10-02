@@ -10,7 +10,9 @@ queries make meaningful by ordering on a key. The recycler must also report at l
 hit, otherwise a silently inactive extension would pass. The parameterized queries run through
 executemany, which prepares once and executes the prepared statement: the client-API path (also taken by
 the C API and JDBC) that the sqllogictest runner, which sends SQL text, cannot reach. So does LOAD inside an
-explicit transaction next to an idle connection, after which the cache must serve once that transaction ends.
+explicit transaction next to an idle connection, after which the cache must serve once that transaction ends, and
+the parameterized inserts at the end: one into a table no query reads must keep the cached results, and one into t
+must outdate them.
 """
 
 import sys
@@ -22,6 +24,7 @@ REPEATS = 3
 TABLES = [
     "CREATE TABLE t AS SELECT range AS id, range % 7 AS g, range % 13 AS h, 'name' || range AS name FROM range(200000)",
     "CREATE TABLE d AS SELECT range AS id, 'role' || range AS role FROM range(12)",
+    "CREATE TABLE w (id BIGINT)",
 ]
 
 QUERIES = [
@@ -64,6 +67,10 @@ def connect(extension_path):
     return con, idle
 
 
+def whole_hits(con):
+    return con.execute("SELECT value FROM recycler_stats() WHERE name = 'whole_hits'").fetchone()[0]
+
+
 def mismatches(sql, plain, recycled, run):
     """Runs `run(connection)` once on the plain connection and REPEATS times on the recycled one"""
     expected = run(plain)
@@ -89,12 +96,25 @@ def main(extension_path):
     for sql, parameters in PARAMETERIZED:
         failures += mismatches(sql, plain, recycled, lambda con: con.executemany(sql, [parameters]).fetchall())
 
+    # QUERIES[0] is cached: a parameterized insert runs its prepared plan, and only an insert into a table the query
+    # reads may outdate the entry
+    hits = whole_hits(recycled)
+    for con in (plain, recycled):
+        con.executemany("INSERT INTO w VALUES (?)", [[1], [2]])
+    failures += mismatches(QUERIES[0], plain, recycled, lambda con: con.execute(QUERIES[0]).fetchall())
+    if whole_hits(recycled) < hits + REPEATS:
+        failures += 1
+        print("FAIL: a parameterized insert into a table no query reads evicted the cached results")
+    for con in (plain, recycled):
+        con.executemany("INSERT INTO t VALUES (?, ?, ?, ?)", [[200000, 0, 0, "x"], [200001, 6, 1, "y"]])
+    failures += mismatches(QUERIES[0], plain, recycled, lambda con: con.execute(QUERIES[0]).fetchall())
+
     stats = dict(recycled.execute("SELECT name, value FROM recycler_stats()").fetchall())
     print("recycler_stats", {k: stats[k] for k in ("whole_hits", "subtree_hits", "misses", "whole_stores")})
     if stats["whole_hits"] < 1:
         failures += 1
         print("FAIL: the recycler served no repeated query")
-    print("%d queries x %d runs, %d failures" % (len(QUERIES) + len(PARAMETERIZED), REPEATS, failures))
+    print("%d queries x %d runs, %d failures" % (len(QUERIES) + len(PARAMETERIZED) + 2, REPEATS, failures))
     return 1 if failures else 0
 
 

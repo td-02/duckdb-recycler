@@ -3,6 +3,7 @@
 // recycler_state.hpp - database-level and connection-level recycler state
 //===----------------------------------------------------------------------===//
 #include "recycler_cache.hpp"
+#include "duckdb/common/enums/statement_type.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/main/client_context_state.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
@@ -16,6 +17,7 @@ class ClientContext;
 class DatabaseInstance;
 class ErrorData;
 class ExtensionLoader;
+class TableCatalogEntry;
 
 //! Database-wide state, owned by the OptimizerExtension registration
 struct RecyclerState : public OptimizerExtensionInfo {
@@ -101,9 +103,10 @@ struct RecyclerClientState : public ClientContextState {
 	void NoteTouched(idx_t operator_id, shared_ptr<CachedEntry> entry);
 	//! Adds the write to pending_writes and announces it, unless the transaction already did
 	void AnnounceWrite(RecyclerCache &cache, PendingWrite write);
-	//! Announces a write to every table of a database a statement modifies (StatementProperties::modified_databases),
-	//! when the cache tracks the database
-	void AnnounceDatabase(ClientContext &context, RecyclerCache &cache, const string &name, idx_t catalog);
+	//! Announces the writes of a statement: to `target` when it names the table it writes, and to every table of
+	//! any other database it modifies (StatementProperties::modified_databases), for the databases the cache tracks
+	void AnnounceStatement(ClientContext &context, RecyclerCache &cache, optional_ptr<TableCatalogEntry> target,
+	                       const unordered_map<string, StatementProperties::ModificationInfo> &modified);
 	//! Announces every database a statement the extension optimizer will not see may write
 	void QueryBegin(ClientContext &context) override;
 	//! Announces the writes of a statement prepared through the client API, which runs without the pre hook, and
