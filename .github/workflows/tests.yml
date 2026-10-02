@@ -69,7 +69,7 @@ jobs:
     name: Debug build (D_ASSERT) and recycler suites
     if: github.event_name == 'pull_request' || inputs.full == true
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 90
     env:
       # Sanitizers are the asan-ubsan job's business; without them the -O0 binary runs the
       # suites several times faster and a failure here is an assertion or a logic error.
@@ -95,7 +95,8 @@ jobs:
     name: Address and undefined-behaviour sanitizers
     if: github.event_name == 'pull_request' || inputs.full == true
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # A cold build took 74 minutes before its link on 2026-10-02; the suites add about 10.
+    timeout-minutes: 150
     env:
       UBSAN_OPTIONS: print_stacktrace=1
     steps:
@@ -174,8 +175,6 @@ jobs:
     name: clang-format (DuckDB style)
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # Non-blocking until src/ has been through `make format`: 32 violations on 2026-10-01.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
         with:

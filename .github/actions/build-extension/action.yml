@@ -23,6 +23,18 @@ inputs:
 runs:
   using: composite
   steps:
+    # A hosted runner starts with about 14 GB free. A debug or sanitizer build of DuckDB with debug
+    # information, plus its 2 GB ccache, does not fit: the first pull request run died in the final
+    # links with "No space left on device". The preinstalled .NET, Android, Haskell, Boost and CodeQL
+    # toolchains are not used by any job and free about 25 GB.
+    - name: Free disk space
+      shell: bash
+      run: |
+        df -h /
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force > /dev/null
+        df -h /
+
     # The shallow submodule checkout carries no tags, so this fetches the one tag: duckdb's CMake
     # derives the version from `git describe`, and stock DuckDB refuses to load an extension
     # stamped with another version.
@@ -64,8 +76,10 @@ runs:
         TARGET: ${{ inputs.target }}
       run: make "$TARGET" && ccache --show-stats
 
-    # Saved before the caller's tests so that a red test run still warms the next build.
+    # Saved before the caller's tests so that a red test run still warms the next build, and after a
+    # failed build too: the objects it did compile are valid, and a cold sanitizer build is over an hour.
     - name: Save ccache
+      if: ${{ !cancelled() }}
       uses: actions/cache/save@v4
       with:
         path: ${{ github.workspace }}/.ccache
