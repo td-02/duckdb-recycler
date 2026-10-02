@@ -10,8 +10,11 @@ namespace duckdb {
 //===----------------------------------------------------------------------===//
 // Table dependencies
 //===----------------------------------------------------------------------===//
-static string TableKey(const TableCatalogEntry &table) {
-	return table.catalog.GetName() + "." + table.schema.name + "." + table.name;
+string TableKey(const TableCatalogEntry &table) {
+	// the schema name's length keeps names that contain dots apart: schema "a.b" with table "c" and schema "a" with
+	// table "b.c" would otherwise share a key
+	auto &schema = table.schema.name;
+	return to_string(table.catalog.GetOid()) + "." + to_string(schema.size()) + ":" + schema + "." + table.name;
 }
 
 TableSnapshot TakeTableSnapshot(ClientContext &context, const vector<reference<const TableCatalogEntry>> &tables) {
@@ -20,6 +23,7 @@ TableSnapshot TakeTableSnapshot(ClientContext &context, const vector<reference<c
 		auto &table = table_ref.get();
 		TableDependency dependency;
 		dependency.table = TableKey(table);
+		dependency.catalog = table.catalog.GetOid();
 		if (table.catalog.IsDuckCatalog()) {
 			// every catalog counts its own transactions: the values are only comparable within one catalog, which
 			// is all the per-table checks do
@@ -69,13 +73,13 @@ idx_t RecyclerCache::NextSequence() {
 	return ++sequence;
 }
 
-shared_ptr<CachedEntry> RecyclerCache::Lookup(RecyclerEntryKind kind, const SigHash &hash, const PlanSignatures &sig,
-                                              const LogicalOperator &op) {
+shared_ptr<CachedEntry> RecyclerCache::Lookup(RecyclerEntryKind kind, const NodeInfo &info, const PlanSignatures &sig,
+                                              const LogicalOperator &op, const TableSnapshot &snapshot) {
 	shared_ptr<CachedEntry> candidate;
 	{
 		std::lock_guard<std::mutex> guard(lock);
 		auto &map = Map(kind);
-		auto entry = map.find(hash);
+		auto entry = map.find(info.hash);
 		if (entry == map.end()) {
 			stats.misses++;
 			return nullptr;
@@ -86,6 +90,10 @@ shared_ptr<CachedEntry> RecyclerCache::Lookup(RecyclerEntryKind kind, const SigH
 	auto canonical = sig.Render(op);
 	if (canonical != candidate->canonical) {
 		stats.hash_collisions++;
+		stats.misses++;
+		return nullptr;
+	}
+	if (!IsCurrent(*candidate, info.tables, snapshot)) {
 		stats.misses++;
 		return nullptr;
 	}
@@ -119,7 +127,32 @@ shared_ptr<CachedEntry> RecyclerCache::PickVictim() const {
 	return victim;
 }
 
+void RecyclerCache::AddDependents(const CachedEntry &entry) {
+	for (auto &dependency : entry.tables) {
+		auto &listed = dependents[dependency.catalog][dependency.table];
+		// Erase removes one listing per dependency, so no two dependencies of an entry share a table
+		D_ASSERT(listed.find(&entry) == listed.end());
+		listed.insert(&entry);
+	}
+}
+
 void RecyclerCache::Erase(const CachedEntry &entry) {
+	for (auto &dependency : entry.tables) {
+		auto catalog = dependents.find(dependency.catalog);
+		D_ASSERT(catalog != dependents.end());
+		auto table = catalog->second.find(dependency.table);
+		D_ASSERT(table != catalog->second.end());
+		table->second.erase(&entry);
+		if (table->second.empty()) {
+			catalog->second.erase(table);
+			if (catalog->second.empty()) {
+				dependents.erase(catalog);
+			}
+		}
+	}
+	D_ASSERT(total_bytes >= entry.bytes && total_used_bytes >= entry.used_bytes);
+	total_bytes -= entry.bytes;
+	total_used_bytes -= entry.used_bytes;
 	if (entry.kind == RecyclerEntryKind::BLOCK) {
 		auto shape = blocks.find(entry.hash);
 		if (shape != blocks.end()) {
@@ -135,11 +168,9 @@ void RecyclerCache::Erase(const CachedEntry &entry) {
 			}
 		}
 	} else {
-		Map(entry.kind).erase(entry.hash);
+		auto &map = Map(entry.kind);
+		map.erase(map.find(entry.hash));
 	}
-	D_ASSERT(total_bytes >= entry.bytes && total_used_bytes >= entry.used_bytes);
-	total_bytes -= entry.bytes;
-	total_used_bytes -= entry.used_bytes;
 }
 
 bool RecyclerCache::MakeRoom(const CachedEntry &entry, idx_t budget_bytes) {
@@ -161,11 +192,152 @@ bool RecyclerCache::MakeRoom(const CachedEntry &entry, idx_t budget_bytes) {
 	return true;
 }
 
+TableVersion &RecyclerCache::Version(const PendingWrite &write) {
+	if (write.IsUnplanned()) {
+		return unplanned;
+	}
+	return write.table.empty() ? catalog_versions[write.catalog] : versions[write.table];
+}
+
+TableVersion &RecyclerCache::AnnouncedVersion(const PendingWrite &write) {
+	if (write.IsUnplanned()) {
+		D_ASSERT(unplanned.writers > 0);
+		return unplanned;
+	}
+	if (write.table.empty()) {
+		auto catalog = catalog_versions.find(write.catalog);
+		D_ASSERT(catalog != catalog_versions.end() && catalog->second.writers > 0);
+		return catalog->second;
+	}
+	auto table = versions.find(write.table);
+	D_ASSERT(table != versions.end() && table->second.writers > 0);
+	return table->second;
+}
+
+static bool FreshFor(const TableVersion &version, transaction_t start_time) {
+	// a commit id never equals a start time; the stamp of CommitWriter is an upper bound of the commit id, which
+	// `<=` treats as a commit too
+	return version.writers == 0 && start_time > version.last_commit;
+}
+
+bool RecyclerCache::Fresh(const TableDependency &dependency) const {
+	if (unplanned.writers > 0) {
+		return false;
+	}
+	auto table = versions.find(dependency.table);
+	if (table != versions.end() && !FreshFor(table->second, dependency.start_time)) {
+		return false;
+	}
+	auto catalog = catalog_versions.find(dependency.catalog);
+	return catalog == catalog_versions.end() || FreshFor(catalog->second, dependency.start_time);
+}
+
+bool RecyclerCache::Fresh(const vector<TableDependency> &dependencies) const {
+	for (auto &dependency : dependencies) {
+		if (!Fresh(dependency)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool RecyclerCache::IsCurrent(const CachedEntry &entry, const vector<reference<const TableCatalogEntry>> &tables,
+                              const TableSnapshot &snapshot) {
+	// a confirmed match pairs the entry's tables with the reader's by position
+	D_ASSERT(entry.tables.size() == tables.size());
+	std::lock_guard<std::mutex> guard(lock);
+	for (idx_t i = 0; i < tables.size(); i++) {
+		auto &stored = entry.tables[i];
+		auto &reader = snapshot.at(tables[i]);
+		// the canonical rendering names the catalog, not the attached database: one detached and attached again
+		// under the same name renders alike
+		D_ASSERT(stored.catalog != reader.catalog || stored.table == reader.table);
+		if (stored.catalog != reader.catalog || stored.catalog_version != reader.catalog_version || !Fresh(stored) ||
+		    !Fresh(reader)) {
+			stats.blocked_by_version++;
+			return false;
+		}
+	}
+	return true;
+}
+
+bool RecyclerCache::Admissible(const vector<reference<const TableCatalogEntry>> &tables,
+                               const TableSnapshot &snapshot) const {
+	std::lock_guard<std::mutex> guard(lock);
+	for (auto &table : tables) {
+		if (!Fresh(snapshot.at(table))) {
+			return false;
+		}
+	}
+	return true;
+}
+
+void RecyclerCache::AnnounceWriter(const PendingWrite &write) {
+	std::lock_guard<std::mutex> guard(lock);
+	Version(write).writers++;
+}
+
+//! An entry over `table` whose snapshot does not exceed `commit`, or nullptr
+static const CachedEntry *StaleEntry(const string &table, const std::unordered_set<const CachedEntry *> &entries,
+                                     transaction_t commit) {
+	for (auto entry : entries) {
+		for (auto &dependency : entry->tables) {
+			if (dependency.table == table && dependency.start_time <= commit) {
+				return entry;
+			}
+		}
+	}
+	return nullptr;
+}
+
+const CachedEntry *RecyclerCache::FirstStale(const PendingWrite &write, transaction_t commit) const {
+	auto catalog = dependents.find(write.catalog);
+	if (catalog == dependents.end()) {
+		return nullptr;
+	}
+	if (!write.table.empty()) {
+		auto table = catalog->second.find(write.table);
+		return table == catalog->second.end() ? nullptr : StaleEntry(table->first, table->second, commit);
+	}
+	for (auto &table : catalog->second) {
+		auto stale = StaleEntry(table.first, table.second, commit);
+		if (stale) {
+			return stale;
+		}
+	}
+	return nullptr;
+}
+
+void RecyclerCache::CommitWriter(const PendingWrite &write, transaction_t commit) {
+	D_ASSERT(!write.IsUnplanned());
+	std::lock_guard<std::mutex> guard(lock);
+	auto &version = AnnouncedVersion(write);
+	version.writers--;
+	// two writers of one table read their stamps before taking this lock, so the later caller may hold the
+	// smaller one
+	version.last_commit = MaxValue(version.last_commit, commit);
+	// one entry at a time: collecting them would allocate, and Erase may remove the lists they are found in
+	for (auto stale = FirstStale(write, commit); stale; stale = FirstStale(write, commit)) {
+		Erase(*stale);
+		stats.invalidated_entries++;
+	}
+}
+
+void RecyclerCache::RetractWriter(const PendingWrite &write) {
+	std::lock_guard<std::mutex> guard(lock);
+	AnnouncedVersion(write).writers--;
+}
+
 bool RecyclerCache::Store(shared_ptr<CachedEntry> entry, idx_t budget_bytes) {
 	std::lock_guard<std::mutex> guard(lock);
 	auto &map = Map(entry->kind);
 	if (map.find(entry->hash) != map.end()) {
 		// never overwrite: a running query may reference the existing collection through the plan
+		stats.store_rejected++;
+		return false;
+	}
+	if (!Fresh(entry->tables)) {
+		stats.blocked_by_version++;
 		stats.store_rejected++;
 		return false;
 	}
@@ -178,6 +350,7 @@ bool RecyclerCache::Store(shared_ptr<CachedEntry> entry, idx_t budget_bytes) {
 	total_bytes += entry->bytes;
 	total_used_bytes += entry->used_bytes;
 	map[entry->hash] = entry;
+	AddDependents(*entry);
 	if (entry->kind == RecyclerEntryKind::WHOLE_RESULT) {
 		stats.whole_stores++;
 	} else {
@@ -196,9 +369,13 @@ bool RecyclerCache::StoreBlock(shared_ptr<CachedEntry> entry, idx_t budget_bytes
 			return false;
 		}
 	}
-	if (!MakeRoom(*entry, budget_bytes)) {
+	bool fresh = Fresh(entry->tables);
+	if (!fresh || !MakeRoom(*entry, budget_bytes)) {
 		if (list.empty()) {
 			blocks.erase(entry->hash);
+		}
+		if (!fresh) {
+			stats.blocked_by_version++;
 		}
 		stats.store_rejected++;
 		return false;
@@ -207,6 +384,7 @@ bool RecyclerCache::StoreBlock(shared_ptr<CachedEntry> entry, idx_t budget_bytes
 	entry->last_used = entry->stored_at;
 	total_bytes += entry->bytes;
 	total_used_bytes += entry->used_bytes;
+	AddDependents(*entry);
 	blocks[entry->hash].push_back(entry);
 	stats.block_stores++;
 	return true;
@@ -228,6 +406,7 @@ void RecyclerCache::Clear() {
 	blocks.clear();
 	history.clear();
 	history_order.clear();
+	dependents.clear();
 	total_bytes = 0;
 	total_used_bytes = 0;
 	stats.clears++;

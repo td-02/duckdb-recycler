@@ -1,0 +1,709 @@
+# name: test/sql/recycler/recycler_invalidation.test
+# description: a write invalidates the entries over its table only, through the transaction callbacks, and no
+# interleaving of readers and writers on two connections yields a stale answer
+# group: [recycler]
+
+require waddle
+
+statement ok con1
+SET recycler_min_input_rows = 1;
+
+statement ok con2
+SET recycler_min_input_rows = 1;
+
+statement ok con1
+CREATE TABLE a AS SELECT range AS id, range % 7 AS g FROM range(20000);
+
+statement ok con1
+CREATE TABLE b AS SELECT range AS id, range % 5 AS g FROM range(20000);
+
+# the first query of every answer is checked against the rows spelled out; the labeled run with the recycler
+# disabled is vanilla's answer, and every served query under the same label must hash to it
+
+# ---------------------------------------------------------------------------
+# (a) a write to a evicts the entries over a; the entry over b stays and is served
+# ---------------------------------------------------------------------------
+query II con1
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+0	2858
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+statement ok con1
+SET recycler_enabled = false;
+
+query II con1 a0
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+
+statement ok con1
+RESET recycler_enabled;
+
+query II con1
+SELECT g, count(*) AS c FROM b GROUP BY g ORDER BY g
+----
+0	4000
+1	4000
+2	4000
+3	4000
+4	4000
+
+statement ok con1
+SET recycler_enabled = false;
+
+query II con1 b0
+SELECT g, count(*) AS c FROM b GROUP BY g ORDER BY g
+----
+
+statement ok con1
+RESET recycler_enabled;
+
+# the whole result and the aggregate of each query
+query I con1
+SELECT count(*) FROM recycler_entries()
+----
+4
+
+statement ok con2
+INSERT INTO a VALUES (20000, 0), (20001, 0);
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'invalidated_entries'
+----
+2
+
+query I con1
+SELECT count(*) FROM recycler_entries()
+----
+2
+
+query II con2 b0
+SELECT g, count(*) AS c FROM b GROUP BY g ORDER BY g
+----
+
+query I con2
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+1
+
+# a is answered with the new rows and stored again
+query II con1
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+0	2860
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+statement ok con1
+SET recycler_enabled = false;
+
+query II con1 a1
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+
+statement ok con1
+RESET recycler_enabled;
+
+query I con1
+SELECT count(*) FROM recycler_entries()
+----
+4
+
+# UPDATE and DELETE likewise take a's entries only
+statement ok con2
+UPDATE a SET g = 1 WHERE id = 20000;
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'invalidated_entries'
+----
+4
+
+query I con1
+SELECT count(*) FROM recycler_entries()
+----
+2
+
+query II con1
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+0	2859
+1	2858
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+statement ok con1
+SET recycler_enabled = false;
+
+query II con1 a2
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+
+statement ok con1
+RESET recycler_enabled;
+
+statement ok con2
+DELETE FROM a WHERE id >= 20000;
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'invalidated_entries'
+----
+6
+
+query I con1
+SELECT count(*) FROM recycler_entries()
+----
+2
+
+query II con1 a0
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+1
+
+# neither the writes nor the CREATE TABLEs cleared the cache
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'clears'
+----
+0
+
+query I con1
+SELECT count(*) FROM recycler_entries()
+----
+4
+
+# ---------------------------------------------------------------------------
+# (b) an open writer on con2 blocks a's entries for con1: not served, not stored; after COMMIT the new rows show
+# ---------------------------------------------------------------------------
+statement ok con2
+BEGIN TRANSACTION;
+
+statement ok con2
+INSERT INTO a VALUES (20002, 1);
+
+# vanilla answers con1 (the whole result and the aggregate are withheld), and nothing is stored
+query II con1 a0
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'blocked_by_version'
+----
+2
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+1
+
+query I con1
+SELECT count(*) FROM recycler_entries()
+----
+4
+
+# b is not blocked
+query II con1 b0
+SELECT g, count(*) AS c FROM b GROUP BY g ORDER BY g
+----
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+2
+
+statement ok con2
+COMMIT;
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'invalidated_entries'
+----
+8
+
+query II con1
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+0	2858
+1	2858
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+statement ok con1
+SET recycler_enabled = false;
+
+query II con1 a3
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+
+statement ok con1
+RESET recycler_enabled;
+
+# ---------------------------------------------------------------------------
+# (c) the race: con1 reads inside a transaction that predates con2's commit; neither con1's answer nor an entry
+# stored after the commit may cross it
+# ---------------------------------------------------------------------------
+statement ok con1
+BEGIN TRANSACTION;
+
+query II con1 a3
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+3
+
+statement ok con2
+INSERT INTO a VALUES (20003, 2);
+
+# con2 sees its own commit (vanilla) and stores entries con1 must not be served
+query II con2
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+0	2858
+1	2858
+2	2858
+3	2857
+4	2857
+5	2857
+6	2857
+
+query I con2
+SELECT count(*) FROM recycler_entries()
+----
+4
+
+# con1 keeps its snapshot: con2's entries are too new for it, and its own result too old to store
+query II con1 a3
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+
+statement ok con1
+SET recycler_enabled = false;
+
+query II con1 a3
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+
+statement ok con1
+RESET recycler_enabled;
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'blocked_by_version'
+----
+4
+
+query I con1
+SELECT count(*) FROM recycler_entries()
+----
+4
+
+statement ok con1
+COMMIT;
+
+# a new transaction on con1 is served con2's entry
+query II con1 a4
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+4
+
+statement ok con1
+SET recycler_enabled = false;
+
+query II con1 a4
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+
+statement ok con1
+RESET recycler_enabled;
+
+# ---------------------------------------------------------------------------
+# (d) a rolled-back writer leaves the entries valid
+# ---------------------------------------------------------------------------
+statement ok con2
+BEGIN TRANSACTION;
+
+statement ok con2
+INSERT INTO a VALUES (20004, 3);
+
+query II con1 a4
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'blocked_by_version'
+----
+6
+
+statement ok con2
+ROLLBACK;
+
+query II con1 a4
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+5
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'invalidated_entries'
+----
+10
+
+# ---------------------------------------------------------------------------
+# (e) DDL names no table: it is announced for its whole database, whose entries its commit evicts
+# ---------------------------------------------------------------------------
+statement ok con2
+ALTER TABLE a ADD COLUMN x INTEGER;
+
+query I con1
+SELECT count(*) FROM recycler_entries()
+----
+0
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'invalidated_entries'
+----
+14
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'clears'
+----
+0
+
+query II con1 a4
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+
+query II con1 b0
+SELECT g, count(*) AS c FROM b GROUP BY g ORDER BY g
+----
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+5
+
+query I con1
+SELECT count(*) FROM recycler_entries()
+----
+4
+
+statement ok con2
+DROP TABLE b;
+
+statement ok con2
+CREATE TABLE b AS SELECT range AS id, range % 2 AS g FROM range(20000);
+
+query I con1
+SELECT count(*) FROM recycler_entries()
+----
+0
+
+query II con1
+SELECT g, count(*) AS c FROM b GROUP BY g ORDER BY g
+----
+0	10000
+1	10000
+
+statement ok con1
+SET recycler_enabled = false;
+
+query II con1 b1
+SELECT g, count(*) AS c FROM b GROUP BY g ORDER BY g
+----
+
+statement ok con1
+RESET recycler_enabled;
+
+# ---------------------------------------------------------------------------
+# (f) a write in one attached database does not touch the entries of another
+# ---------------------------------------------------------------------------
+statement ok con1
+ATTACH ':memory:' AS other;
+
+statement ok con1
+CREATE TABLE other.c AS SELECT range AS id, range % 3 AS g FROM range(20000);
+
+query II con1
+SELECT g, count(*) AS c FROM other.c GROUP BY g ORDER BY g
+----
+0	6667
+1	6667
+2	6666
+
+statement ok con1
+SET recycler_enabled = false;
+
+query II con1 c0
+SELECT g, count(*) AS c FROM other.c GROUP BY g ORDER BY g
+----
+
+statement ok con1
+RESET recycler_enabled;
+
+# stored anew: the DDL above cleared the cache
+query II con1 a4
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+
+query I con1
+SELECT count(*) FROM recycler_entries()
+----
+4
+
+statement ok con2
+INSERT INTO other.c VALUES (20000, 0);
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'invalidated_entries'
+----
+20
+
+query I con1
+SELECT count(*) FROM recycler_entries()
+----
+2
+
+query II con2 a4
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+
+query I con2
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+6
+
+query II con2
+SELECT g, count(*) AS c FROM other.c GROUP BY g ORDER BY g
+----
+0	6668
+1	6667
+2	6666
+
+statement ok con2
+SET recycler_enabled = false;
+
+query II con2 c1
+SELECT g, count(*) AS c FROM other.c GROUP BY g ORDER BY g
+----
+
+statement ok con2
+RESET recycler_enabled;
+
+# ---------------------------------------------------------------------------
+# (g) a write to a temporary table is a write like any other: it clears nothing
+# ---------------------------------------------------------------------------
+statement ok con2
+CREATE TEMP TABLE scratch (id INTEGER);
+
+query I con1
+SELECT count(*) FROM recycler_entries()
+----
+0
+
+query II con1 a4
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+
+query I con1
+SELECT count(*) FROM recycler_entries()
+----
+2
+
+statement ok con2
+INSERT INTO scratch VALUES (1);
+
+query I con1
+SELECT count(*) FROM recycler_entries()
+----
+2
+
+query II con2 a4
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+
+query I con2
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+7
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'hash_collisions'
+----
+0
+
+# ---------------------------------------------------------------------------
+# (h) an entry stored above the scan of an earlier result reads the tables behind that result: a write to them
+# evicts it, although the scan renders as the result's key, which the result keeps once it is stored again
+# ---------------------------------------------------------------------------
+statement ok con1
+SET preserve_insertion_order = false;
+
+statement ok con1
+CREATE TABLE n AS SELECT range AS id, range % 7 AS g FROM range(20000);
+
+statement ok con1
+CREATE TABLE nu AS SELECT range AS g, range % 2 AS k FROM range(7);
+
+query II con1
+SELECT g, count(*) AS c FROM n GROUP BY g ORDER BY g
+----
+0	2858
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+# the nested block is served from the result above, and the aggregates above its scan are stored
+query I con1
+SELECT sum(s) FROM (SELECT nu.k, sum(x.c) AS s FROM (SELECT g, count(*) AS c FROM n GROUP BY g ORDER BY g) x JOIN nu ON x.g = nu.g GROUP BY nu.k)
+----
+20000
+
+# another query over the same aggregate is served the entry stored above the scan
+query I con1
+SELECT max(s) FROM (SELECT nu.k, sum(x.c) AS s FROM (SELECT g, count(*) AS c FROM n GROUP BY g ORDER BY g) x JOIN nu ON x.g = nu.g GROUP BY nu.k)
+----
+11429
+
+query II con1
+SELECT name, value FROM recycler_stats() WHERE name IN ('block_hits', 'subtree_hits') ORDER BY name
+----
+block_hits	2
+subtree_hits	1
+
+statement ok con2
+INSERT INTO n SELECT range, 0 FROM range(1000);
+
+# every entry reads n
+query I con1
+SELECT count(*) FROM recycler_entries()
+----
+0
+
+query II con1
+SELECT g, count(*) AS c FROM n GROUP BY g ORDER BY g
+----
+0	3858
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+statement ok con1
+SET recycler_enabled = false;
+
+query I con1 h0
+SELECT max(s) FROM (SELECT nu.k, sum(x.c) AS s FROM (SELECT g, count(*) AS c FROM n GROUP BY g ORDER BY g) x JOIN nu ON x.g = nu.g GROUP BY nu.k)
+----
+
+statement ok con1
+RESET recycler_enabled;
+
+# the nested block is served from the new result; nothing stored above the old one is
+query I con1 h0
+SELECT max(s) FROM (SELECT nu.k, sum(x.c) AS s FROM (SELECT g, count(*) AS c FROM n GROUP BY g ORDER BY g) x JOIN nu ON x.g = nu.g GROUP BY nu.k)
+----
+
+query II con1
+SELECT name, value FROM recycler_stats() WHERE name IN ('block_hits', 'subtree_hits') ORDER BY name
+----
+block_hits	3
+subtree_hits	1
+
+statement ok con1
+RESET preserve_insertion_order;
+
+# ---------------------------------------------------------------------------
+# (i) tables whose schema and table names join to the same dotted name are two dependencies of one entry: a write
+# to either evicts it, and the answer is vanilla's
+# ---------------------------------------------------------------------------
+statement ok con1
+CREATE SCHEMA "a.b";
+
+statement ok con1
+CREATE SCHEMA a;
+
+statement ok con1
+CREATE TABLE "a.b".c AS SELECT range AS id FROM range(100000);
+
+statement ok con1
+CREATE TABLE a."b.c" AS SELECT range AS id FROM range(100000);
+
+query I con1
+SELECT count(*) FROM "a.b".c x JOIN a."b.c" y ON x.id = y.id
+----
+100000
+
+query I con1
+SELECT count(*) FROM "a.b".c x JOIN a."b.c" y ON x.id = y.id
+----
+100000
+
+query I con1
+SELECT count(*) FROM recycler_entries()
+----
+1
+
+statement ok con2
+INSERT INTO a."b.c" VALUES (1);
+
+query I con1
+SELECT count(*) FROM recycler_entries()
+----
+0
+
+statement ok con1
+SET recycler_enabled = false;
+
+query I con1 h1
+SELECT count(*) FROM "a.b".c x JOIN a."b.c" y ON x.id = y.id
+----
+100001
+
+statement ok con1
+RESET recycler_enabled;
+
+query I con1 h1
+SELECT count(*) FROM "a.b".c x JOIN a."b.c" y ON x.id = y.id
+----
+
+query I con1 h1
+SELECT count(*) FROM "a.b".c x JOIN a."b.c" y ON x.id = y.id
+----
+
+statement ok con2
+INSERT INTO "a.b".c VALUES (1);
+
+query I con1
+SELECT count(*) FROM "a.b".c x JOIN a."b.c" y ON x.id = y.id
+----
+100003

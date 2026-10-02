@@ -60,8 +60,9 @@ WHERE name IN ('whole_hits', 'block_hits', 'subtree_hits', 'subsumption_hits', '
 ----
 0
 
-# the SQLite rows change through the attached catalog and the answer follows (a write through DuckDB clears the cache
-# anyway; the refusal is for the changes SQLite's file takes outside DuckDB, which no entry over s.t can outlive)
+# the SQLite rows change through the attached catalog and the answer follows (a write through DuckDB is announced
+# like any other; the refusal is for the changes SQLite's file takes outside DuckDB, which no entry over s.t could
+# outlive)
 statement ok
 INSERT INTO s.t VALUES (3000, 0);
 

@@ -54,6 +54,15 @@ struct RecyclerClientState : public ClientContextState {
 	idx_t whole_est_input_rows = 0;
 	vector<TableDependency> whole_tables;
 
+	//! The writes of the open transaction, each announced once (RecyclerCache::AnnounceWriter) before the first
+	//! statement to name it runs, and settled by the transaction callbacks
+	vector<PendingWrite> pending_writes;
+	//! A commit of a database that no hook announced (an unplanned statement's, committed with it), which the
+	//! connection's next transaction stamps: the commit callback must not allocate the database's version. Until
+	//! then an unplanned writer withholds every entry.
+	idx_t unstamped_catalog = DConstants::INVALID_INDEX;
+	transaction_t unstamped_commit = 0;
+
 	//! Ids of this connection's recycler operators, drawn when the physical plan is built: a profiler node shows
 	//! its operator's id ("Id" among the parameters), which is how QueryEnd tells two entries of one shape apart
 	idx_t operator_ids = 0;
@@ -76,8 +85,25 @@ struct RecyclerClientState : public ClientContextState {
 		return ++operator_ids;
 	}
 	void NoteTouched(idx_t operator_id, shared_ptr<CachedEntry> entry);
+	//! Adds the write to pending_writes and announces it, unless the transaction already did
+	void AnnounceWrite(RecyclerCache &cache, PendingWrite write);
+	//! Whether the open transaction may have written the catalog without an announcement: it ran an unplanned
+	//! statement, or announced nothing for the catalog, and did not announce the whole catalog
+	bool MayWriteUnannounced(idx_t catalog) const;
+	//! Stamps the commit TransactionCommit could not, and releases the unplanned writer that stood in for it
+	void StampUnstampedCommit(RecyclerCache &cache);
+	//! Announces an unplanned write for a statement the extension optimizer will not see, and the database the
+	//! transaction modified without an announcement
+	void QueryBegin(ClientContext &context) override;
+	//! Announces the writes of a statement prepared through the client API, which runs without the pre hook
+	RebindQueryInfo OnExecutePrepared(ClientContext &context, PreparedStatementCallbackInfo &info,
+	                                  RebindQueryInfo current_rebind) override;
 	//! Records measured costs from the profiler tree on the touched entries and in the history
 	void QueryEnd(ClientContext &context, optional_ptr<ErrorData> error) override;
+	void TransactionBegin(MetaTransaction &transaction, ClientContext &context) override;
+	//! Stamps the written tables with the commit and evicts the entries the commit outdates
+	void TransactionCommit(MetaTransaction &transaction, ClientContext &context) override;
+	void TransactionRollback(MetaTransaction &transaction, ClientContext &context) override;
 };
 
 RecyclerSettings LoadRecyclerSettings(ClientContext &context);

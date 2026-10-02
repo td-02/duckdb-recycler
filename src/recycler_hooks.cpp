@@ -2,6 +2,8 @@
 // recycler_hooks.cpp - the pre- and post-optimizer passes
 //
 // Pre-optimize (before any built-in optimizer, i.e. on the bound plan):
+//   * writes announce their target table (or the database they modify) before
+//     they run; statements outside any database (ATTACH, LOAD) clear the cache
 //   * whole-result hit: the query's plan matches a cached result -> replace the
 //     whole plan with a RecyclerScan; miss -> remember the key for the post hook
 //   * nested-block hit: a sub-query block equals an earlier whole query
@@ -23,6 +25,8 @@
 #include "recycler_rewrite.hpp"
 #include "recycler_signature.hpp"
 
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -35,8 +39,12 @@
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/logical_operator_visitor.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
+#include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_explain.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
+#include "duckdb/planner/operator/logical_insert.hpp"
+#include "duckdb/planner/operator/logical_merge_into.hpp"
+#include "duckdb/planner/operator/logical_update.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 
 #include <algorithm>
@@ -103,13 +111,30 @@ struct ScopedTimer {
 //===----------------------------------------------------------------------===//
 // Root classification
 //===----------------------------------------------------------------------===//
-//! Statements that may change data or catalog state: drop everything we cached
+//! Statements that write the rows of one table (TRUNCATE is a DELETE, COPY FROM an INSERT, RETURNING a projection
+//! over the write): the target is announced to the cache, which withholds entries over it until the transaction
+//! ends
+static optional_ptr<TableCatalogEntry> WriteTarget(LogicalOperator &root) {
+	switch (root.type) {
+	case LogicalOperatorType::LOGICAL_PROJECTION:
+		return root.children.size() == 1 ? WriteTarget(*root.children[0]) : nullptr;
+	case LogicalOperatorType::LOGICAL_INSERT:
+		return root.Cast<LogicalInsert>().table;
+	case LogicalOperatorType::LOGICAL_DELETE:
+		return root.Cast<LogicalDelete>().table;
+	case LogicalOperatorType::LOGICAL_UPDATE:
+		return root.Cast<LogicalUpdate>().table;
+	case LogicalOperatorType::LOGICAL_MERGE_INTO:
+		return root.Cast<LogicalMergeInto>().table;
+	default:
+		return nullptr;
+	}
+}
+
+//! Statements that may change state the cache does not track and that modify no database the cache can stamp
+//! (ATTACH, DETACH, LOAD, ...): drop everything we cached
 static bool IsModifyingRoot(LogicalOperatorType type) {
 	switch (type) {
-	case LogicalOperatorType::LOGICAL_INSERT:
-	case LogicalOperatorType::LOGICAL_DELETE:
-	case LogicalOperatorType::LOGICAL_UPDATE:
-	case LogicalOperatorType::LOGICAL_MERGE_INTO:
 	case LogicalOperatorType::LOGICAL_ALTER:
 	case LogicalOperatorType::LOGICAL_CREATE_TABLE:
 	case LogicalOperatorType::LOGICAL_CREATE_INDEX:
@@ -120,7 +145,6 @@ static bool IsModifyingRoot(LogicalOperatorType type) {
 	case LogicalOperatorType::LOGICAL_CREATE_TYPE:
 	case LogicalOperatorType::LOGICAL_CREATE_SECRET:
 	case LogicalOperatorType::LOGICAL_DROP:
-	case LogicalOperatorType::LOGICAL_TRANSACTION:
 	case LogicalOperatorType::LOGICAL_ATTACH:
 	case LogicalOperatorType::LOGICAL_DETACH:
 	case LogicalOperatorType::LOGICAL_COPY_DATABASE:
@@ -190,14 +214,16 @@ static unique_ptr<LogicalOperator> *FindQueryRoot(unique_ptr<LogicalOperator> &p
 // Pre-optimize: nested-block hits
 //===----------------------------------------------------------------------===//
 struct BlockMatcher {
-	BlockMatcher(Binder &binder, RecyclerCache &cache, const RecyclerSettings &settings, PlanSignatures &sig,
+	BlockMatcher(Binder &binder, RecyclerCache &cache, const RecyclerClientState &client, PlanSignatures &sig,
 	             bool preserve_order)
-	    : binder(binder), cache(cache), settings(settings), sig(sig), preserve_order(preserve_order) {
+	    : binder(binder), cache(cache), settings(client.settings), snapshot(client.snapshot), sig(sig),
+	      preserve_order(preserve_order) {
 	}
 
 	Binder &binder;
 	RecyclerCache &cache;
 	const RecyclerSettings &settings;
+	const TableSnapshot &snapshot;
 	PlanSignatures &sig;
 	bool preserve_order;
 	ColumnBindingReplacer replacer;
@@ -215,7 +241,7 @@ struct BlockMatcher {
 		}
 		auto &info = sig.Get(op);
 		if (info.Cacheable() && info.est_leaf_rows >= settings.min_input_rows && op.children.size() > 0) {
-			auto entry = cache.Lookup(RecyclerEntryKind::WHOLE_RESULT, info.hash, sig, op);
+			auto entry = cache.Lookup(RecyclerEntryKind::WHOLE_RESULT, info, sig, op, snapshot);
 			if (entry && CanServe(*entry, preserve_order) &&
 			    SubstituteScan(slot, entry, entry->ordered, info.tables, binder, replacer)) {
 				cache.stats.block_hits++;
@@ -295,11 +321,12 @@ struct SubsumptionPass {
 		if (op.type == LogicalOperatorType::LOGICAL_FILTER && sig.Get(op).Cacheable()) {
 			auto shape = ComputeBlockShape(context, op, sig);
 			if (shape.ok) {
-				if (TryHit(slot, shape, sig.Get(op).tables)) {
+				auto &tables = sig.Get(op).tables;
+				if (TryHit(slot, shape, tables)) {
 					replaced = true;
 					return;
 				}
-				if (AdmitBlockWrite(*cache, settings, shape)) {
+				if (AdmitBlockWrite(*cache, settings, shape) && cache->Admissible(tables, snapshot)) {
 					Plant(slot, shape);
 					return;
 				}
@@ -355,6 +382,9 @@ struct SubsumptionPass {
 				continue;
 			}
 			if (!RangeConstraintsImply(shape.constraints, entry->constraints)) {
+				continue;
+			}
+			if (!cache->IsCurrent(*entry, tables, snapshot)) {
 				continue;
 			}
 			if (entry->rows > shape.est_leaf_rows / 2) {
@@ -467,6 +497,30 @@ static unique_ptr<LogicalOperator> *GateStatement(OptimizerExtensionInput &input
 		return nullptr;
 	}
 	auto &root = **root_slot;
+	// announced before the write runs, whatever this session's settings say: a reader that starts after the commit
+	// must never find an entry the cache has not yet heard about (the stamp follows at commit). A database the
+	// statement modifies without a table named here is announced as a whole: DDL, and EXECUTE, whose root
+	// (LOGICAL_EXECUTE) carries the prepared statement's modified databases. PREPARE (LOGICAL_PREPARE) runs
+	// nothing and modifies nothing.
+	auto target = WriteTarget(root);
+	if (target) {
+		client.AnnounceWrite(cache, PendingWrite {target->catalog.GetOid(), TableKey(*target)});
+	}
+	auto &modified = input.optimizer.binder.GetStatementProperties().modified_databases;
+	for (auto &database : modified) {
+		auto catalog = database.second.identity.catalog_oid;
+		if (!target || catalog != target->catalog.GetOid()) {
+			client.AnnounceWrite(cache, PendingWrite {catalog, string()});
+		}
+	}
+	if (target) {
+		cache.stats.announced_table_writes++;
+		return nullptr;
+	}
+	if (!modified.empty()) {
+		cache.stats.skip_modified_databases++;
+		return nullptr;
+	}
 	if (IsModifyingRoot(root.type)) {
 		cache.stats.skip_modifying++;
 		cache.Clear();
@@ -484,13 +538,7 @@ static unique_ptr<LogicalOperator> *GateStatement(OptimizerExtensionInput &input
 		cache.stats.skip_disabled++;
 		return nullptr;
 	}
-	// statements that modify data are detected at bind time; a running write transaction must not be served
-	// from or written into the cache either
-	if (!input.optimizer.binder.GetStatementProperties().modified_databases.empty()) {
-		cache.stats.skip_modified_databases++;
-		cache.Clear();
-		return nullptr;
-	}
+	// a running write transaction must not be served from or written into the cache
 	if (context.transaction.HasActiveTransaction() && MetaTransaction::Get(context).ModifiedDatabase()) {
 		cache.stats.skip_write_transaction++;
 		return nullptr;
@@ -504,7 +552,7 @@ static bool ServeOrPlanWholeResult(OptimizerExtensionInput &input, unique_ptr<Lo
                                    bool preserve_order) {
 	auto &root = *root_slot;
 	auto &root_info = sig.Get(root);
-	auto entry = cache.Lookup(RecyclerEntryKind::WHOLE_RESULT, root_info.hash, sig, root);
+	auto entry = cache.Lookup(RecyclerEntryKind::WHOLE_RESULT, root_info, sig, root, client.snapshot);
 	if (entry && CanServe(*entry, preserve_order)) {
 		ColumnBindingReplacer unused;
 		if (SubstituteScan(root_slot, entry, entry->ordered, root_info.tables, input.optimizer.binder, unused)) {
@@ -515,7 +563,8 @@ static bool ServeOrPlanWholeResult(OptimizerExtensionInput &input, unique_ptr<Lo
 	// unordered results are written by a parallel sink; with preserve_insertion_order that would change the
 	// observable row order, and a serial sink would run the whole pipeline on one thread: neither is acceptable
 	bool writable = root_info.ordered || !preserve_order;
-	if (writable && root_info.est_leaf_rows >= client.settings.min_input_rows) {
+	if (writable && root_info.est_leaf_rows >= client.settings.min_input_rows &&
+	    cache.Admissible(root_info.tables, client.snapshot)) {
 		client.has_pending_whole = true;
 		client.whole_hash = root_info.hash;
 		client.whole_canonical = sig.Render(root);
@@ -527,9 +576,9 @@ static bool ServeOrPlanWholeResult(OptimizerExtensionInput &input, unique_ptr<Lo
 
 //! Nested blocks: sub-queries below the root that equal an earlier whole query
 static void ServeNestedBlocks(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan, LogicalOperator &root,
-                              RecyclerCache &cache, const RecyclerSettings &settings, PlanSignatures &sig,
+                              RecyclerCache &cache, const RecyclerClientState &client, PlanSignatures &sig,
                               bool preserve_order) {
-	BlockMatcher matcher(input.optimizer.binder, cache, settings, sig, preserve_order);
+	BlockMatcher matcher(input.optimizer.binder, cache, client, sig, preserve_order);
 	for (auto &child : root.children) {
 		matcher.Walk(child);
 	}
@@ -597,7 +646,7 @@ void RecyclerPreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOpera
 		}
 	}
 	if (settings.blocks) {
-		ServeNestedBlocks(input, plan, root, cache, settings, sig, preserve_order);
+		ServeNestedBlocks(input, plan, root, cache, client, sig, preserve_order);
 	}
 	if (settings.subsumption && !preserve_order) {
 		// block results are written by a parallel sink, so their row order is arbitrary: only usable when the
@@ -639,7 +688,7 @@ struct SubtreeWalker {
 		bool candidate = !is_root && (force_candidate || IsSubtreeCandidateType(op.type)) && info.Cacheable();
 		if (candidate) {
 			cache->NoteSeen(info.hash);
-			auto entry = cache->Lookup(RecyclerEntryKind::SUBTREE, info.hash, sig, op);
+			auto entry = cache->Lookup(RecyclerEntryKind::SUBTREE, info, sig, op, snapshot);
 			if (entry && SubstituteScan(slot, entry, entry->ordered, info.tables, binder, replacer)) {
 				cache->stats.subtree_hits++;
 				replaced = true;
@@ -647,7 +696,8 @@ struct SubtreeWalker {
 			}
 			bool may_write =
 			    policy == WritePolicy::ALL || (policy == WritePolicy::AGGREGATES_ONLY && IsAggregation(op.type));
-			if (may_write && AdmitSubtreeWrite(context, *cache, settings, op, info, under_delim_lhs, force_candidate)) {
+			if (may_write && AdmitSubtreeWrite(context, *cache, settings, op, info, under_delim_lhs, force_candidate) &&
+			    cache->Admissible(info.tables, snapshot)) {
 				auto spec =
 				    RecyclerWriteSpec::Make(RecyclerEntryKind::SUBTREE, info.hash, sig.Render(op), info.ordered,
 				                            info.est_leaf_rows, TableDependencies(info.tables, snapshot), settings);

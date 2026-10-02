@@ -52,7 +52,7 @@ SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
 1
 
 # ---------------------------------------------------------------------------
-# an INSERT on con2 drops the cache; con1's next query sees the new rows
+# an INSERT on con2 evicts the entries over t, the only table cached so far; con1's next query sees the new rows
 # ---------------------------------------------------------------------------
 statement ok con2
 INSERT INTO t VALUES (20000, 0), (20001, 0);

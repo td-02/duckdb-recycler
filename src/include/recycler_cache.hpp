@@ -13,6 +13,7 @@
 #include <list>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace duckdb {
 
@@ -33,15 +34,36 @@ const char *RecyclerEntryKindName(RecyclerEntryKind kind);
 //! A base table a statement reads, with the state its catalog's transaction had at the pre hook: the start time
 //! says which commits the statement sees, the catalog version which schema
 struct TableDependency {
-	//! "catalog.schema.table"; two tables whose dotted names coincide only share invalidations
+	//! TableKey(): the oid of the attached database, which a database attached again under the same name does not
+	//! share, and the schema and table names
 	string table;
+	//! The oid of the table's attached database
+	idx_t catalog = 0;
 	transaction_t start_time = 0;
 	idx_t catalog_version = 0;
+};
+
+//! A write a statement announced before it ran: one table, every table of a catalog when the hook cannot name the
+//! table the statement writes, or every table of every catalog for a statement that runs without the pre hook
+struct PendingWrite {
+	//! TableDependency::catalog; DConstants::INVALID_INDEX for every catalog
+	idx_t catalog;
+	//! TableDependency::table; empty for the whole catalog
+	string table;
+
+	static PendingWrite Unplanned() {
+		return PendingWrite {DConstants::INVALID_INDEX, string()};
+	}
+	bool IsUnplanned() const {
+		return catalog == DConstants::INVALID_INDEX;
+	}
 };
 
 //! The dependencies of the running statement, one per table of the analyzed plan
 using TableSnapshot = reference_map_t<const TableCatalogEntry, TableDependency>;
 
+//! TableDependency::table of a table, distinct for every table of every attached database
+string TableKey(const TableCatalogEntry &table);
 //! The dependencies of a statement scanning `tables`, read from the transactions of their catalogs
 TableSnapshot TakeTableSnapshot(ClientContext &context, const vector<reference<const TableCatalogEntry>> &tables);
 //! The dependencies of a subtree scanning `tables`, in that order, under the statement's snapshot
@@ -89,6 +111,16 @@ struct CachedEntry {
 
 	//! Benefit density used for eviction: work saved per reuse, per byte held
 	double Benefit() const;
+};
+
+//! What the cache knows about the writes to one table, or to every table of a catalog
+struct TableVersion {
+	//! Transactions that announced a write and have not ended: while any exists, entries over the table (every
+	//! table of the catalog) are neither served nor stored
+	idx_t writers = 0;
+	//! Upper bound of the commit ids that wrote the table (0: no commit since the cache exists). An entry or a
+	//! reader whose start time does not exceed it may miss that commit.
+	transaction_t last_commit = 0;
 };
 
 struct RecyclerSettings {
@@ -144,13 +176,24 @@ struct RecyclerStats {
 	std::atomic<uint64_t> block_stores {0};
 	std::atomic<uint64_t> subsumption_hits {0};
 	std::atomic<uint64_t> clears {0};
+	//! entries evicted because a writer of one of their tables (or of the whole catalog) committed
+	std::atomic<uint64_t> invalidated_entries {0};
+	//! lookups and stores refused by the table versions: an uncommitted writer, a commit the snapshot predates, or
+	//! a catalog the reader does not share
+	std::atomic<uint64_t> blocked_by_version {0};
+	//! write statements whose target table the pre hook named (INSERT, UPDATE, DELETE, MERGE), also when their
+	//! transaction had already announced that table
+	std::atomic<uint64_t> announced_table_writes {0};
 	std::atomic<uint64_t> pre_ns {0};
 	std::atomic<uint64_t> post_ns {0};
 	//! why the pre hook declined to take part (diagnostics)
 	std::atomic<uint64_t> skip_not_query {0};
+	//! statements that change state no table version tracks (ATTACH, DETACH, LOAD, ...) and clear the cache
 	std::atomic<uint64_t> skip_modifying {0};
 	std::atomic<uint64_t> skip_not_read {0};
 	std::atomic<uint64_t> skip_disabled {0};
+	//! statements that modify a database without a table the pre hook can name (DDL, EXECUTE of a prepared write),
+	//! announced for every table of the database
 	std::atomic<uint64_t> skip_modified_databases {0};
 	std::atomic<uint64_t> skip_write_transaction {0};
 	std::atomic<uint64_t> skip_analyze_failed {0};
@@ -161,16 +204,37 @@ struct RecyclerStats {
 
 class RecyclerCache {
 public:
-	//! Look up the entry for the subtree rooted at `op`; a hash match is confirmed by rendering the subtree and
-	//! comparing the canonical byte string
-	shared_ptr<CachedEntry> Lookup(RecyclerEntryKind kind, const SigHash &hash, const PlanSignatures &sig,
-	                               const LogicalOperator &op);
-	//! Insert an entry (never overwrites); evicts lower-benefit entries to respect the budget. Returns success.
+	//! Look up the entry for the subtree rooted at `op` (analyzed as `info`) on behalf of a statement with this
+	//! snapshot; a hash match is confirmed by rendering the subtree and comparing the canonical byte string, and
+	//! the entry must be current for the reader (see IsCurrent)
+	shared_ptr<CachedEntry> Lookup(RecyclerEntryKind kind, const NodeInfo &info, const PlanSignatures &sig,
+	                               const LogicalOperator &op, const TableSnapshot &snapshot);
+	//! Insert an entry (never overwrites); evicts lower-benefit entries to respect the budget. Refused when one of
+	//! its tables has a writer or a commit the entry's snapshot predates. Returns success.
 	bool Store(shared_ptr<CachedEntry> entry, idx_t budget_bytes);
 	//! Insert a BLOCK entry under its shape hash (several entries per shape may coexist)
 	bool StoreBlock(shared_ptr<CachedEntry> entry, idx_t budget_bytes);
-	//! All BLOCK entries with this shape hash
+	//! All BLOCK entries with this shape hash; the caller confirms a match and then asks IsCurrent
 	vector<shared_ptr<CachedEntry>> LookupBlocks(const SigHash &hash) const;
+	//! Whether an entry whose canonical rendering matched the subtree over `tables` answers a statement with this
+	//! snapshot: every table is fresh for the entry and for the reader, and both see the same attached database
+	//! at the same catalog version
+	bool IsCurrent(const CachedEntry &entry, const vector<reference<const TableCatalogEntry>> &tables,
+	               const TableSnapshot &snapshot);
+	//! Whether a statement with this snapshot may store a result over `tables` now (Store checks again when the
+	//! result is ready)
+	bool Admissible(const vector<reference<const TableCatalogEntry>> &tables, const TableSnapshot &snapshot) const;
+
+	//! A transaction is about to write (announced before the write runs, so that no reader can see the commit
+	//! before the cache knows about it)
+	void AnnounceWriter(const PendingWrite &write);
+	//! The writer's transaction committed with a commit id of at most `commit`: entries over the written tables
+	//! whose snapshot does not exceed it are evicted (an unplanned write is never committed: its transaction
+	//! commits the whole database it modified instead). Allocates nothing, since it runs after DuckDB made the
+	//! commit durable.
+	void CommitWriter(const PendingWrite &write, transaction_t commit);
+	//! The writer's transaction rolled back, or wrote nothing the cache can hold. Allocates nothing.
+	void RetractWriter(const PendingWrite &write);
 	//! Account a reuse of an entry (also for entries found through LookupBlocks). Runs outside the cache lock, which is
 	//! why `hits` and `last_used` are atomics
 	void NoteHit(CachedEntry &entry);
@@ -209,9 +273,22 @@ private:
 	shared_ptr<CachedEntry> PickVictim() const;
 	//! Evict until `entry` fits the budget; false when the cache holds more valuable results (caller holds the lock)
 	bool MakeRoom(const CachedEntry &entry, idx_t budget_bytes);
+	//! Adds a stored entry to `dependents` (caller holds the lock)
+	void AddDependents(const CachedEntry &entry);
+	//! Removes the entry from the maps, `dependents` and the accounting; the maps may hold the last reference to it
 	void Erase(const CachedEntry &entry);
 	//! The history of `hash`, created and moved to the front of the LRU order (caller holds the lock)
 	SignatureHistory &History(const SigHash &hash);
+	//! The version of the written table or catalog, created on first use (caller holds the lock)
+	TableVersion &Version(const PendingWrite &write);
+	//! The version of an announced write, which exists since its announcement (caller holds the lock)
+	TableVersion &AnnouncedVersion(const PendingWrite &write);
+	//! An entry the commit of `write` outdates, or nullptr (caller holds the lock)
+	const CachedEntry *FirstStale(const PendingWrite &write, transaction_t commit) const;
+	//! No unplanned writer, no uncommitted writer of the table or its catalog and no commit of either the snapshot
+	//! predates (caller holds the lock)
+	bool Fresh(const TableDependency &dependency) const;
+	bool Fresh(const vector<TableDependency> &dependencies) const;
 
 	using HistoryOrder = std::list<SigHash>;
 	struct HistoryNode {
@@ -226,6 +303,16 @@ private:
 	std::unordered_map<SigHash, HistoryNode, SigHashHasher> history;
 	//! Most recently noted first
 	HistoryOrder history_order;
+	//! By TableDependency::table and by TableDependency::catalog; kept across Clear(), since a reader with an old
+	//! snapshot may store after it. They grow with the tables ever written and the databases ever attached: a
+	//! dropped table keeps its key and a detached database its oid, which is never reused.
+	std::unordered_map<string, TableVersion> versions;
+	std::unordered_map<idx_t, TableVersion> catalog_versions;
+	//! Transactions that ran a statement without the pre hook; only `writers` is used
+	TableVersion unplanned;
+	//! The stored entries over each table, by TableDependency::catalog and TableDependency::table: a commit evicts
+	//! through it without visiting the entries over other tables
+	std::unordered_map<idx_t, std::unordered_map<string, std::unordered_set<const CachedEntry *>>> dependents;
 	idx_t total_bytes = 0;
 	idx_t total_used_bytes = 0;
 	std::atomic<idx_t> sequence {0};
