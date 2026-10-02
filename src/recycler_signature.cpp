@@ -955,6 +955,21 @@ void PlanSignatures::RenderNode(const LogicalOperator &op, const Frame &frame, S
 		auto &scan = op.Cast<LogicalRecyclerScan>();
 		RenderOwnIndex(scan.table_index, frame, sink);
 		sink.Hash(scan.entry->hash);
+		if (scan.entry->kind == RecyclerEntryKind::BLOCK) {
+			// a block entry's hash is its shape's, which several entries of different stored columns share
+			// (StoreBlock keeps one per canonical/conjuncts/columns): render what tells them apart, or two
+			// scans of different stored results render alike
+			sink.Str(scan.entry->canonical);
+			sink.U64(scan.entry->conjuncts.size());
+			for (auto &conjunct : scan.entry->conjuncts) {
+				sink.Str(conjunct);
+			}
+			sink.U64(scan.entry->columns.size());
+			for (auto &column : scan.entry->columns) {
+				sink.U64(column.table);
+				sink.U64(column.column);
+			}
+		}
 		sink.U64(scan.column_ids.size());
 		for (auto col : scan.column_ids) {
 			sink.U64(col);

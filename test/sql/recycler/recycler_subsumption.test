@@ -179,3 +179,40 @@ SELECT g, count(*) AS c FROM t JOIN d ON t.g = d.id JOIN k ON k.id = t.g WHERE y
 
 statement ok
 SET recycler_subsumption = true;
+
+# two block entries of one shape differ only in the columns they store: a subtree over a scan of either must not be
+# keyed by the shape hash alone, or the second query is served the first one's rows
+statement ok
+CREATE TABLE u AS SELECT range AS id, range % 7 AS g, 1990 + range % 30 AS y, range % 5 AS a, range % 11 AS b FROM range(300000)
+
+# stores a block carrying [g, a]
+query II
+SELECT g, sum(a) FROM u JOIN d ON u.g = d.id JOIN k ON k.id = u.g WHERE y IS NOT NULL AND d.id < 3 GROUP BY g ORDER BY g
+----
+0	85716
+1	85714
+2	85716
+
+# block hit: the aggregate above the scan is stored as a subtree
+query II
+SELECT g, sum(a) FROM u JOIN d ON u.g = d.id JOIN k ON k.id = u.g WHERE y IS NOT NULL AND d.id < 3 GROUP BY g ORDER BY g DESC
+----
+2	85716
+1	85714
+0	85716
+
+# same shape, other columns: stores a second block carrying [g, b]
+query II
+SELECT g, sum(b) FROM u JOIN d ON u.g = d.id JOIN k ON k.id = u.g WHERE y IS NOT NULL AND d.id < 3 GROUP BY g ORDER BY g
+----
+0	214287
+1	214281
+2	214282
+
+# block hit over the second entry: the aggregate renders like the one above it, but must not match it
+query II
+SELECT g, sum(b) FROM u JOIN d ON u.g = d.id JOIN k ON k.id = u.g WHERE y IS NOT NULL AND d.id < 3 GROUP BY g ORDER BY g DESC
+----
+2	214282
+1	214281
+0	214287
