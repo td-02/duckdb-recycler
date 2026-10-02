@@ -227,8 +227,9 @@ private:
 	idx_t joins = 0;
 	//! node -> info
 	std::unordered_map<const LogicalOperator *, NodeInfo> infos;
-	//! DynamicTableFilterSet* -> owning join operator
-	std::unordered_map<const void *, const LogicalOperator *> dynamic_owners;
+	//! DynamicTableFilterSet* -> every join that pushes runtime filters into it: JoinFilterPushdownOptimizer gives a
+	//! scan one set that all of them share
+	std::unordered_map<const void *, vector<const LogicalOperator *>> dynamic_owners;
 };
 
 //! Compute the shape of the SPJ block rooted at `root` (a LOGICAL_FILTER on the bound plan); `plan_info` is the

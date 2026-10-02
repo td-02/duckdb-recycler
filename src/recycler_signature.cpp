@@ -360,7 +360,7 @@ void PlanSignatures::CollectDynamicOwners(const LogicalOperator &op) {
 		auto &join = op.Cast<LogicalComparisonJoin>();
 		if (join.filter_pushdown) {
 			for (auto &probe : join.filter_pushdown->probe_info) {
-				dynamic_owners[probe.dynamic_filters.get()] = &op;
+				dynamic_owners[probe.dynamic_filters.get()].push_back(&op);
 			}
 		}
 	}
@@ -678,11 +678,12 @@ void PlanSignatures::RenderNode(const LogicalOperator &op, const Frame &frame, S
 			AnalyzeTableFilter(*entry.second, info);
 		}
 		if (get.dynamic_filters) {
-			auto owner = dynamic_owners.find(get.dynamic_filters.get());
-			if (owner == dynamic_owners.end()) {
+			auto owners = dynamic_owners.find(get.dynamic_filters.get());
+			if (owners == dynamic_owners.end()) {
 				info.runtime_filtered = true;
 			} else {
-				info.pending_dynamic_owners.push_back(owner->second);
+				info.pending_dynamic_owners.insert(info.pending_dynamic_owners.end(), owners->second.begin(),
+				                                   owners->second.end());
 			}
 		}
 		break;
