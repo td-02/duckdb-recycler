@@ -3,7 +3,9 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
+#include "duckdb/transaction/transaction_manager.hpp"
 
 #include <algorithm>
 
@@ -12,6 +14,10 @@ namespace duckdb {
 //===----------------------------------------------------------------------===//
 // Table dependencies
 //===----------------------------------------------------------------------===//
+bool IsTrackedDatabase(AttachedDatabase &db) {
+	return !db.IsSystem() && !db.IsTemporary() && db.GetTransactionManager().IsDuckTransactionManager();
+}
+
 string TableKey(const TableCatalogEntry &table) {
 	// the schema name's length keeps names that contain dots apart: schema "a.b" with table "c" and schema "a" with
 	// table "b.c" would otherwise share a key
@@ -195,17 +201,10 @@ bool RecyclerCache::MakeRoom(const CachedEntry &entry, idx_t budget_bytes) {
 }
 
 TableVersion &RecyclerCache::Version(const PendingWrite &write) {
-	if (write.IsUnplanned()) {
-		return unplanned;
-	}
 	return write.table.empty() ? catalog_versions[write.catalog] : versions[write.table];
 }
 
 TableVersion &RecyclerCache::AnnouncedVersion(const PendingWrite &write) {
-	if (write.IsUnplanned()) {
-		D_ASSERT(unplanned.writers > 0);
-		return unplanned;
-	}
 	if (write.table.empty()) {
 		auto catalog = catalog_versions.find(write.catalog);
 		D_ASSERT(catalog != catalog_versions.end() && catalog->second.writers > 0);
@@ -223,9 +222,6 @@ static bool FreshFor(const TableVersion &version, transaction_t start_time) {
 }
 
 bool RecyclerCache::Fresh(const TableDependency &dependency) const {
-	if (unplanned.writers > 0) {
-		return false;
-	}
 	auto table = versions.find(dependency.table);
 	if (table != versions.end() && !FreshFor(table->second, dependency.start_time)) {
 		return false;
@@ -311,7 +307,6 @@ const CachedEntry *RecyclerCache::FirstStale(const PendingWrite &write, transact
 }
 
 void RecyclerCache::CommitWriter(const PendingWrite &write, transaction_t commit) {
-	D_ASSERT(!write.IsUnplanned());
 	std::lock_guard<std::mutex> guard(lock);
 	auto &version = AnnouncedVersion(write);
 	version.writers--;

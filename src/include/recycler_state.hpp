@@ -75,11 +75,6 @@ struct RecyclerClientState : public ClientContextState {
 	//! The connection holds RecyclerState::predating: it was open at LOAD and has not yet ended the transaction it was
 	//! in
 	bool predates_load = false;
-	//! A commit of a database that no hook announced (an unplanned statement's, committed with it), which the
-	//! connection's next transaction stamps: the commit callback must not allocate the database's version. Until
-	//! then an unplanned writer withholds every entry.
-	idx_t unstamped_catalog = DConstants::INVALID_INDEX;
-	transaction_t unstamped_commit = 0;
 
 	//! Ids of this connection's recycler operators, drawn when the physical plan is built: a profiler node shows
 	//! its operator's id ("Id" among the parameters), which is how QueryEnd tells two entries of one shape apart
@@ -105,15 +100,9 @@ struct RecyclerClientState : public ClientContextState {
 	void NoteTouched(idx_t operator_id, shared_ptr<CachedEntry> entry);
 	//! Adds the write to pending_writes and announces it, unless the transaction already did
 	void AnnounceWrite(RecyclerCache &cache, PendingWrite write);
-	//! Whether the open transaction may have written the catalog without an announcement: it ran an unplanned
-	//! statement, or announced nothing for the catalog, and did not announce the whole catalog
-	bool MayWriteUnannounced(idx_t catalog) const;
-	//! Stamps the commit TransactionCommit could not, and releases the unplanned writer that stood in for it
-	void StampUnstampedCommit(RecyclerCache &cache);
 	//! The connection ended the transaction it was in at LOAD (or closes): it no longer holds RecyclerState::predating
 	void EndPredating(RecyclerState &state);
-	//! Announces an unplanned write for a statement the extension optimizer will not see, and the database the
-	//! transaction modified without an announcement
+	//! Announces every database a statement the extension optimizer will not see may write
 	void QueryBegin(ClientContext &context) override;
 	//! Announces the writes of a statement prepared through the client API, which runs without the pre hook, and
 	//! asks for a rebind when the hooks rewrote its plan

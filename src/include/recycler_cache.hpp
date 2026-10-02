@@ -17,6 +17,7 @@
 
 namespace duckdb {
 
+class AttachedDatabase;
 class ClientContext;
 class TableCatalogEntry;
 
@@ -43,25 +44,21 @@ struct TableDependency {
 	idx_t catalog_version = 0;
 };
 
-//! A write a statement announced before it ran: one table, every table of a catalog when the hook cannot name the
-//! table the statement writes, or every table of every catalog for a statement that runs without the pre hook
+//! A write a statement announced before it ran: one table, or every table of a catalog when no hook can name the
+//! table the statement writes
 struct PendingWrite {
-	//! TableDependency::catalog; DConstants::INVALID_INDEX for every catalog
+	//! TableDependency::catalog
 	idx_t catalog;
 	//! TableDependency::table; empty for the whole catalog
 	string table;
-
-	static PendingWrite Unplanned() {
-		return PendingWrite {DConstants::INVALID_INDEX, string()};
-	}
-	bool IsUnplanned() const {
-		return catalog == DConstants::INVALID_INDEX;
-	}
 };
 
 //! The dependencies of the running statement, one per table of the analyzed plan
 using TableSnapshot = reference_map_t<const TableCatalogEntry, TableDependency>;
 
+//! Whether the cache stamps the commits of the database: a DuckDB database other than the system and temporary ones,
+//! the only databases whose tables the signature accepts
+bool IsTrackedDatabase(AttachedDatabase &db);
 //! TableDependency::table of a table, distinct for every table of every attached database
 string TableKey(const TableCatalogEntry &table);
 //! The dependencies of a statement scanning `tables`, read from the transactions of their catalogs
@@ -232,11 +229,10 @@ public:
 	//! before the cache knows about it)
 	void AnnounceWriter(const PendingWrite &write);
 	//! The writer's transaction committed with a commit id of at most `commit`: entries over the written tables
-	//! whose snapshot does not exceed it are evicted (an unplanned write is never committed: its transaction
-	//! commits the whole database it modified instead). Allocates nothing, since it runs after DuckDB made the
-	//! commit durable.
+	//! whose snapshot does not exceed it are evicted. Allocates nothing, since it runs after DuckDB made the commit
+	//! durable.
 	void CommitWriter(const PendingWrite &write, transaction_t commit);
-	//! The writer's transaction rolled back, or wrote nothing the cache can hold. Allocates nothing.
+	//! The writer's transaction rolled back, or did not write the database. Allocates nothing.
 	void RetractWriter(const PendingWrite &write);
 	//! Account a reuse of an entry (also for entries found through LookupBlocks). Runs outside the cache lock, which is
 	//! why `hits` and `last_used` are atomics
@@ -288,8 +284,8 @@ private:
 	TableVersion &AnnouncedVersion(const PendingWrite &write);
 	//! An entry the commit of `write` outdates, or nullptr (caller holds the lock)
 	const CachedEntry *FirstStale(const PendingWrite &write, transaction_t commit) const;
-	//! No unplanned writer, no uncommitted writer of the table or its catalog and no commit of either the snapshot
-	//! predates (caller holds the lock)
+	//! No uncommitted writer of the table or its catalog and no commit of either the snapshot predates (caller holds
+	//! the lock)
 	bool Fresh(const TableDependency &dependency) const;
 	bool Fresh(const vector<TableDependency> &dependencies) const;
 
@@ -311,8 +307,6 @@ private:
 	//! dropped table keeps its key and a detached database its oid, which is never reused.
 	std::unordered_map<string, TableVersion> versions;
 	std::unordered_map<idx_t, TableVersion> catalog_versions;
-	//! Transactions that ran a statement without the pre hook; only `writers` is used
-	TableVersion unplanned;
 	//! The stored entries over each table, by TableDependency::catalog and TableDependency::table: a commit evicts
 	//! through it without visiting the entries over other tables
 	std::unordered_map<idx_t, std::unordered_map<string, std::unordered_set<const CachedEntry *>>> dependents;

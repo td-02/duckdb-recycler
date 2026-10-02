@@ -656,3 +656,35 @@ SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
 
 statement ok con2
 COMMIT;
+
+# ---------------------------------------------------------------------------
+# (j) an auto-commit write with the optimizer disabled announces every database before it runs and stamps the one it
+# wrote at its commit: a connection that stays idle afterwards stops no other connection from being served
+# ---------------------------------------------------------------------------
+statement ok con2
+PRAGMA disable_optimizer;
+
+statement ok con2
+INSERT INTO a VALUES (40001, 0);
+
+# the commit evicted every entry of the database
+query I con1
+SELECT count(*) FROM recycler_entries()
+----
+0
+
+query II con1 b2
+SELECT g, count(*) AS c FROM b GROUP BY g ORDER BY g
+----
+
+query II con1 b2
+SELECT g, count(*) AS c FROM b GROUP BY g ORDER BY g
+----
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+11
+
+statement ok con2
+PRAGMA enable_optimizer;

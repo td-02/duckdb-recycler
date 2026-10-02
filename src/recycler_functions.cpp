@@ -184,49 +184,21 @@ void RecyclerClientState::AnnounceWrite(RecyclerCache &cache, PendingWrite write
 	cache.AnnounceWriter(pending_writes.back());
 }
 
-bool RecyclerClientState::MayWriteUnannounced(idx_t catalog) const {
-	bool unplanned = false;
-	bool announced = false;
-	for (auto &write : pending_writes) {
-		if (write.catalog == catalog) {
-			if (write.table.empty()) {
-				return false;
-			}
-			announced = true;
-		}
-		unplanned = unplanned || write.IsUnplanned();
-	}
-	return unplanned || !announced;
-}
-
-//! The database the transaction modified, when the cache can stamp its commits (a DuckDB database): writes to the
-//! temporary catalog do not set it, and no entry reads a table of a catalog other than DuckDB's
-static optional_ptr<AttachedDatabase> StampableDatabase(MetaTransaction &transaction) {
-	auto db = transaction.ModifiedDatabase();
-	if (db && !db->GetTransactionManager().IsDuckTransactionManager()) {
-		return nullptr;
-	}
-	return db;
-}
-
 void RecyclerClientState::QueryBegin(ClientContext &context) {
 	// a statement the extension optimizer does not see runs without the pre hook, so which tables it writes is
-	// unknown: until its transaction ends no connection is served or stores, and the whole database the transaction
-	// modified is stamped with its commit (see TransactionCommit for a statement that commits together with it)
-	bool unplanned = !ClientConfig::GetConfig(context).enable_optimizer ||
-	                 Optimizer::OptimizerDisabled(context, OptimizerType::EXTENSION);
-	// a database this transaction may have written without an announcement (by an unplanned statement, or by one
-	// that ran before LOAD registered this state) is announced as a whole before the transaction can commit
-	auto db = StampableDatabase(MetaTransaction::Get(context));
-	if (!unplanned && (!db || !MayWriteUnannounced(db->oid))) {
+	// unknown: every database it may write is announced as a whole, so that until its transaction ends no connection
+	// is served or stores over them, and the commit stamps the one it modified. The optimizer reads
+	// disabled_optimizers again when it runs: a SET GLOBAL on another connection in between lets a write run without
+	// either announcement, and its commit evicts nothing.
+	if (ClientConfig::GetConfig(context).enable_optimizer &&
+	    !Optimizer::OptimizerDisabled(context, OptimizerType::EXTENSION)) {
 		return;
 	}
 	auto &cache = *GetRecyclerState(context)->cache;
-	if (unplanned) {
-		AnnounceWrite(cache, PendingWrite::Unplanned());
-	}
-	if (db && MayWriteUnannounced(db->oid)) {
-		AnnounceWrite(cache, PendingWrite {db->oid, string()});
+	for (auto &database : DatabaseManager::Get(context).GetDatabases(context)) {
+		if (IsTrackedDatabase(*database) && !database->IsReadOnly()) {
+			AnnounceWrite(cache, PendingWrite {database->oid, string()});
+		}
 	}
 }
 
@@ -265,17 +237,6 @@ RebindQueryInfo RecyclerClientState::OnExecutePrepared(ClientContext &context, P
 	return current_rebind;
 }
 
-void RecyclerClientState::StampUnstampedCommit(RecyclerCache &cache) {
-	if (unstamped_catalog == DConstants::INVALID_INDEX) {
-		return;
-	}
-	PendingWrite write {unstamped_catalog, string()};
-	cache.AnnounceWriter(write);
-	cache.CommitWriter(write, unstamped_commit);
-	cache.RetractWriter(PendingWrite::Unplanned());
-	unstamped_catalog = DConstants::INVALID_INDEX;
-}
-
 void RecyclerClientState::EndPredating(RecyclerState &state) {
 	if (!predates_load) {
 		return;
@@ -286,42 +247,31 @@ void RecyclerClientState::EndPredating(RecyclerState &state) {
 
 void RecyclerClientState::TransactionBegin(MetaTransaction &transaction, ClientContext &context) {
 	auto &state = *GetRecyclerState(context);
-	StampUnstampedCommit(*state.cache);
 	// a connection idle at LOAD ended the transaction it was in before this one
 	EndPredating(state);
 	transaction_tracked = state.predating == 0;
 }
 
 void RecyclerClientState::TransactionCommit(MetaTransaction &transaction, ClientContext &context) {
-	// the announcements of writes to a database the cache cannot stamp are only retracted
-	auto db = StampableDatabase(transaction);
-	if (!db && pending_writes.empty() && !predates_load) {
+	if (pending_writes.empty() && !predates_load) {
 		return;
 	}
 	// this runs after DuckDB made the commit durable: nothing here allocates, since a throw would report a failed
 	// commit for a transaction that committed, and leave its writes announced. Every version it settles exists since
-	// the write's announcement.
+	// the write's announcement. A database modified without an announcement is not stamped: one written before LOAD
+	// registered this state, which no tracked transaction predates (RecyclerClientState::transaction_tracked), one
+	// replayed from its WAL while it is attached, over which nothing is cached yet, or one written in the window
+	// QueryBegin describes.
 	auto &state = *GetRecyclerState(context);
 	auto &cache = *state.cache;
-	transaction_t commit = 0;
-	if (db) {
-		// the catalog's DuckTransaction is gone by now (the manager removed it before this callback), so the commit
-		// id is bounded from above by the catalog's last commit, which the manager assigned right after drawing the
-		// id under the same lock
-		commit = DuckTransactionManager::Get(*db).GetLastCommit();
-		// a write that ran before LOAD registered this state needs no stamp: no transaction that began before this
-		// commit is tracked
-		if (MayWriteUnannounced(db->oid) && !predates_load) {
-			// a write no hook announced, by an unplanned statement that committed together with it (QueryBegin
-			// announced the database for every later statement): the tables it wrote are unknown and stamping its
-			// whole database may allocate the database's version, so an unplanned writer (whose version always
-			// exists) withholds every entry until this connection's next transaction stamps the database
-			D_ASSERT(unstamped_catalog == DConstants::INVALID_INDEX);
-			cache.AnnounceWriter(PendingWrite::Unplanned());
-			unstamped_catalog = db->oid;
-			unstamped_commit = commit;
-		}
+	auto db = transaction.ModifiedDatabase();
+	if (db && !IsTrackedDatabase(*db)) {
+		db = nullptr;
 	}
+	// the catalog's DuckTransaction is gone by now (the manager removed it before this callback), so the commit id is
+	// bounded from above by the catalog's last commit, which the manager assigned right after drawing the id under
+	// the same lock
+	auto commit = db ? DuckTransactionManager::Get(*db).GetLastCommit() : 0;
 	for (auto &write : pending_writes) {
 		if (db && write.catalog == db->oid) {
 			cache.CommitWriter(write, commit);
@@ -361,11 +311,9 @@ public:
 	}
 
 	void OnConnectionClosed(ClientContext &context) override {
-		// a connection that closes without another transaction settles what its last one left. LOAD may register a
-		// closing connection: whichever of the two creates its state, the predating count is released.
-		auto &client = RecyclerClientState::Get(context);
-		client.StampUnstampedCommit(*state->cache);
-		client.EndPredating(*state);
+		// a connection open at LOAD may close without another transaction. LOAD may register a closing connection:
+		// whichever of the two creates its state, the predating count is released.
+		RecyclerClientState::Get(context).EndPredating(*state);
 		// cached ColumnDataCollections are buffer-managed. DatabaseInstance destroys the buffer manager before the
 		// DBConfig that (transitively) owns this cache, so the collections must be released while the last
 		// connection closes.
@@ -614,8 +562,7 @@ static void RecyclerClearPragma(ClientContext &context, const FunctionParameters
 //! Whether a transaction (or a checkpoint) is active on a database whose commits the cache stamps
 static bool HasOpenTransaction(DatabaseInstance &db) {
 	for (auto &database : DatabaseManager::Get(db).GetDatabases()) {
-		if (database->IsSystem() || database->IsTemporary() ||
-		    !database->GetTransactionManager().IsDuckTransactionManager()) {
+		if (!IsTrackedDatabase(*database)) {
 			continue;
 		}
 		// the manager sets the lowest active start to a start time while a transaction is active, and to at least
