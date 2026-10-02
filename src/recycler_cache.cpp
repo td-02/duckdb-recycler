@@ -5,6 +5,8 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 
+#include <algorithm>
+
 namespace duckdb {
 
 //===----------------------------------------------------------------------===//
@@ -155,17 +157,15 @@ void RecyclerCache::Erase(const CachedEntry &entry) {
 	total_used_bytes -= entry.used_bytes;
 	if (entry.kind == RecyclerEntryKind::BLOCK) {
 		auto shape = blocks.find(entry.hash);
-		if (shape != blocks.end()) {
-			auto &list = shape->second;
-			for (idx_t i = 0; i < list.size(); i++) {
-				if (list[i].get() == &entry) {
-					list.erase(list.begin() + static_cast<int64_t>(i));
-					break;
-				}
-			}
-			if (list.empty()) {
-				blocks.erase(shape);
-			}
+		D_ASSERT(shape != blocks.end());
+		auto &list = shape->second;
+		auto stored = std::find_if(list.begin(), list.end(), [&](const shared_ptr<CachedEntry> &candidate) {
+			return candidate.get() == &entry;
+		});
+		D_ASSERT(stored != list.end());
+		list.erase(stored);
+		if (list.empty()) {
+			blocks.erase(shape);
 		}
 	} else {
 		auto &map = Map(entry.kind);
