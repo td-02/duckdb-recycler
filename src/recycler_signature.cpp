@@ -954,6 +954,15 @@ void PlanSignatures::RenderNode(const LogicalOperator &op, const Frame &frame, S
 	sink.Tag("}");
 }
 
+static void AddTable(vector<reference<const TableCatalogEntry>> &tables, const TableCatalogEntry &table) {
+	for (auto &existing : tables) {
+		if (&existing.get() == &table) {
+			return;
+		}
+	}
+	tables.push_back(table);
+}
+
 void PlanSignatures::Compute(LogicalOperator &op) {
 	for (auto &child : op.children) {
 		Compute(*child);
@@ -982,14 +991,34 @@ void PlanSignatures::Compute(LogicalOperator &op) {
 				info.pending_dynamic_owners.push_back(owner);
 			}
 		}
+		for (auto &table : child_info.tables) {
+			AddTable(info.tables, table.get());
+		}
 	}
 	// operator-specific derived flags
 	switch (op.type) {
-	case LogicalOperatorType::LOGICAL_GET:
+	case LogicalOperatorType::LOGICAL_GET: {
+		auto table = op.Cast<LogicalGet>().GetTable();
+		if (table) {
+			AddTable(info.tables, *table);
+		}
+		info.est_leaf_rows += op.EstimateCardinality(context);
+		break;
+	}
+	case LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR: {
+		// an entry stored above the scan of an earlier hit is invalidated with the tables behind that hit
+		auto ours = AsRecyclerOperator(op);
+		if (ours && ours->kind == RecyclerOperatorKind::SCAN) {
+			for (auto &table : op.Cast<LogicalRecyclerScan>().tables) {
+				AddTable(info.tables, table.get());
+			}
+		}
+		info.est_leaf_rows += op.EstimateCardinality(context);
+		break;
+	}
 	case LogicalOperatorType::LOGICAL_CHUNK_GET:
 	case LogicalOperatorType::LOGICAL_EXPRESSION_GET:
 	case LogicalOperatorType::LOGICAL_DUMMY_SCAN:
-	case LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR:
 		info.est_leaf_rows += op.EstimateCardinality(context);
 		break;
 	case LogicalOperatorType::LOGICAL_DELIM_GET:

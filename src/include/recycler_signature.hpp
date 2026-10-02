@@ -37,6 +37,7 @@ class ClientContext;
 class Expression;
 class LogicalComparisonJoin;
 class LogicalGet;
+class TableCatalogEntry;
 
 //! 128-bit compositional hash of a subtree
 struct SigHash {
@@ -110,6 +111,9 @@ struct NodeInfo {
 	bool unreliable_estimate = false;
 	//! Owners of dynamic filter sets that some scan in this subtree depends on but which are not in the subtree
 	vector<const LogicalOperator *> pending_dynamic_owners;
+	//! The base tables the subtree reads, each once, in scan order; a RecyclerScan reads those of the subtree it
+	//! replaced
+	vector<reference<const TableCatalogEntry>> tables;
 
 	bool Cacheable() const {
 		return !refused && !external_ref && !unresolved_delim_get && !nondeterministic && !runtime_filtered &&

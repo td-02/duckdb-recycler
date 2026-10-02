@@ -1,6 +1,46 @@
 #include "recycler_cache.hpp"
 
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/transaction/duck_transaction.hpp"
+
 namespace duckdb {
+
+//===----------------------------------------------------------------------===//
+// Table dependencies
+//===----------------------------------------------------------------------===//
+static string TableKey(const TableCatalogEntry &table) {
+	return table.catalog.GetName() + "." + table.schema.name + "." + table.name;
+}
+
+TableSnapshot TakeTableSnapshot(ClientContext &context, const vector<reference<const TableCatalogEntry>> &tables) {
+	TableSnapshot snapshot;
+	for (auto &table_ref : tables) {
+		auto &table = table_ref.get();
+		TableDependency dependency;
+		dependency.table = TableKey(table);
+		if (table.catalog.IsDuckCatalog()) {
+			// every catalog counts its own transactions: the values are only comparable within one catalog, which
+			// is all the per-table checks do
+			auto &transaction = DuckTransaction::Get(context, table.catalog);
+			dependency.start_time = transaction.start_time;
+			dependency.catalog_version = transaction.catalog_version;
+		}
+		snapshot.emplace(table, std::move(dependency));
+	}
+	return snapshot;
+}
+
+vector<TableDependency> TableDependencies(const vector<reference<const TableCatalogEntry>> &tables,
+                                          const TableSnapshot &snapshot) {
+	vector<TableDependency> result;
+	result.reserve(tables.size());
+	for (auto &table : tables) {
+		result.push_back(snapshot.at(table));
+	}
+	return result;
+}
 
 const char *RecyclerEntryKindName(RecyclerEntryKind kind) {
 	switch (kind) {

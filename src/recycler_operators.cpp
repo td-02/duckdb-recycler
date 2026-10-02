@@ -73,9 +73,11 @@ static SourceResultType ScanCollection(const ColumnDataCollection &collection, D
 // LogicalRecyclerScan
 //===----------------------------------------------------------------------===//
 LogicalRecyclerScan::LogicalRecyclerScan(idx_t table_index, vector<LogicalType> types_p,
-                                         shared_ptr<CachedEntry> entry_p, bool ordered, vector<column_t> column_ids_p)
+                                         shared_ptr<CachedEntry> entry_p, bool ordered,
+                                         vector<reference<const TableCatalogEntry>> tables_p,
+                                         vector<column_t> column_ids_p)
     : LogicalRecyclerOperator(RecyclerOperatorKind::SCAN), table_index(table_index), scan_types(std::move(types_p)),
-      entry(std::move(entry_p)), ordered(ordered), column_ids(std::move(column_ids_p)) {
+      entry(std::move(entry_p)), ordered(ordered), tables(std::move(tables_p)), column_ids(std::move(column_ids_p)) {
 	if (column_ids.empty()) {
 		for (idx_t i = 0; i < scan_types.size(); i++) {
 			column_ids.push_back(i);
@@ -118,7 +120,7 @@ vector<idx_t> LogicalRecyclerScan::GetTableIndex() const {
 }
 
 unique_ptr<LogicalOperator> LogicalRecyclerScan::Copy(ClientContext &context) const {
-	auto result = make_uniq<LogicalRecyclerScan>(table_index, scan_types, entry, ordered, column_ids);
+	auto result = make_uniq<LogicalRecyclerScan>(table_index, scan_types, entry, ordered, tables, column_ids);
 	result->types = types;
 	return std::move(result);
 }
@@ -174,13 +176,15 @@ SourceResultType PhysicalRecyclerScan::GetDataInternal(ExecutionContext &context
 // LogicalRecyclerMaterialize
 //===----------------------------------------------------------------------===//
 RecyclerWriteSpec RecyclerWriteSpec::Make(RecyclerEntryKind kind, const SigHash &hash, string canonical, bool ordered,
-                                          idx_t est_input_rows, const RecyclerSettings &settings) {
+                                          idx_t est_input_rows, vector<TableDependency> tables,
+                                          const RecyclerSettings &settings) {
 	RecyclerWriteSpec spec;
 	spec.kind = kind;
 	spec.hash = hash;
 	spec.canonical = std::move(canonical);
 	spec.ordered = ordered;
 	spec.est_input_rows = est_input_rows;
+	spec.tables = std::move(tables);
 	spec.cap_rows = settings.CapRows(kind);
 	spec.cap_bytes = settings.entry_cap_bytes;
 	spec.budget_bytes = settings.budget_bytes;
@@ -366,6 +370,7 @@ SinkFinalizeType PhysicalRecyclerMaterialize::Finalize(Pipeline &pipeline, Event
 	entry->measured_cost_ns = cost_ns;
 	entry->ordered = spec.ordered;
 	entry->est_input_rows = spec.est_input_rows;
+	entry->tables = spec.tables;
 	bool stored;
 	if (spec.kind == RecyclerEntryKind::BLOCK) {
 		entry->columns = spec.columns;

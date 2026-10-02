@@ -43,11 +43,16 @@ struct RecyclerClientState : public ClientContextState {
 	//! The result-affecting session settings as the pre hook read them (PlanSignatures::SettingsSalt); the post hook
 	//! keys the same statement under the same values
 	string settings_salt;
-	//! Whole-result write requested by the pre hook (a miss on an admissible query)
+	//! The tables of the statement's plan with the state of their catalogs' transactions, taken by each hook for
+	//! the plan it analyzes (the transaction is the same in both)
+	TableSnapshot snapshot;
+	//! Whole-result write requested by the pre hook (a miss on an admissible query); the key and the tables are
+	//! those of the bound plan, which later lookups see again
 	bool has_pending_whole = false;
 	SigHash whole_hash;
 	string whole_canonical;
 	idx_t whole_est_input_rows = 0;
+	vector<TableDependency> whole_tables;
 
 	//! Ids of this connection's recycler operators, drawn when the physical plan is built: a profiler node shows
 	//! its operator's id ("Id" among the parameters), which is how QueryEnd tells two entries of one shape apart
@@ -61,9 +66,11 @@ struct RecyclerClientState : public ClientContextState {
 
 	void Reset() {
 		active = false;
+		snapshot.clear();
 		has_pending_whole = false;
 		whole_canonical.clear();
 		whole_est_input_rows = 0;
+		whole_tables.clear();
 	}
 	idx_t NextOperatorId() {
 		return ++operator_ids;

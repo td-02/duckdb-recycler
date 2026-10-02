@@ -4,6 +4,7 @@
 //===----------------------------------------------------------------------===//
 #include "recycler_signature.hpp"
 #include "duckdb/common/common.hpp"
+#include "duckdb/common/reference_map.hpp"
 #include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
@@ -15,6 +16,9 @@
 
 namespace duckdb {
 
+class ClientContext;
+class TableCatalogEntry;
+
 enum class RecyclerEntryKind : uint8_t {
 	//! The complete result of a query (keyed on the pre-optimization plan)
 	WHOLE_RESULT = 0,
@@ -25,6 +29,24 @@ enum class RecyclerEntryKind : uint8_t {
 };
 
 const char *RecyclerEntryKindName(RecyclerEntryKind kind);
+
+//! A base table a statement reads, with the state its catalog's transaction had at the pre hook: the start time
+//! says which commits the statement sees, the catalog version which schema
+struct TableDependency {
+	//! "catalog.schema.table"; two tables whose dotted names coincide only share invalidations
+	string table;
+	transaction_t start_time = 0;
+	idx_t catalog_version = 0;
+};
+
+//! The dependencies of the running statement, one per table of the analyzed plan
+using TableSnapshot = reference_map_t<const TableCatalogEntry, TableDependency>;
+
+//! The dependencies of a statement scanning `tables`, read from the transactions of their catalogs
+TableSnapshot TakeTableSnapshot(ClientContext &context, const vector<reference<const TableCatalogEntry>> &tables);
+//! The dependencies of a subtree scanning `tables`, in that order, under the statement's snapshot
+vector<TableDependency> TableDependencies(const vector<reference<const TableCatalogEntry>> &tables,
+                                          const TableSnapshot &snapshot);
 
 //! One cached, immutable result
 struct CachedEntry {
@@ -40,6 +62,9 @@ struct CachedEntry {
 	bool ordered = false;
 	//! Estimated rows scanned to produce the result (benefit proxy)
 	idx_t est_input_rows = 0;
+	//! The tables the result reads, in NodeInfo::tables order: a canonical match pairs them by position with the
+	//! reader's tables
+	vector<TableDependency> tables;
 	//! Bytes holding rows; `bytes` is the allocation the buffer pool charges
 	idx_t used_bytes = 0;
 	//! Sink() calls that built the collection: many small chunks make the materialization expensive

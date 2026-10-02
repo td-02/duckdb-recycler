@@ -9,9 +9,10 @@ namespace duckdb {
 class Binder;
 class ColumnBindingReplacer;
 
-//! Replace the operator in `slot` by a scan over `entry`, recording the binding replacements. False when the
-//! entry's columns do not match the operator's output.
-bool SubstituteScan(unique_ptr<LogicalOperator> &slot, shared_ptr<CachedEntry> entry, bool ordered, Binder &binder,
+//! Replace the operator in `slot`, which scans `tables`, by a scan over `entry`, recording the binding
+//! replacements. False when the entry's columns do not match the operator's output.
+bool SubstituteScan(unique_ptr<LogicalOperator> &slot, shared_ptr<CachedEntry> entry, bool ordered,
+                    const vector<reference<const TableCatalogEntry>> &tables, Binder &binder,
                     ColumnBindingReplacer &replacer);
 
 //! Wrap the operator in `slot` in a RecyclerMaterialize that writes `spec`. `keep_alive` are column references the

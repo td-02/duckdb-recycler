@@ -105,6 +105,9 @@ static double CollectProfiledOperators(const ProfilingNode &node, vector<Profile
 }
 
 void RecyclerClientState::QueryEnd(ClientContext &context, optional_ptr<ErrorData> error) {
+	// the post hook resets the state, but never runs when an optimizer between the hooks throws: the snapshot's
+	// catalog-entry references must not outlive the statement either way
+	Reset();
 	if (!profiled) {
 		return;
 	}

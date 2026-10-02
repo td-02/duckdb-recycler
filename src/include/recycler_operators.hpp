@@ -49,12 +49,16 @@ class LogicalRecyclerScan : public LogicalRecyclerOperator {
 public:
 	//! `column_ids` selects the stored columns to emit (empty = all, in stored order); `types` are their types
 	LogicalRecyclerScan(idx_t table_index, vector<LogicalType> types, shared_ptr<CachedEntry> entry, bool ordered,
+	                    vector<reference<const TableCatalogEntry>> tables,
 	                    vector<column_t> column_ids = vector<column_t>());
 
 	idx_t table_index;
 	vector<LogicalType> scan_types;
 	shared_ptr<CachedEntry> entry;
 	bool ordered;
+	//! NodeInfo::tables of the subtree the scan replaced: an entry stored above the scan depends on them. The entry
+	//! was current for this statement, so the statement's snapshot of these tables is also the entry's.
+	vector<reference<const TableCatalogEntry>> tables;
 	vector<column_t> column_ids;
 
 public:
@@ -114,6 +118,8 @@ struct RecyclerWriteSpec {
 	//! Write single-threaded in arrival order and replay in that order
 	bool ordered = false;
 	idx_t est_input_rows = 0;
+	//! CachedEntry::tables of the entry to write
+	vector<TableDependency> tables;
 	idx_t cap_rows = 0;
 	idx_t cap_bytes = 0;
 	idx_t budget_bytes = 0;
@@ -127,7 +133,8 @@ struct RecyclerWriteSpec {
 	//! The write of one entry under the session's caps (the kind decides the row cap); BLOCK writes add their shape
 	//! fields afterwards
 	static RecyclerWriteSpec Make(RecyclerEntryKind kind, const SigHash &hash, string canonical, bool ordered,
-	                              idx_t est_input_rows, const RecyclerSettings &settings);
+	                              idx_t est_input_rows, vector<TableDependency> tables,
+	                              const RecyclerSettings &settings);
 };
 
 class LogicalRecyclerMaterialize : public LogicalRecyclerOperator {

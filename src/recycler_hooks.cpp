@@ -217,7 +217,7 @@ struct BlockMatcher {
 		if (info.Cacheable() && info.est_leaf_rows >= settings.min_input_rows && op.children.size() > 0) {
 			auto entry = cache.Lookup(RecyclerEntryKind::WHOLE_RESULT, info.hash, sig, op);
 			if (entry && CanServe(*entry, preserve_order) &&
-			    SubstituteScan(slot, entry, entry->ordered, binder, replacer)) {
+			    SubstituteScan(slot, entry, entry->ordered, info.tables, binder, replacer)) {
 				cache.stats.block_hits++;
 				replaced = true;
 				return;
@@ -266,8 +266,10 @@ static void CollectBindings(const Expression &expr, vector<ColumnBinding> &out) 
 
 struct SubsumptionPass {
 	SubsumptionPass(ClientContext &context, Binder &binder, shared_ptr<RecyclerCache> cache,
-	                const RecyclerSettings &settings, PlanSignatures &sig, LogicalOperator &plan)
-	    : context(context), binder(binder), cache(std::move(cache)), settings(settings), sig(sig), plan(plan) {
+	                const RecyclerSettings &settings, PlanSignatures &sig, const TableSnapshot &snapshot,
+	                LogicalOperator &plan)
+	    : context(context), binder(binder), cache(std::move(cache)), settings(settings), sig(sig), snapshot(snapshot),
+	      plan(plan) {
 	}
 
 	ClientContext &context;
@@ -275,6 +277,7 @@ struct SubsumptionPass {
 	shared_ptr<RecyclerCache> cache;
 	const RecyclerSettings &settings;
 	PlanSignatures &sig;
+	const TableSnapshot &snapshot;
 	LogicalOperator &plan;
 	ColumnBindingReplacer replacer;
 	bool replaced = false;
@@ -292,7 +295,7 @@ struct SubsumptionPass {
 		if (op.type == LogicalOperatorType::LOGICAL_FILTER && sig.Get(op).Cacheable()) {
 			auto shape = ComputeBlockShape(context, op, sig);
 			if (shape.ok) {
-				if (TryHit(slot, shape)) {
+				if (TryHit(slot, shape, sig.Get(op).tables)) {
 					replaced = true;
 					return;
 				}
@@ -325,8 +328,9 @@ struct SubsumptionPass {
 				}
 			}
 		}
-		auto spec = RecyclerWriteSpec::Make(RecyclerEntryKind::BLOCK, shape.hash, std::move(shape.canonical), false,
-		                                    shape.est_leaf_rows, settings);
+		auto spec =
+		    RecyclerWriteSpec::Make(RecyclerEntryKind::BLOCK, shape.hash, std::move(shape.canonical), false,
+		                            shape.est_leaf_rows, TableDependencies(sig.Get(*slot).tables, snapshot), settings);
 		spec.constraints = std::move(shape.constraints);
 		spec.conjuncts = std::move(shape.conjuncts);
 		spec.table_ids = std::move(shape.table_ids);
@@ -334,7 +338,8 @@ struct SubsumptionPass {
 		WrapMaterialize(slot, std::move(spec), cache, std::move(keep_alive));
 	}
 
-	bool TryHit(unique_ptr<LogicalOperator> &slot, const BlockShape &shape) {
+	bool TryHit(unique_ptr<LogicalOperator> &slot, const BlockShape &shape,
+	            const vector<reference<const TableCatalogEntry>> &tables) {
 		auto entries = cache->LookupBlocks(shape.hash);
 		if (entries.empty()) {
 			return false;
@@ -421,7 +426,7 @@ struct SubsumptionPass {
 			}
 			// rewrite: scan of the stored columns, plus the residual predicates
 			auto new_index = binder.GenerateTableIndex();
-			auto scan = make_uniq<LogicalRecyclerScan>(new_index, scan_types, entry, false, scan_columns);
+			auto scan = make_uniq<LogicalRecyclerScan>(new_index, scan_types, entry, false, tables, scan_columns);
 			scan->ResolveOperatorTypes();
 			for (auto &m : mapping) {
 				replacer.replacement_bindings.emplace_back(m.first, ColumnBinding(new_index, m.second));
@@ -502,7 +507,7 @@ static bool ServeOrPlanWholeResult(OptimizerExtensionInput &input, unique_ptr<Lo
 	auto entry = cache.Lookup(RecyclerEntryKind::WHOLE_RESULT, root_info.hash, sig, root);
 	if (entry && CanServe(*entry, preserve_order)) {
 		ColumnBindingReplacer unused;
-		if (SubstituteScan(root_slot, entry, entry->ordered, input.optimizer.binder, unused)) {
+		if (SubstituteScan(root_slot, entry, entry->ordered, root_info.tables, input.optimizer.binder, unused)) {
 			cache.stats.whole_hits++;
 			return true;
 		}
@@ -515,6 +520,7 @@ static bool ServeOrPlanWholeResult(OptimizerExtensionInput &input, unique_ptr<Lo
 		client.whole_hash = root_info.hash;
 		client.whole_canonical = sig.Render(root);
 		client.whole_est_input_rows = root_info.est_leaf_rows;
+		client.whole_tables = TableDependencies(root_info.tables, client.snapshot);
 	}
 	return false;
 }
@@ -535,8 +541,9 @@ static void ServeNestedBlocks(OptimizerExtensionInput &input, unique_ptr<Logical
 //! Subsumption: SPJ blocks served from wider cached blocks, admissible misses planted with a marker
 static void ServeSubsumedBlocks(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan,
                                 unique_ptr<LogicalOperator> &root_slot, RecyclerState &state,
-                                const RecyclerSettings &settings, PlanSignatures &sig) {
-	SubsumptionPass pass(input.context, input.optimizer.binder, state.cache, settings, sig, *plan);
+                                const RecyclerClientState &client, PlanSignatures &sig) {
+	SubsumptionPass pass(input.context, input.optimizer.binder, state.cache, client.settings, sig, client.snapshot,
+	                     *plan);
 	pass.Walk(root_slot);
 	if (pass.replaced) {
 		pass.replacer.VisitOperator(*plan);
@@ -582,6 +589,7 @@ void RecyclerPreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOpera
 		cache.stats.root_not_cacheable++;
 		cache.stats.refused[static_cast<idx_t>(reason)]++;
 	}
+	client.snapshot = TakeTableSnapshot(context, root_info.tables);
 
 	if (settings.whole_result && root_info.Cacheable()) {
 		if (ServeOrPlanWholeResult(input, *root_slot, cache, client, sig, preserve_order)) {
@@ -594,7 +602,7 @@ void RecyclerPreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOpera
 	if (settings.subsumption && !preserve_order) {
 		// block results are written by a parallel sink, so their row order is arbitrary: only usable when the
 		// session does not promise insertion order
-		ServeSubsumedBlocks(input, plan, *root_slot, *state, settings, sig);
+		ServeSubsumedBlocks(input, plan, *root_slot, *state, client, sig);
 	}
 }
 
@@ -608,8 +616,8 @@ enum class WritePolicy : uint8_t { NONE, AGGREGATES_ONLY, ALL };
 
 struct SubtreeWalker {
 	SubtreeWalker(ClientContext &context, Binder &binder, shared_ptr<RecyclerCache> cache,
-	              const RecyclerSettings &settings, PlanSignatures &sig)
-	    : context(context), binder(binder), cache(std::move(cache)), settings(settings), sig(sig) {
+	              const RecyclerSettings &settings, PlanSignatures &sig, const TableSnapshot &snapshot)
+	    : context(context), binder(binder), cache(std::move(cache)), settings(settings), sig(sig), snapshot(snapshot) {
 	}
 
 	ClientContext &context;
@@ -617,6 +625,7 @@ struct SubtreeWalker {
 	shared_ptr<RecyclerCache> cache;
 	const RecyclerSettings &settings;
 	PlanSignatures &sig;
+	const TableSnapshot &snapshot;
 	ColumnBindingReplacer replacer;
 	bool replaced = false;
 
@@ -631,7 +640,7 @@ struct SubtreeWalker {
 		if (candidate) {
 			cache->NoteSeen(info.hash);
 			auto entry = cache->Lookup(RecyclerEntryKind::SUBTREE, info.hash, sig, op);
-			if (entry && SubstituteScan(slot, entry, entry->ordered, binder, replacer)) {
+			if (entry && SubstituteScan(slot, entry, entry->ordered, info.tables, binder, replacer)) {
 				cache->stats.subtree_hits++;
 				replaced = true;
 				return;
@@ -639,8 +648,9 @@ struct SubtreeWalker {
 			bool may_write =
 			    policy == WritePolicy::ALL || (policy == WritePolicy::AGGREGATES_ONLY && IsAggregation(op.type));
 			if (may_write && AdmitSubtreeWrite(context, *cache, settings, op, info, under_delim_lhs, force_candidate)) {
-				auto spec = RecyclerWriteSpec::Make(RecyclerEntryKind::SUBTREE, info.hash, sig.Render(op), info.ordered,
-				                                    info.est_leaf_rows, settings);
+				auto spec =
+				    RecyclerWriteSpec::Make(RecyclerEntryKind::SUBTREE, info.hash, sig.Render(op), info.ordered,
+				                            info.est_leaf_rows, TableDependencies(info.tables, snapshot), settings);
 				cache->stats.writes_planned++;
 				WrapMaterialize(slot, std::move(spec), cache);
 				// below the wrapper: hits, and at most one more nested aggregation
@@ -681,8 +691,8 @@ struct SubtreeWalker {
 //! Subtrees: exact hits replace subtrees, admissible misses get a RecyclerMaterialize
 static void RewriteSubtrees(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan,
                             unique_ptr<LogicalOperator> &root_slot, RecyclerState &state,
-                            const RecyclerSettings &settings, PlanSignatures &sig) {
-	SubtreeWalker walker(input.context, input.optimizer.binder, state.cache, settings, sig);
+                            const RecyclerClientState &client, PlanSignatures &sig) {
+	SubtreeWalker walker(input.context, input.optimizer.binder, state.cache, client.settings, sig, client.snapshot);
 	walker.Walk(root_slot, true, WritePolicy::ALL, false, false);
 	if (walker.replaced) {
 		walker.replacer.VisitOperator(*plan);
@@ -699,9 +709,9 @@ static void WriteWholeResult(OptimizerExtensionInput &input, unique_ptr<LogicalO
 	}
 	// an ordered result is written by a serial sink (only the sort's output stage is serialized) and replayed in
 	// that order; anything else is written and replayed in parallel
-	auto spec =
-	    RecyclerWriteSpec::Make(RecyclerEntryKind::WHOLE_RESULT, client.whole_hash, std::move(client.whole_canonical),
-	                            root_info.ordered, client.whole_est_input_rows, settings);
+	auto spec = RecyclerWriteSpec::Make(RecyclerEntryKind::WHOLE_RESULT, client.whole_hash,
+	                                    std::move(client.whole_canonical), root_info.ordered,
+	                                    client.whole_est_input_rows, std::move(client.whole_tables), settings);
 	state.cache->stats.writes_planned++;
 	WrapMaterialize(root_slot, std::move(spec), state.cache);
 }
@@ -724,11 +734,9 @@ void RecyclerOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator
 	auto settings = client.settings;
 
 	auto root_slot = FindQueryRoot(plan);
-	if (!root_slot) {
-		return;
-	}
-	if (AsRecyclerOperator(**root_slot)) {
-		// whole-result hit at the pre hook
+	if (!root_slot || AsRecyclerOperator(**root_slot)) {
+		// nothing to rewrite: the pre hook served the whole result
+		client.Reset();
 		return;
 	}
 	cache->stats.post_calls++;
@@ -741,13 +749,15 @@ void RecyclerOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator
 		plan->ResolveOperatorTypes();
 		sig.Analyze(**root_slot);
 	} catch (std::exception &) {
+		client.Reset();
 		return;
 	}
 	// the root's analysis (rewrites below the root do not touch the analysis map)
 	const auto &root_info = sig.Get(**root_slot);
+	client.snapshot = TakeTableSnapshot(context, root_info.tables);
 
 	if (settings.subtrees) {
-		RewriteSubtrees(input, plan, *root_slot, *state, settings, sig);
+		RewriteSubtrees(input, plan, *root_slot, *state, client, sig);
 	}
 	if (settings.whole_result && client.has_pending_whole) {
 		WriteWholeResult(input, *root_slot, *state, client, settings, root_info);

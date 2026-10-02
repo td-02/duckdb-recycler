@@ -13,7 +13,8 @@
 
 namespace duckdb {
 
-bool SubstituteScan(unique_ptr<LogicalOperator> &slot, shared_ptr<CachedEntry> entry, bool ordered, Binder &binder,
+bool SubstituteScan(unique_ptr<LogicalOperator> &slot, shared_ptr<CachedEntry> entry, bool ordered,
+                    const vector<reference<const TableCatalogEntry>> &tables, Binder &binder,
                     ColumnBindingReplacer &replacer) {
 	auto &old_op = *slot;
 	if (old_op.types != entry->types) {
@@ -23,7 +24,8 @@ bool SubstituteScan(unique_ptr<LogicalOperator> &slot, shared_ptr<CachedEntry> e
 	if (old_bindings.size() != entry->types.size()) {
 		return false;
 	}
-	auto scan = make_uniq<LogicalRecyclerScan>(binder.GenerateTableIndex(), old_op.types, std::move(entry), ordered);
+	auto scan = make_uniq<LogicalRecyclerScan>(binder.GenerateTableIndex(), old_op.types, std::move(entry), ordered,
+	                                           tables);
 	scan->ResolveOperatorTypes();
 	auto new_bindings = scan->GetColumnBindings();
 	for (idx_t i = 0; i < old_bindings.size(); i++) {
