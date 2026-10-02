@@ -688,3 +688,57 @@ SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
 
 statement ok con2
 PRAGMA enable_optimizer;
+
+# ---------------------------------------------------------------------------
+# (k) the cache keeps the version of a written table while a transaction may predate its commit, and forgets it at a
+# later commit of the database; a write to a temporary table creates no version, since no entry reads one
+# ---------------------------------------------------------------------------
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'versions'
+----
+0
+
+statement ok con1
+BEGIN TRANSACTION;
+
+query I con1
+SELECT count(*) FROM b
+----
+20003
+
+statement ok con2
+INSERT INTO a VALUES (40002, 0);
+
+# the database's version and a's
+query I con2
+SELECT value FROM recycler_stats() WHERE name = 'versions'
+----
+2
+
+statement ok con1
+COMMIT;
+
+statement ok con2
+INSERT INTO b VALUES (40003, 0);
+
+query I con2
+SELECT value FROM recycler_stats() WHERE name = 'versions'
+----
+0
+
+statement ok con2
+CREATE TEMP TABLE scratch (id INTEGER);
+
+statement ok con2
+BEGIN TRANSACTION;
+
+statement ok con2
+INSERT INTO scratch VALUES (1);
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'versions'
+----
+0
+
+statement ok con2
+COMMIT;

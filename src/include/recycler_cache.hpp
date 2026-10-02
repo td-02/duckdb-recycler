@@ -19,6 +19,7 @@ namespace duckdb {
 
 class AttachedDatabase;
 class ClientContext;
+class DuckTransactionManager;
 class TableCatalogEntry;
 
 enum class RecyclerEntryKind : uint8_t {
@@ -115,10 +116,17 @@ struct TableVersion {
 	//! Transactions that announced a write and have not ended: while any exists, entries over the table (every
 	//! table of the catalog) are neither served nor stored
 	idx_t writers = 0;
-	//! Upper bound of the commit ids that wrote the table (0: no commit since the cache exists; a transaction older
+	//! Upper bound of the commit ids that wrote the table (0: no commit since the version exists; a transaction older
 	//! than the cache is refused by its connection, see RecyclerClientState::transaction_tracked). An entry or a
 	//! reader whose start time does not exceed it may miss that commit.
 	transaction_t last_commit = 0;
+};
+
+//! The versions of one attached database: of the database as a whole, and of each table a statement named
+struct CatalogVersions {
+	TableVersion whole;
+	//! By TableDependency::table
+	std::unordered_map<string, TableVersion> tables;
 };
 
 struct RecyclerSettings {
@@ -234,6 +242,10 @@ public:
 	void CommitWriter(const PendingWrite &write, transaction_t commit);
 	//! The writer's transaction rolled back, or did not write the database. Allocates nothing.
 	void RetractWriter(const PendingWrite &write);
+	//! Drops the versions of the catalog that no snapshot needs any more: without a writer, and with no commit a
+	//! transaction of `manager` (the catalog's) can predate. Called after a commit of the catalog; allocates
+	//! nothing.
+	void ForgetCommits(idx_t catalog, const DuckTransactionManager &manager);
 	//! Account a reuse of an entry (also for entries found through LookupBlocks). Runs outside the cache lock, which is
 	//! why `hits` and `last_used` are atomics
 	void NoteHit(CachedEntry &entry);
@@ -258,6 +270,8 @@ public:
 	idx_t TotalBytes() const;
 	idx_t UsedBytes() const;
 	idx_t EntryCount() const;
+	//! The databases and tables the cache holds a version for
+	idx_t VersionCount() const;
 	vector<shared_ptr<CachedEntry>> Entries() const;
 
 	static constexpr idx_t HISTORY_BOUND = 4096;
@@ -278,10 +292,15 @@ private:
 	void Erase(const CachedEntry &entry);
 	//! The history of `hash`, created and moved to the front of the LRU order (caller holds the lock)
 	SignatureHistory &History(const SigHash &hash);
+	using VersionMap = std::unordered_map<idx_t, CatalogVersions>;
 	//! The version of the written table or catalog, created on first use (caller holds the lock)
 	TableVersion &Version(const PendingWrite &write);
-	//! The version of an announced write, which exists since its announcement (caller holds the lock)
-	TableVersion &AnnouncedVersion(const PendingWrite &write);
+	//! The version of an announced write in its catalog's versions, which exist since the announcement (caller holds
+	//! the lock)
+	static TableVersion &AnnouncedVersion(CatalogVersions &catalog, const PendingWrite &write);
+	//! Erases the versions of the catalog without a writer and whose last commit is 0 or below
+	//! `lowest_active_start`, and the catalog's versions once none remains (caller holds the lock)
+	void Forget(VersionMap::iterator catalog, transaction_t lowest_active_start);
 	//! An entry the commit of `write` outdates, or nullptr (caller holds the lock)
 	const CachedEntry *FirstStale(const PendingWrite &write, transaction_t commit) const;
 	//! No uncommitted writer of the table or its catalog and no commit of either the snapshot predates (caller holds
@@ -302,11 +321,11 @@ private:
 	std::unordered_map<SigHash, HistoryNode, SigHashHasher> history;
 	//! Most recently noted first
 	HistoryOrder history_order;
-	//! By TableDependency::table and by TableDependency::catalog; kept across Clear(), since a reader with an old
-	//! snapshot may store after it. They grow with the tables ever written and the databases ever attached: a
-	//! dropped table keeps its key and a detached database its oid, which is never reused.
-	std::unordered_map<string, TableVersion> versions;
-	std::unordered_map<idx_t, TableVersion> catalog_versions;
+	//! By TableDependency::catalog; kept across Clear(), since a reader with an old snapshot may store after it. A
+	//! version lives while a writer is announced and, after its commit, while a transaction of its catalog may
+	//! predate the commit: a commit of the catalog forgets the others (ForgetCommits). The versions of a detached
+	//! database stay, since none of its commits follows.
+	VersionMap versions;
 	//! The stored entries over each table, by TableDependency::catalog and TableDependency::table: a commit evicts
 	//! through it without visiting the entries over other tables
 	std::unordered_map<idx_t, std::unordered_map<string, std::unordered_set<const CachedEntry *>>> dependents;

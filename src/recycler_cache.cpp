@@ -5,6 +5,7 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
+#include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "duckdb/transaction/transaction_manager.hpp"
 
 #include <algorithm>
@@ -201,17 +202,17 @@ bool RecyclerCache::MakeRoom(const CachedEntry &entry, idx_t budget_bytes) {
 }
 
 TableVersion &RecyclerCache::Version(const PendingWrite &write) {
-	return write.table.empty() ? catalog_versions[write.catalog] : versions[write.table];
+	auto &catalog = versions[write.catalog];
+	return write.table.empty() ? catalog.whole : catalog.tables[write.table];
 }
 
-TableVersion &RecyclerCache::AnnouncedVersion(const PendingWrite &write) {
+TableVersion &RecyclerCache::AnnouncedVersion(CatalogVersions &catalog, const PendingWrite &write) {
 	if (write.table.empty()) {
-		auto catalog = catalog_versions.find(write.catalog);
-		D_ASSERT(catalog != catalog_versions.end() && catalog->second.writers > 0);
-		return catalog->second;
+		D_ASSERT(catalog.whole.writers > 0);
+		return catalog.whole;
 	}
-	auto table = versions.find(write.table);
-	D_ASSERT(table != versions.end() && table->second.writers > 0);
+	auto table = catalog.tables.find(write.table);
+	D_ASSERT(table != catalog.tables.end() && table->second.writers > 0);
 	return table->second;
 }
 
@@ -222,12 +223,16 @@ static bool FreshFor(const TableVersion &version, transaction_t start_time) {
 }
 
 bool RecyclerCache::Fresh(const TableDependency &dependency) const {
-	auto table = versions.find(dependency.table);
-	if (table != versions.end() && !FreshFor(table->second, dependency.start_time)) {
+	auto catalog = versions.find(dependency.catalog);
+	if (catalog == versions.end()) {
+		return true;
+	}
+	if (!FreshFor(catalog->second.whole, dependency.start_time)) {
 		return false;
 	}
-	auto catalog = catalog_versions.find(dependency.catalog);
-	return catalog == catalog_versions.end() || FreshFor(catalog->second, dependency.start_time);
+	auto &tables = catalog->second.tables;
+	auto table = tables.find(dependency.table);
+	return table == tables.end() || FreshFor(table->second, dependency.start_time);
 }
 
 bool RecyclerCache::Fresh(const vector<TableDependency> &dependencies) const {
@@ -308,7 +313,9 @@ const CachedEntry *RecyclerCache::FirstStale(const PendingWrite &write, transact
 
 void RecyclerCache::CommitWriter(const PendingWrite &write, transaction_t commit) {
 	std::lock_guard<std::mutex> guard(lock);
-	auto &version = AnnouncedVersion(write);
+	auto catalog_versions = versions.find(write.catalog);
+	D_ASSERT(catalog_versions != versions.end());
+	auto &version = AnnouncedVersion(catalog_versions->second, write);
 	version.writers--;
 	// two writers of one table read their stamps before taking this lock, so the later caller may hold the
 	// smaller one
@@ -322,7 +329,42 @@ void RecyclerCache::CommitWriter(const PendingWrite &write, transaction_t commit
 
 void RecyclerCache::RetractWriter(const PendingWrite &write) {
 	std::lock_guard<std::mutex> guard(lock);
-	AnnouncedVersion(write).writers--;
+	auto catalog = versions.find(write.catalog);
+	D_ASSERT(catalog != versions.end());
+	AnnouncedVersion(catalog->second, write).writers--;
+	// a version no commit stamped holds nothing; a stamped one is forgotten by a later commit of its catalog
+	Forget(catalog, 0);
+}
+
+static bool Forgettable(const TableVersion &version, transaction_t lowest_active_start) {
+	return version.writers == 0 && (version.last_commit == 0 || version.last_commit < lowest_active_start);
+}
+
+void RecyclerCache::Forget(VersionMap::iterator catalog, transaction_t lowest_active_start) {
+	auto &tables = catalog->second.tables;
+	for (auto table = tables.begin(); table != tables.end();) {
+		if (Forgettable(table->second, lowest_active_start)) {
+			table = tables.erase(table);
+		} else {
+			++table;
+		}
+	}
+	if (tables.empty() && Forgettable(catalog->second.whole, lowest_active_start)) {
+		versions.erase(catalog);
+	}
+}
+
+void RecyclerCache::ForgetCommits(idx_t catalog, const DuckTransactionManager &manager) {
+	std::lock_guard<std::mutex> guard(lock);
+	auto catalog_versions = versions.find(catalog);
+	if (catalog_versions == versions.end()) {
+		return;
+	}
+	// read under this lock, after the stamps it is compared with: a transaction that began before one of their
+	// commits and is still active holds the lowest start down, and one that begins later starts after them all. A
+	// commit no active transaction predates is in every snapshot from now on, and its commit evicted the entries
+	// that predate it.
+	Forget(catalog_versions, manager.LowestActiveStart());
 }
 
 bool RecyclerCache::Store(shared_ptr<CachedEntry> entry, idx_t budget_bytes) {
@@ -501,6 +543,15 @@ idx_t RecyclerCache::EntryCount() const {
 	idx_t count = whole.size() + subtrees.size();
 	for (auto &shape : blocks) {
 		count += shape.second.size();
+	}
+	return count;
+}
+
+idx_t RecyclerCache::VersionCount() const {
+	std::lock_guard<std::mutex> guard(lock);
+	idx_t count = 0;
+	for (auto &catalog : versions) {
+		count += 1 + catalog.second.tables.size();
 	}
 	return count;
 }

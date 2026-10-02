@@ -184,6 +184,16 @@ void RecyclerClientState::AnnounceWrite(RecyclerCache &cache, PendingWrite write
 	cache.AnnounceWriter(pending_writes.back());
 }
 
+void RecyclerClientState::AnnounceDatabase(ClientContext &context, RecyclerCache &cache, const string &name,
+                                           idx_t catalog) {
+	// writes to the temporary and the system database, and to foreign ones, invalidate nothing: no entry reads their
+	// tables
+	auto db = DatabaseManager::Get(context).GetDatabase(context, name);
+	if (db && IsTrackedDatabase(*db)) {
+		AnnounceWrite(cache, PendingWrite {catalog, string()});
+	}
+}
+
 void RecyclerClientState::QueryBegin(ClientContext &context) {
 	// a statement the extension optimizer does not see runs without the pre hook, so which tables it writes is
 	// unknown: every database it may write is announced as a whole, so that until its transaction ends no connection
@@ -222,7 +232,7 @@ RebindQueryInfo RecyclerClientState::OnExecutePrepared(ClientContext &context, P
 	if (!modified.empty()) {
 		auto &cache = *GetRecyclerState(context)->cache;
 		for (auto &database : modified) {
-			AnnounceWrite(cache, PendingWrite {database.second.identity.catalog_oid, string()});
+			AnnounceDatabase(context, cache, database.first, database.second.identity.catalog_oid);
 		}
 	}
 	// the hooks rewrote the plan under the snapshot of the transaction that prepared it: a scan would keep serving
@@ -280,6 +290,9 @@ void RecyclerClientState::TransactionCommit(MetaTransaction &transaction, Client
 		}
 	}
 	pending_writes.clear();
+	if (db) {
+		cache.ForgetCommits(db->oid, DuckTransactionManager::Get(*db));
+	}
 	EndPredating(state);
 }
 
@@ -389,6 +402,7 @@ static unique_ptr<GlobalTableFunctionState> RecyclerStatsInit(ClientContext &con
 		add("root_not_cacheable", s.root_not_cacheable);
 		add("swap_bytes", BufferManager::GetBufferManager(context).GetUsedSwap());
 		add("history_entries", cache.HistorySize());
+		add("versions", cache.VersionCount());
 		for (idx_t reason = 1; reason < static_cast<idx_t>(RefusalReason::COUNT); reason++) {
 			result->rows.emplace_back(string("refused_") + RefusalReasonName(static_cast<RefusalReason>(reason)),
 			                          int64_t(s.refused[reason].load()));

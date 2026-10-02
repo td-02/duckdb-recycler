@@ -28,6 +28,7 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/query_profiler.hpp"
@@ -499,14 +500,14 @@ static unique_ptr<LogicalOperator> *GateStatement(OptimizerExtensionInput &input
 	// statement modifies as modified, and so commits them.
 	auto &statement = plan->type == LogicalOperatorType::LOGICAL_EXPLAIN ? *plan->children[0] : *plan;
 	auto target = WriteTarget(statement);
-	if (target) {
+	if (target && IsTrackedDatabase(target->catalog.GetAttached())) {
 		client.AnnounceWrite(cache, PendingWrite {target->catalog.GetOid(), TableKey(*target)});
 	}
 	auto &modified = input.optimizer.binder.GetStatementProperties().modified_databases;
 	for (auto &database : modified) {
 		auto catalog = database.second.identity.catalog_oid;
 		if (!target || catalog != target->catalog.GetOid()) {
-			client.AnnounceWrite(cache, PendingWrite {catalog, string()});
+			client.AnnounceDatabase(context, cache, database.first, catalog);
 		}
 	}
 	auto root_slot = FindQueryRoot(plan);

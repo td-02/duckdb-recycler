@@ -100,6 +100,9 @@ struct RecyclerClientState : public ClientContextState {
 	void NoteTouched(idx_t operator_id, shared_ptr<CachedEntry> entry);
 	//! Adds the write to pending_writes and announces it, unless the transaction already did
 	void AnnounceWrite(RecyclerCache &cache, PendingWrite write);
+	//! Announces a write to every table of a database a statement modifies (StatementProperties::modified_databases),
+	//! when the cache tracks the database
+	void AnnounceDatabase(ClientContext &context, RecyclerCache &cache, const string &name, idx_t catalog);
 	//! The connection ended the transaction it was in at LOAD (or closes): it no longer holds RecyclerState::predating
 	void EndPredating(RecyclerState &state);
 	//! Announces every database a statement the extension optimizer will not see may write
