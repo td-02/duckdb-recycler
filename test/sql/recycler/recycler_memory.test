@@ -4,8 +4,10 @@
 
 require waddle
 
+# One thread: a parallel sink allocates a 256 KB block per writer thread that receives rows, so with several
+# threads an entry's size, and with it every eviction below, depends on scheduling and on the machine.
 statement ok
-SET threads = 4;
+SET threads = 1;
 
 statement ok
 SET recycler_min_input_rows = 1;
@@ -51,11 +53,10 @@ whole_hits	0
 writes_planned	1
 
 # ---------------------------------------------------------------------------
-# results of 20000 rows take two 256 KB blocks each: two of them fill the 1 MB budget exactly, the
-# third evicts the least recently used one. Each query also materializes its aggregate as a subtree,
-# which finishes first: the first one is stored and then evicted by its own query's whole result
-# (same benefit, older), the later ones are rejected because the whole results in the cache save more
-# work per byte.
+# a whole result of 20000 rows takes two 256 KB blocks, the aggregate below it (stored as a subtree, and
+# finished first) one block: the first query's pair fits the 1 MB budget. From then on every new pair has to
+# make room: entries with less benefit per byte are evicted, and a store is rejected when the cache only holds
+# more valuable results.
 # ---------------------------------------------------------------------------
 query II
 SELECT g, count(*) AS c FROM big WHERE h = 0 GROUP BY g ORDER BY g
@@ -63,14 +64,15 @@ SELECT g, count(*) AS c FROM big WHERE h = 0 GROUP BY g ORDER BY g
 40000 values hashing to 17817d3a78c3ca2953704778a019fb00
 
 query III
-SELECT kind, rows, bytes FROM recycler_entries()
+SELECT kind, rows, bytes FROM recycler_entries() ORDER BY kind
 ----
+subtree	20000	262136
 whole_result	20000	524272
 
 query II
 SELECT name, value FROM recycler_stats() WHERE name IN ('evictions', 'store_rejected', 'subtree_stores', 'whole_stores') ORDER BY name
 ----
-evictions	1
+evictions	0
 store_rejected	0
 subtree_stores	1
 whole_stores	1
@@ -85,8 +87,8 @@ SELECT name, value FROM recycler_stats() WHERE name IN ('entries', 'bytes', 'evi
 ----
 bytes	1048544
 entries	2
-evictions	1
-store_rejected	1
+evictions	2
+store_rejected	0
 
 query II
 SELECT g, count(*) AS c FROM big WHERE h = 2 GROUP BY g ORDER BY g
@@ -98,8 +100,8 @@ SELECT name, value FROM recycler_stats() WHERE name IN ('entries', 'bytes', 'evi
 ----
 bytes	1048544
 entries	2
-evictions	2
-store_rejected	2
+evictions	3
+store_rejected	1
 
 query II
 SELECT g, count(*) AS c FROM big WHERE h = 3 GROUP BY g ORDER BY g
@@ -116,8 +118,8 @@ SELECT name, value FROM recycler_stats() WHERE name IN ('entries', 'bytes', 'evi
 ----
 bytes	1048544
 entries	2
-evictions	4
-store_rejected	4
+evictions	5
+store_rejected	3
 whole_stores	5
 
 # ---------------------------------------------------------------------------
@@ -143,8 +145,8 @@ SELECT name, value FROM recycler_stats() WHERE name IN ('entries', 'bytes', 'evi
 ----
 bytes	1048544
 entries	2
-evictions	6
-store_rejected	6
+evictions	7
+store_rejected	5
 whole_hits	1
 whole_stores	7
 
@@ -177,11 +179,11 @@ SELECT g, count(*) AS c FROM big WHERE h = 4 GROUP BY g ORDER BY g
 ----
 40000 values hashing to cfb81360f3fa31f453b684e33e9fbbec
 
-# the cleared cache is empty again, so the subtree is stored first and evicted by the whole result
+# the cleared cache is empty again, so the query's subtree and whole result both fit
 query II
 SELECT name, value FROM recycler_stats() WHERE name IN ('entries', 'bytes', 'evictions', 'whole_hits') ORDER BY name
 ----
-bytes	524272
-entries	1
+bytes	786408
+entries	2
 evictions	7
 whole_hits	1

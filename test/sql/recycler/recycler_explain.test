@@ -37,6 +37,8 @@ SELECT value FROM recycler_stats() WHERE name = 'writes_planned'
 # ---------------------------------------------------------------------------
 # whole-result hit: the profile is a complete JSON document with a single RECYCLER_SCAN
 # ---------------------------------------------------------------------------
+# Within one profile node the order of operator_name and extra_info follows the standard library's hash map
+# (libc++ and libstdc++ differ), so the patterns accept both; a node's children always follow its own fields.
 query II
 SELECT g, count(*) FROM t GROUP BY g ORDER BY g
 ----
@@ -51,7 +53,7 @@ SELECT g, count(*) FROM t GROUP BY g ORDER BY g
 query II
 EXPLAIN (ANALYZE, FORMAT JSON) SELECT g, count(*) FROM t GROUP BY g ORDER BY g
 ----
-analyzed_plan	<REGEX>:(?s).*"latency": [0-9].*"operator_name": "RECYCLER_SCAN".*"Kind": "whole_result".*"Rows": "7".*"Ordered": "true".*
+analyzed_plan	<REGEX>:(?s).*"latency": [0-9].*(?:"operator_name": "RECYCLER_SCAN".*"Kind": "whole_result".*"Rows": "7".*"Ordered": "true"|"Kind": "whole_result".*"Rows": "7".*"Ordered": "true".*"operator_name": "RECYCLER_SCAN").*
 
 query II
 EXPLAIN (ANALYZE, FORMAT JSON) SELECT g, count(*) FROM t GROUP BY g ORDER BY g
@@ -80,7 +82,7 @@ role6	2857
 query II
 EXPLAIN (ANALYZE, FORMAT JSON) SELECT d.role, count(*) FROM t JOIN d ON t.g = d.id GROUP BY d.role ORDER BY d.role DESC
 ----
-analyzed_plan	<REGEX>:(?s).*"latency": [0-9].*"operator_name": "ORDER_BY".*"operator_name": "RECYCLER_SCAN".*"Kind": "subtree".*"Rows": "7".*
+analyzed_plan	<REGEX>:(?s).*"latency": [0-9].*"operator_name": "ORDER_BY".*(?:"operator_name": "RECYCLER_SCAN".*"Kind": "subtree".*"Rows": "7"|"Kind": "subtree".*"Rows": "7".*"operator_name": "RECYCLER_SCAN").*
 
 query II
 EXPLAIN (ANALYZE, FORMAT JSON) SELECT d.role, count(*) FROM t JOIN d ON t.g = d.id GROUP BY d.role ORDER BY d.role DESC
