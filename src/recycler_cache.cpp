@@ -100,7 +100,6 @@ void RecyclerCache::Erase(const CachedEntry &entry) {
 	D_ASSERT(total_bytes >= entry.bytes && total_used_bytes >= entry.used_bytes);
 	total_bytes -= entry.bytes;
 	total_used_bytes -= entry.used_bytes;
-	stats.evictions++;
 }
 
 bool RecyclerCache::MakeRoom(const CachedEntry &entry, idx_t budget_bytes) {
@@ -117,6 +116,7 @@ bool RecyclerCache::MakeRoom(const CachedEntry &entry, idx_t budget_bytes) {
 			return false;
 		}
 		Erase(*victim);
+		stats.evictions++;
 	}
 	return true;
 }
