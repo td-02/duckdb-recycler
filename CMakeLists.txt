@@ -14,7 +14,7 @@ set(EXTENSION_SOURCES
     src/recycler_operators.cpp     # RecyclerScan (hit) and RecyclerMaterialize (miss) operators
     src/recycler_policy.cpp        # serving and admission decisions
     src/recycler_rewrite.cpp       # plan rewrites: scan substitution, materialize wrapping, block finalization
-    src/recycler_hooks.cpp         # pre-/post-optimizer passes: orchestration of gate, analysis, mechanisms
+    src/recycler_hooks.cpp         # pre-/post-optimizer passes: matching, admission, rewrites
     src/recycler_functions.cpp     # settings, recycler_stats()/recycler_entries(), PRAGMA recycler_clear
 )
 
