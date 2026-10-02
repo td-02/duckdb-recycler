@@ -26,7 +26,9 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/filter/optional_filter.hpp"
 #include "duckdb/planner/filter/struct_filter.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
@@ -200,30 +202,54 @@ static void Refuse(NodeInfo &info, RefusalReason reason) {
 	}
 }
 
-static bool ContainsDynamicFilter(const TableFilter &filter) {
+//! Refuse a function whose result is not a function of its rendered arguments alone, whatever its children
+static void RefuseFunction(const BoundFunctionExpression &func, NodeInfo &info) {
+	if (func.function.GetStability() != FunctionStability::CONSISTENT) {
+		Refuse(info, RefusalReason::VOLATILE_FUNCTION);
+	} else if (func.function.name == "current_setting") {
+		// CONSISTENT, but CurrentSettingBind folds the named setting's value into bind data, which is rendered only
+		// as current_setting('name'): the result is a function of the session, not of the arguments
+		Refuse(info, RefusalReason::SESSION_BOUND_FUNCTION);
+	}
+}
+
+//! A table filter is rendered as text only: a dynamic filter marks the scan as runtime filtered, and the functions
+//! of an expression filter (a predicate on one column pushed into the scan) are refused as RenderExpression refuses
+//! them anywhere else
+static void AnalyzeTableFilter(const TableFilter &filter, NodeInfo &info) {
 	switch (filter.filter_type) {
 	case TableFilterType::DYNAMIC_FILTER:
-		return true;
+		info.runtime_filtered = true;
+		break;
+	case TableFilterType::EXPRESSION_FILTER:
+		ExpressionIterator::VisitExpression<BoundFunctionExpression>(
+		    *filter.Cast<ExpressionFilter>().expr,
+		    [&](const BoundFunctionExpression &func) { RefuseFunction(func, info); });
+		break;
 	case TableFilterType::OPTIONAL_FILTER: {
 		auto &opt = filter.Cast<OptionalFilter>();
-		return opt.child_filter && ContainsDynamicFilter(*opt.child_filter);
+		if (opt.child_filter) {
+			AnalyzeTableFilter(*opt.child_filter, info);
+		}
+		break;
 	}
 	case TableFilterType::CONJUNCTION_AND:
 	case TableFilterType::CONJUNCTION_OR: {
 		auto &conj = static_cast<const ConjunctionFilter &>(filter);
 		for (auto &child : conj.child_filters) {
-			if (ContainsDynamicFilter(*child)) {
-				return true;
-			}
+			AnalyzeTableFilter(*child, info);
 		}
-		return false;
+		break;
 	}
 	case TableFilterType::STRUCT_EXTRACT: {
 		auto &sf = filter.Cast<StructFilter>();
-		return sf.child_filter && ContainsDynamicFilter(*sf.child_filter);
+		if (sf.child_filter) {
+			AnalyzeTableFilter(*sf.child_filter, info);
+		}
+		break;
 	}
 	default:
-		return false;
+		break;
 	}
 }
 
@@ -263,7 +289,7 @@ idx_t RecyclerEstimateRowWidth(const vector<LogicalType> &types) {
 //! of the same "/" function without bind data (BindBinaryFloatingPoint). Everything else that affects a result is
 //! bound into the plan and rendered: integer_division is a parser option ("/" becomes "//"), collations, search_path
 //! and casts are in the operators; threads and memory_limit change speed only. current_setting(), whose bind data
-//! holds the value of whichever setting it names, is refused instead (RenderExpression). The values are read once
+//! holds the value of whichever setting it names, is refused instead (RefuseFunction). The values are read once
 //! per statement after binding, so a SET GLOBAL on another connection between the bind and the pre hook is not
 //! detected, as for the recycler's own settings (RecyclerClientState::settings_loaded). Documented in the README; a
 //! new entry here needs a sqllogictest.
@@ -442,13 +468,7 @@ void PlanSignatures::RenderExpression(const Expression &expr, const Frame &frame
 	}
 	case ExpressionClass::BOUND_FUNCTION: {
 		auto &func = expr.Cast<BoundFunctionExpression>();
-		if (func.function.GetStability() != FunctionStability::CONSISTENT) {
-			Refuse(info, RefusalReason::VOLATILE_FUNCTION);
-		} else if (func.function.name == "current_setting") {
-			// CONSISTENT, but CurrentSettingBind folds the named setting's value into bind data, which is rendered
-			// below only as current_setting('name'): the result is a function of the session, not of the arguments
-			Refuse(info, RefusalReason::SESSION_BOUND_FUNCTION);
-		}
+		RefuseFunction(func, info);
 		sink.Str(func.function.name);
 		sink.Bool(func.is_operator);
 		sink.U64(func.children.size());
@@ -637,9 +657,7 @@ void PlanSignatures::RenderNode(const LogicalOperator &op, const Frame &frame, S
 			sink.U64(entry.first);
 			sink.U8(static_cast<uint8_t>(entry.second->filter_type));
 			sink.Str(entry.second->ToString("c"));
-			if (ContainsDynamicFilter(*entry.second)) {
-				info.runtime_filtered = true;
-			}
+			AnalyzeTableFilter(*entry.second, info);
 		}
 		if (get.dynamic_filters) {
 			auto owner = dynamic_owners.find(get.dynamic_filters.get());

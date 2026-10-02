@@ -1,0 +1,57 @@
+# name: test/sql/recycler/recycler_session_functions.test
+# description: a function whose result depends on the session or the transaction is refused wherever the plan holds it, including in a predicate pushed into a scan
+# group: [recycler]
+
+require waddle
+
+statement ok
+SET threads = 4;
+
+statement ok
+SET recycler_min_input_rows = 1;
+
+statement ok
+CREATE SCHEMA other;
+
+statement ok
+CREATE TABLE t AS
+SELECT range AS id, range % 7 AS g, CASE WHEN range % 2 = 0 THEN 'main' ELSE 'other' END AS s
+FROM range(20000);
+
+# ---------------------------------------------------------------------------
+# in_search_path() is CONSISTENT_WITHIN_QUERY; on one column it is pushed into the scan as an expression filter, whose
+# rendered text does not hold the search path: the scan and every subtree over it are refused, and the query after
+# the SET gets vanilla's rows, not those cached under the other search path
+# ---------------------------------------------------------------------------
+query II
+SELECT g, count(*) AS c FROM t WHERE in_search_path(current_database(), s) GROUP BY g ORDER BY g
+----
+0	1429
+1	1428
+2	1429
+3	1428
+4	1429
+5	1428
+6	1429
+
+statement ok
+SET search_path = 'other,main';
+
+query II
+SELECT g, count(*) AS c FROM t WHERE in_search_path(current_database(), s) GROUP BY g ORDER BY g
+----
+0	2858
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+query II
+SELECT name, value FROM recycler_stats()
+WHERE name IN ('refused_volatile_function', 'subtree_stores', 'whole_stores') ORDER BY name
+----
+refused_volatile_function	2
+subtree_stores	0
+whole_stores	0
