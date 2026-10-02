@@ -186,3 +186,56 @@ SELECT kind, rows, bytes FROM recycler_entries() WHERE rows = 0
 ----
 whole_result	0	0
 whole_result	0	0
+
+# ---------------------------------------------------------------------------
+# compaction: an aggregate of 5,000 rows over every type, written by four threads, is kept in memory allocated
+# with the data rather than in buffer blocks and replayed by a parallel scan; a narrow ordered result of three
+# chunks replays its stored order. Both are identical to an uncached run. (A wide ordered result stays in its
+# single writer's blocks, which are smaller than the in-memory allocation of 2,048-row vectors.)
+# ---------------------------------------------------------------------------
+statement ok
+PRAGMA recycler_clear;
+
+statement ok
+SET recycler_enabled = false;
+
+query IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII nosort by_id_desc
+SELECT id, any_value(COLUMNS(* EXCLUDE (id))) FROM all_types GROUP BY id ORDER BY id DESC
+----
+
+query II nosort by_s_short
+SELECT s_short, id FROM all_types ORDER BY s_short DESC, id DESC
+----
+
+statement ok
+SET recycler_enabled = true;
+
+statement ok
+SELECT id, any_value(COLUMNS(* EXCLUDE (id))) FROM all_types GROUP BY id ORDER BY id
+
+query II nosort by_s_short
+SELECT s_short, id FROM all_types ORDER BY s_short DESC, id DESC
+----
+
+# the aggregate and the narrow result are compacted (no longer a whole number of 262,136-byte blocks); the wide
+# ordered whole result of the aggregate's query is not
+query III
+SELECT kind, ordered, bytes % 262136 <> 0 FROM recycler_entries() ORDER BY ALL
+----
+subtree	false	true
+whole_result	true	false
+whole_result	true	true
+
+query IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII nosort by_id_desc
+SELECT id, any_value(COLUMNS(* EXCLUDE (id))) FROM all_types GROUP BY id ORDER BY id DESC
+----
+
+query II nosort by_s_short
+SELECT s_short, id FROM all_types ORDER BY s_short DESC, id DESC
+----
+
+query II
+SELECT name, value FROM recycler_stats() WHERE name IN ('subtree_hits', 'whole_hits') ORDER BY name
+----
+subtree_hits	2
+whole_hits	6

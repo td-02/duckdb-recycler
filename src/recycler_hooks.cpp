@@ -88,6 +88,7 @@ RecyclerSettings LoadRecyclerSettings(ClientContext &context) {
 	s.min_input_rows = GetIntSetting(context, "recycler_min_input_rows", s.min_input_rows);
 	s.speculate_bytes =
 	    GetIntSetting(context, "recycler_speculate_mb", s.speculate_bytes / (1024 * 1024)) * 1024 * 1024;
+	s.compact_rows = GetIntSetting(context, "recycler_compact_rows", s.compact_rows);
 	return s;
 }
 

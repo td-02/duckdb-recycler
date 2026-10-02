@@ -141,6 +141,7 @@ struct RecyclerSettings {
 	idx_t whole_cap_rows = 1000000;
 	idx_t min_input_rows = 200000;
 	idx_t speculate_bytes = 64ULL * 1024 * 1024;
+	idx_t compact_rows = 8192;
 
 	//! The row cap of an entry of this kind
 	idx_t CapRows(RecyclerEntryKind kind) const {

@@ -1,6 +1,7 @@
 #include "recycler_operators.hpp"
 #include "recycler_state.hpp"
 
+#include "duckdb/common/allocator.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/types/column/column_data_scan_states.hpp"
 #include "duckdb/execution/execution_context.hpp"
@@ -195,6 +196,7 @@ RecyclerWriteSpec RecyclerWriteSpec::Make(RecyclerEntryKind kind, const SigHash 
 	spec.cap_rows = settings.CapRows(kind);
 	spec.cap_bytes = settings.entry_cap_bytes;
 	spec.budget_bytes = settings.budget_bytes;
+	spec.compact_rows = settings.compact_rows;
 	return spec;
 }
 
@@ -353,10 +355,33 @@ SinkCombineResultType PhysicalRecyclerMaterialize::Combine(ExecutionContext &con
 	return SinkCombineResultType::FINISHED;
 }
 
+//! The rows of `collection`, in order, in a collection on the in-memory allocator, which grows with the data: a
+//! buffer-managed collection holds at least one block per writer thread however few rows it has
+static shared_ptr<ColumnDataCollection> CompactCollection(ClientContext &context,
+                                                          const ColumnDataCollection &collection) {
+	auto result = make_shared_ptr<ColumnDataCollection>(Allocator::Get(context), collection.Types());
+	ColumnDataAppendState append_state;
+	result->InitializeAppend(append_state);
+	for (auto &chunk : collection.Chunks()) {
+		result->Append(append_state, chunk);
+	}
+	return result;
+}
+
 SinkFinalizeType PhysicalRecyclerMaterialize::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
                                                        OperatorSinkFinalizeInput &input) const {
 	auto &gstate = input.global_state.Cast<RecyclerMaterializeGlobalSinkState>();
 	auto rows = gstate.collection->Count();
+	if (rows <= spec.compact_rows) {
+		auto compacted = CompactCollection(context, *gstate.collection);
+		// the in-memory allocator doubles its allocations from the first vector's size, so a few wide chunks can take
+		// more than the blocks they filled. The source re-emits the kept collection: the other one is released here.
+		if (compacted->AllocationSize() < gstate.collection->AllocationSize()) {
+			gstate.collection = std::move(compacted);
+		}
+	}
+	// the caps and the budget charge the allocated bytes, not the used ones: the allocation is what the buffer pool
+	// (or the allocator, for a compacted entry) holds for the entry, whatever part of it the rows fill
 	idx_t bytes = gstate.collection->AllocationSize();
 	auto cost_ns = gstate.ElapsedNs();
 	bool too_big = gstate.too_big || rows > spec.cap_rows || bytes > spec.cap_bytes;

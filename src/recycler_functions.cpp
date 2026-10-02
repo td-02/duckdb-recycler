@@ -658,6 +658,9 @@ void LoadRecycler(ExtensionLoader &loader) {
 	config.AddExtensionOption("recycler_speculate_mb",
 	                          "Largest estimated result (MB) materialized on first sight, before a repeat is seen",
 	                          LogicalType::BIGINT, Value::BIGINT(int64_t(defaults.speculate_bytes / (1024 * 1024))));
+	config.AddExtensionOption("recycler_compact_rows",
+	                          "Largest entry in rows kept in memory sized to its data rather than in buffer blocks",
+	                          LogicalType::BIGINT, Value::BIGINT(int64_t(defaults.compact_rows)));
 
 	loader.RegisterFunction(TableFunction("recycler_stats", {}, RecyclerStatsFunction, RecyclerStatsBind,
 	                                      RecyclerStatsInit));

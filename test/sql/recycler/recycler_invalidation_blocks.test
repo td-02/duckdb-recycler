@@ -214,10 +214,10 @@ evictions	0
 store_rejected	0
 
 statement ok con1
-SET recycler_budget_mb = 2;
+SET recycler_budget_mb = 1;
 
-# the block over y in 2016..2019 has the shape of the stored one and does not fit: its store evicts the stored block
-# and the cheaper aggregate, and is refused by the next victim
+# the block over y in 2016..2019 (768 KiB) has the shape of the stored one and does not fit next to the compacted
+# small results (0.5 MiB): its store evicts the stored block and is refused by the next victim
 query II con1
 SELECT g, count(*) AS c FROM t JOIN d ON t.g = d.id JOIN k ON k.id = t.g WHERE y BETWEEN 2016 AND 2019 AND d.id < 3 GROUP BY g ORDER BY g
 ----
@@ -229,13 +229,13 @@ query II con1
 SELECT name, value FROM recycler_stats() WHERE name IN ('block_stores', 'evictions', 'store_rejected') ORDER BY name
 ----
 block_stores	4
-evictions	3
+evictions	1
 store_rejected	1
 
 query II con1
 SELECT kind, count(*) FROM recycler_entries() GROUP BY kind ORDER BY kind
 ----
-subtree	3
+subtree	5
 whole_result	5
 
 # the cache stays usable: once the budget allows it, a block of the shape is stored again

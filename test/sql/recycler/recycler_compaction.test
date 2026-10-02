@@ -1,0 +1,135 @@
+# name: test/sql/recycler/recycler_compaction.test
+# description: entries of at most recycler_compact_rows rows are kept in allocations sized to their data, larger ones in buffer blocks; both are served unchanged, in order and in parallel
+# group: [recycler]
+
+require waddle
+
+statement ok
+SET threads = 4;
+
+statement ok
+SET recycler_min_input_rows = 1;
+
+statement ok
+CREATE TABLE src AS SELECT range AS id, range % 100000 AS g, range % 20 AS h FROM range(200000);
+
+# ---------------------------------------------------------------------------
+# 50 tiny results of 1 to 19 rows, each stored as a whole result and as its aggregate. In buffer blocks every
+# entry would hold at least one block of 262,136 bytes, 26 MB for the 100; compacted, each holds its two
+# 2,048-row vectors in 96 KiB
+# ---------------------------------------------------------------------------
+loop i 0 50
+
+statement ok
+SELECT id % (${i} % 20 + 1) AS k, count(*) AS c FROM src WHERE h <> ${i} % 7 GROUP BY k ORDER BY k
+
+endloop
+
+query II
+SELECT name, value FROM recycler_stats() WHERE name IN ('entries', 'whole_stores') ORDER BY name
+----
+entries	100
+whole_stores	50
+
+query IIII
+SELECT min(rows), max(rows), max(bytes), bool_and(used_bytes <= bytes) FROM recycler_entries()
+----
+1	19	98304	true
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'bytes'
+----
+9830400
+
+# served from the compacted entries
+loop i 0 50
+
+statement ok
+SELECT id % (${i} % 20 + 1) AS k, count(*) AS c FROM src WHERE h <> ${i} % 7 GROUP BY k ORDER BY k
+
+endloop
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+50
+
+query II
+SELECT id % (6 % 20 + 1) AS k, count(*) AS c FROM src WHERE h <> 6 % 7 GROUP BY k ORDER BY k
+----
+0	27144
+1	27144
+2	27144
+3	27142
+4	27142
+5	27142
+6	27142
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+51
+
+# recycler_compact_rows = 0 keeps every non-empty entry in buffer blocks
+statement ok
+PRAGMA recycler_clear;
+
+statement ok
+SET recycler_compact_rows = 0;
+
+statement ok
+SELECT id % 3 AS k, count(*) AS c FROM src GROUP BY k ORDER BY k
+
+query III
+SELECT kind, rows, bytes % 262136 FROM recycler_entries() ORDER BY kind
+----
+subtree	3	0
+whole_result	3	0
+
+statement ok
+RESET recycler_compact_rows;
+
+# ---------------------------------------------------------------------------
+# a 100,000-row aggregate stays in buffer blocks (whole blocks of 262,136 bytes): its ordered whole result is
+# served in order, its subtree entry by a parallel scan under another ORDER BY
+# ---------------------------------------------------------------------------
+statement ok
+PRAGMA recycler_clear;
+
+statement ok
+SET recycler_enabled = false;
+
+query II nosort by_g
+SELECT g, count(*) AS c FROM src GROUP BY g ORDER BY g
+----
+
+query II nosort by_g_desc
+SELECT g, count(*) AS c FROM src GROUP BY g ORDER BY g DESC
+----
+
+statement ok
+SET recycler_enabled = true;
+
+query II nosort by_g
+SELECT g, count(*) AS c FROM src GROUP BY g ORDER BY g
+----
+
+query IIII
+SELECT kind, ordered, bytes >= 262136, bytes % 262136 FROM recycler_entries() ORDER BY kind
+----
+subtree	false	true	0
+whole_result	true	true	0
+
+query II nosort by_g
+SELECT g, count(*) AS c FROM src GROUP BY g ORDER BY g
+----
+
+query II nosort by_g_desc
+SELECT g, count(*) AS c FROM src GROUP BY g ORDER BY g DESC
+----
+
+query II
+SELECT name, value FROM recycler_stats() WHERE name IN ('subtree_hits', 'whole_hits') ORDER BY name
+----
+subtree_hits	1
+whole_hits	52

@@ -138,6 +138,7 @@ struct RecyclerWriteSpec {
 	idx_t cap_rows = 0;
 	idx_t cap_bytes = 0;
 	idx_t budget_bytes = 0;
+	idx_t compact_rows = 0;
 	//! BLOCK writes: the block's constraints and conjunct renderings (from the pre hook), the table_index ->
 	//! canonical id map used to resolve column identities, and the identities themselves (filled by the post hook)
 	vector<RangeConstraint> constraints;
