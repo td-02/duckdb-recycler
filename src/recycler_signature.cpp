@@ -300,14 +300,16 @@ idx_t RecyclerEstimateRowWidth(const vector<LogicalType> &types) {
 //! Session settings that change a query's result although the renderer sees the same plan: ICU reads TimeZone and
 //! Calendar into function bind data (not rendered), list_sort's family (list_sort, list_reverse_sort, list_grade_up)
 //! resolves its ORDER_DEFAULT through default_order and default_null_order into bind data (an ORDER BY clause is
-//! resolved by the binder, so a sort's direction is in the operator), and ieee_floating_point_ops swaps the callback
-//! of the same "/" function without bind data (BindBinaryFloatingPoint). Everything else that affects a result is
-//! bound into the plan and rendered: integer_division is a parser option ("/" becomes "//"), collations, search_path
-//! and casts are in the operators; threads and memory_limit change speed only. current_setting(), whose bind data
-//! holds the value of whichever setting it names, is refused instead (IsSessionBound). The values are read once
-//! per statement after binding, so a SET GLOBAL on another connection between the bind and the pre hook is not
-//! detected, as for the recycler's own settings (RecyclerClientState::settings_loaded). Documented in the README; a
-//! new entry here needs a sqllogictest.
+//! resolved by the binder, so a sort's direction is in the operator), and ieee_floating_point_ops swaps the callback of
+//! the same "/" function without bind data (BindBinaryFloatingPoint). scalar_subquery_error_on_multiple_rows is read by
+//! the hash table of a SINGLE join (a correlated scalar subquery) at execution: a second match is an error under true
+//! and dropped under false (the planner reads it too, for an uncorrelated subquery, into the plan). Everything else
+//! that affects a result is bound into the plan and rendered: integer_division is a parser option ("/" becomes "//"),
+//! collations, search_path and casts are in the operators; threads and memory_limit change speed only.
+//! current_setting(), whose bind data holds the value of whichever setting it names, is refused instead
+//! (IsSessionBound). The values are read once per statement after binding, so a SET GLOBAL on another connection
+//! between the bind and the pre hook is not detected, as for the recycler's own settings
+//! (RecyclerClientState::settings_loaded). Documented in the README; a new entry here needs a sqllogictest.
 static const char *const ICU_SETTINGS[] = {"TimeZone", "Calendar"};
 
 string PlanSignatures::SettingsSalt(const ClientContext &context) {
@@ -321,6 +323,7 @@ string PlanSignatures::SettingsSalt(const ClientContext &context) {
 	sink.Bool(Settings::Get<IeeeFloatingPointOpsSetting>(context));
 	sink.U8(static_cast<uint8_t>(Settings::Get<DefaultOrderSetting>(context)));
 	sink.U8(static_cast<uint8_t>(Settings::Get<DefaultNullOrderSetting>(context)));
+	sink.Bool(Settings::Get<ScalarSubqueryErrorOnMultipleRowsSetting>(context));
 	return salt;
 }
 

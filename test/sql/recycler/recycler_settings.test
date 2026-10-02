@@ -1,5 +1,5 @@
 # name: test/sql/recycler/recycler_settings.test
-# description: the result-affecting settings the renderer cannot see (ieee_floating_point_ops, default_order, default_null_order) are part of every key; current_setting() is refused; integer_division is in the plan
+# description: the result-affecting settings the renderer cannot see (ieee_floating_point_ops, default_order, default_null_order, scalar_subquery_error_on_multiple_rows) are part of every key; current_setting() is refused; integer_division is in the plan
 # group: [recycler]
 
 require waddle
@@ -489,3 +489,54 @@ query I
 SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
 ----
 12
+
+# ---------------------------------------------------------------------------
+# scalar_subquery_error_on_multiple_rows is read at execution by the hash table of the SINGLE join a correlated scalar
+# subquery becomes: under false the second match of g = 0 is dropped, under true it is an error. The entry stored
+# under false is served under false, and never under true
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE s AS SELECT range % 7 AS id, 'v' || (range % 7) AS v FROM range(8);
+
+statement ok
+SET scalar_subquery_error_on_multiple_rows = false;
+
+query IIT
+SELECT g, count(*) AS c, (SELECT s.v FROM s WHERE s.id = t.g) AS v FROM t GROUP BY g ORDER BY g
+----
+0	2858	v0
+1	2857	v1
+2	2857	v2
+3	2857	v3
+4	2857	v4
+5	2857	v5
+6	2857	v6
+
+query IIT
+SELECT g, count(*) AS c, (SELECT s.v FROM s WHERE s.id = t.g) AS v FROM t GROUP BY g ORDER BY g
+----
+0	2858	v0
+1	2857	v1
+2	2857	v2
+3	2857	v3
+4	2857	v4
+5	2857	v5
+6	2857	v6
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+13
+
+statement ok
+SET scalar_subquery_error_on_multiple_rows = true;
+
+statement error
+SELECT g, count(*) AS c, (SELECT s.v FROM s WHERE s.id = t.g) AS v FROM t GROUP BY g ORDER BY g
+----
+More than one row returned by a subquery used as an expression
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+13

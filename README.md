@@ -179,11 +179,12 @@ non-DuckDB catalogs (attached SQLite/Postgres/... databases change outside DuckD
 without ORDER BY, runtime (dynamic) filters owned outside the subtree, or references into a delim join's other
 side are never cached; any statement that modifies data or the catalog clears the cache, and nothing is cached
 or served inside a transaction that has written. The values of the result-affecting session settings `TimeZone`,
-`Calendar`, `ieee_floating_point_ops`, `default_order` and `default_null_order` (the settings that change a result at
-execution time without changing the bound plan: ICU and the `list_sort` family read them into function bind data, and
-the flag picks the division callback; `integer_division` is a parser option and an ORDER BY clause is resolved by the
-binder, so both already change the plan) are part of every key, so a statement is never served an entry computed under
-other values. Functions DuckDB declares consistent although their result depends on the session or the transaction
+`Calendar`, `ieee_floating_point_ops`, `default_order`, `default_null_order` and
+`scalar_subquery_error_on_multiple_rows` (the settings that change a result at execution time without changing the
+bound plan: ICU and the `list_sort` family read them into function bind data, the flag picks the division callback,
+and the hash table of a correlated scalar subquery's join reads the last one; `integer_division` is a parser option and
+an ORDER BY clause is resolved by the binder, so both already change the plan) are part of every key, so a statement is
+never served an entry computed under other values. Functions DuckDB declares consistent although their result depends on the session or the transaction
 are refused: `current_setting()`, whose bind data holds the value of whichever setting it names, `age()` with one
 argument, which measures from the transaction's start date, and ICU's `current_localtimestamp()` and
 `current_localtime()`, which hold the transaction's start. Cached collections are buffer-managed and bounded by
