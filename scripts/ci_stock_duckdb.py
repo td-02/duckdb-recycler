@@ -9,7 +9,8 @@ connection holding the same deterministic tables; the rows must be identical as 
 queries make meaningful by ordering on a key. The recycler must also report at least one whole-result
 hit, otherwise a silently inactive extension would pass. The parameterized queries run through
 executemany, which prepares once and executes the prepared statement: the client-API path (also taken by
-the C API and JDBC) that the sqllogictest runner, which sends SQL text, cannot reach.
+the C API and JDBC) that the sqllogictest runner, which sends SQL text, cannot reach. So does LOAD inside an
+explicit transaction next to an idle connection, after which the cache must serve once that transaction ends.
 """
 
 import sys
@@ -44,15 +45,23 @@ PARAMETERIZED = [
 
 
 def connect(extension_path):
+    """Returns the connection, and the idle one opened before LOAD"""
     con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
     con.execute("SET threads = 4")
-    if extension_path is not None:
-        con.load_extension(extension_path)
-        # the synthetic tables are far below the default admission floor
-        con.execute("SET recycler_min_input_rows = 1000")
     for statement in TABLES:
         con.execute(statement)
-    return con
+    if extension_path is None:
+        return con, None
+    # LOAD runs inside a transaction, next to an idle connection: neither may keep the cache off once the
+    # transaction ends
+    idle = con.cursor()
+    con.execute("BEGIN TRANSACTION")
+    con.execute("SELECT count(*) FROM t").fetchall()
+    con.load_extension(extension_path)
+    con.execute("COMMIT")
+    # the synthetic tables are far below the default admission floor
+    con.execute("SET recycler_min_input_rows = 1000")
+    return con, idle
 
 
 def mismatches(sql, plain, recycled, run):
@@ -68,8 +77,8 @@ def mismatches(sql, plain, recycled, run):
 
 
 def main(extension_path):
-    plain = connect(None)
-    recycled = connect(extension_path)
+    plain, _ = connect(None)
+    recycled, idle = connect(extension_path)
     print("duckdb", plain.execute("PRAGMA version").fetchone())
     print("extension", recycled.execute(
         "SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'waddle'").fetchone())

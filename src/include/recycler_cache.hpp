@@ -202,7 +202,7 @@ struct RecyclerStats {
 	//! announced for every table of the database
 	std::atomic<uint64_t> skip_modified_databases {0};
 	std::atomic<uint64_t> skip_write_transaction {0};
-	//! statements of a transaction that was open when LOAD registered its connection
+	//! statements of a transaction that began before every transaction open at LOAD had ended
 	std::atomic<uint64_t> skip_untracked_transaction {0};
 	std::atomic<uint64_t> skip_analyze_failed {0};
 	std::atomic<uint64_t> root_not_cacheable {0};

@@ -1,7 +1,7 @@
 # name: test/sql/recycler/recycler_load.test
 # description: transactions that are open while the extension loads may predate commits the cache never heard of,
-# and may commit writes no hook announced: until every connection open at LOAD has ended the transaction it was in,
-# no transaction that begins is served or stores
+# and may commit writes no hook announced: until every transaction open at LOAD has ended, no transaction that begins
+# is served or stores; a connection idle at LOAD holds nothing
 # group: [recycler]
 
 statement ok con1
@@ -107,24 +107,8 @@ SELECT g, count(*) AS c FROM u GROUP BY g ORDER BY g
 statement ok con2
 COMMIT;
 
-# the default connection has run nothing since LOAD: until it does, con2 is still not tracked
-query II con2
-SELECT g, count(*) AS c FROM u GROUP BY g ORDER BY g
-----
-0	4001
-1	4000
-2	4000
-3	4000
-4	4000
-
-query I con2
-SELECT count(*) FROM recycler_entries()
-----
-0
-
-statement ok
-SELECT 42;
-
+# every transaction open at LOAD has ended: con2 is tracked, although the default connection, idle at LOAD, has run
+# nothing since
 query II con2
 SELECT g, count(*) AS c FROM u GROUP BY g ORDER BY g
 ----
@@ -148,12 +132,12 @@ SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
 ----
 1
 
-# con2's seven queries before the default connection's statement, recycler_entries() included, and con1's query in
-# the transaction it was in at LOAD
+# con2's five queries while con1 or con3 was still in the transaction it was in at LOAD, recycler_entries() included,
+# and con1's query in that transaction
 query I con2
 SELECT value FROM recycler_stats() WHERE name = 'skip_untracked_transaction'
 ----
-8
+6
 
 # con1 is answered from the cache too
 statement ok con1

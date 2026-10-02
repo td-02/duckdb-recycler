@@ -3,6 +3,7 @@
 // recycler_state.hpp - database-level and connection-level recycler state
 //===----------------------------------------------------------------------===//
 #include "recycler_cache.hpp"
+#include "duckdb/common/unordered_map.hpp"
 #include "duckdb/main/client_context_state.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
 
@@ -12,6 +13,7 @@
 namespace duckdb {
 
 class ClientContext;
+class DatabaseInstance;
 class ErrorData;
 class ExtensionLoader;
 
@@ -20,11 +22,18 @@ struct RecyclerState : public OptimizerExtensionInfo {
 	RecyclerState() : cache(make_shared_ptr<RecyclerCache>()) {
 	}
 	shared_ptr<RecyclerCache> cache;
-	//! One held by LOAD while it registers the open connections, and, when a transaction was open on a database at
-	//! LOAD, one per connection open then until it ends the transaction it was in. Such a transaction may commit
-	//! writes no hook announced, so a transaction that begins while any remains is not tracked
+	//! Per database the cache tracked at LOAD, the id of a transaction LOAD began on it once the hooks were
+	//! registered: a transaction with an id up to it may have written without an announcement. Filled before
+	//! load_horizon_set is.
+	unordered_map<idx_t, transaction_t> load_horizon;
+	std::atomic<bool> load_horizon_set {false};
+	//! No transaction up to load_horizon remains (latched)
+	std::atomic<bool> predating_ended {false};
+
+	//! Whether every transaction that may have written before LOAD registered the hooks has ended. Such a
+	//! transaction may commit writes no hook announced, so a transaction that begins while one remains is not tracked
 	//! (RecyclerClientState::transaction_tracked); one that begins later sees them all.
-	std::atomic<idx_t> predating {1};
+	bool PredatingTransactionsEnded(DatabaseInstance &db);
 };
 
 //! A cache entry a recycler operator of the running statement touched, with the operator's id
@@ -37,11 +46,6 @@ struct TouchedEntry {
 //! recycler operators to QueryEnd. The hooks, physical planning and QueryEnd of a connection run one statement at
 //! a time.
 struct RecyclerClientState : public ClientContextState {
-	RecyclerClientState() = default;
-	//! The state LOAD gives a connection open before it while a transaction was open, counted in
-	//! RecyclerState::predating
-	explicit RecyclerClientState(RecyclerState &state);
-
 	static RecyclerClientState &Get(ClientContext &context);
 
 	//! The pre hook decided this statement takes part in recycling
@@ -69,12 +73,9 @@ struct RecyclerClientState : public ClientContextState {
 	//! statement to name it runs, and settled by the transaction callbacks
 	vector<PendingWrite> pending_writes;
 	//! TransactionBegin ran for the open transaction when no transaction that predates LOAD remained
-	//! (RecyclerState::predating). A transaction that began earlier may predate commits the cache never heard of: it
-	//! is neither served nor stores.
+	//! (RecyclerState::PredatingTransactionsEnded). A transaction that began earlier may predate commits the cache
+	//! never heard of: it is neither served nor stores.
 	bool transaction_tracked = false;
-	//! The connection holds RecyclerState::predating: it was open at LOAD and has not yet ended the transaction it was
-	//! in
-	bool predates_load = false;
 
 	//! Ids of this connection's recycler operators, drawn when the physical plan is built: a profiler node shows
 	//! its operator's id ("Id" among the parameters), which is how QueryEnd tells two entries of one shape apart
@@ -103,8 +104,6 @@ struct RecyclerClientState : public ClientContextState {
 	//! Announces a write to every table of a database a statement modifies (StatementProperties::modified_databases),
 	//! when the cache tracks the database
 	void AnnounceDatabase(ClientContext &context, RecyclerCache &cache, const string &name, idx_t catalog);
-	//! The connection ended the transaction it was in at LOAD (or closes): it no longer holds RecyclerState::predating
-	void EndPredating(RecyclerState &state);
 	//! Announces every database a statement the extension optimizer will not see may write
 	void QueryBegin(ClientContext &context) override;
 	//! Announces the writes of a statement prepared through the client API, which runs without the pre hook, and

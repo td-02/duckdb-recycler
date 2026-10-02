@@ -25,6 +25,7 @@
 #include "duckdb/optimizer/optimizer_extension.hpp"
 #include "duckdb/planner/extension_callback.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
+#include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 
@@ -46,10 +47,6 @@ optional_ptr<RecyclerState> GetRecyclerState(ClientContext &context) {
 //===----------------------------------------------------------------------===//
 // Connection state and the end-of-query callback
 //===----------------------------------------------------------------------===//
-RecyclerClientState::RecyclerClientState(RecyclerState &state) : predates_load(true) {
-	state.predating++;
-}
-
 RecyclerClientState &RecyclerClientState::Get(ClientContext &context) {
 	return *context.registered_state->GetOrCreate<RecyclerClientState>("recycler");
 }
@@ -247,23 +244,33 @@ RebindQueryInfo RecyclerClientState::OnExecutePrepared(ClientContext &context, P
 	return current_rebind;
 }
 
-void RecyclerClientState::EndPredating(RecyclerState &state) {
-	if (!predates_load) {
-		return;
+bool RecyclerState::PredatingTransactionsEnded(DatabaseInstance &db) {
+	if (predating_ended) {
+		return true;
 	}
-	predates_load = false;
-	state.predating--;
+	if (!load_horizon_set) {
+		return false;
+	}
+	// a manager draws transaction ids in start order, and its lowest active id, unlike its lowest active start, is
+	// never lowered by a checkpoint. A database attached since LOAD has no horizon: every transaction on it is
+	// announced.
+	for (auto &database : DatabaseManager::Get(db).GetDatabases()) {
+		auto horizon = load_horizon.find(database->oid);
+		if (horizon != load_horizon.end() &&
+		    DuckTransactionManager::Get(*database).LowestActiveId() <= horizon->second) {
+			return false;
+		}
+	}
+	predating_ended = true;
+	return true;
 }
 
 void RecyclerClientState::TransactionBegin(MetaTransaction &transaction, ClientContext &context) {
-	auto &state = *GetRecyclerState(context);
-	// a connection idle at LOAD ended the transaction it was in before this one
-	EndPredating(state);
-	transaction_tracked = state.predating == 0;
+	transaction_tracked = GetRecyclerState(context)->PredatingTransactionsEnded(DatabaseInstance::GetDatabase(context));
 }
 
 void RecyclerClientState::TransactionCommit(MetaTransaction &transaction, ClientContext &context) {
-	if (pending_writes.empty() && !predates_load) {
+	if (pending_writes.empty()) {
 		return;
 	}
 	// this runs after DuckDB made the commit durable: nothing here allocates, since a throw would report a failed
@@ -272,8 +279,7 @@ void RecyclerClientState::TransactionCommit(MetaTransaction &transaction, Client
 	// registered this state, which no tracked transaction predates (RecyclerClientState::transaction_tracked), one
 	// replayed from its WAL while it is attached, over which nothing is cached yet, or one written in the window
 	// QueryBegin describes.
-	auto &state = *GetRecyclerState(context);
-	auto &cache = *state.cache;
+	auto &cache = *GetRecyclerState(context)->cache;
 	auto db = transaction.ModifiedDatabase();
 	if (db && !IsTrackedDatabase(*db)) {
 		db = nullptr;
@@ -293,19 +299,17 @@ void RecyclerClientState::TransactionCommit(MetaTransaction &transaction, Client
 	if (db) {
 		cache.ForgetCommits(db->oid, DuckTransactionManager::Get(*db));
 	}
-	EndPredating(state);
 }
 
 void RecyclerClientState::TransactionRollback(MetaTransaction &transaction, ClientContext &context) {
-	if (pending_writes.empty() && !predates_load) {
+	if (pending_writes.empty()) {
 		return;
 	}
-	auto &state = *GetRecyclerState(context);
+	auto &cache = *GetRecyclerState(context)->cache;
 	for (auto &write : pending_writes) {
-		state.cache->RetractWriter(write);
+		cache.RetractWriter(write);
 	}
 	pending_writes.clear();
-	EndPredating(state);
 }
 
 //===----------------------------------------------------------------------===//
@@ -313,7 +317,7 @@ void RecyclerClientState::TransactionRollback(MetaTransaction &transaction, Clie
 //===----------------------------------------------------------------------===//
 class RecyclerConnectionCallback : public ExtensionCallback {
 public:
-	explicit RecyclerConnectionCallback(shared_ptr<RecyclerState> state_p) : state(std::move(state_p)) {
+	explicit RecyclerConnectionCallback(shared_ptr<RecyclerCache> cache_p) : cache(std::move(cache_p)) {
 	}
 
 	void OnConnectionOpened(ClientContext &context) override {
@@ -324,20 +328,17 @@ public:
 	}
 
 	void OnConnectionClosed(ClientContext &context) override {
-		// a connection open at LOAD may close without another transaction. LOAD may register a closing connection:
-		// whichever of the two creates its state, the predating count is released.
-		RecyclerClientState::Get(context).EndPredating(*state);
 		// cached ColumnDataCollections are buffer-managed. DatabaseInstance destroys the buffer manager before the
 		// DBConfig that (transitively) owns this cache, so the collections must be released while the last
 		// connection closes.
 		auto &db = DatabaseInstance::GetDatabase(context);
 		if (db.GetConnectionManager().GetConnectionCount() <= 1) {
-			state->cache->Clear();
+			cache->Clear();
 		}
 	}
 
 private:
-	shared_ptr<RecyclerState> state;
+	shared_ptr<RecyclerCache> cache;
 };
 
 //===----------------------------------------------------------------------===//
@@ -573,21 +574,6 @@ static void RecyclerClearPragma(ClientContext &context, const FunctionParameters
 //===----------------------------------------------------------------------===//
 // Registration
 //===----------------------------------------------------------------------===//
-//! Whether a transaction (or a checkpoint) is active on a database whose commits the cache stamps
-static bool HasOpenTransaction(DatabaseInstance &db) {
-	for (auto &database : DatabaseManager::Get(db).GetDatabases()) {
-		if (!IsTrackedDatabase(*database)) {
-			continue;
-		}
-		// the manager sets the lowest active start to a start time while a transaction is active, and to at least
-		// TRANSACTION_ID_START when none is
-		if (DuckTransactionManager::Get(*database).LowestActiveStart() < TRANSACTION_ID_START) {
-			return true;
-		}
-	}
-	return false;
-}
-
 void LoadRecycler(ExtensionLoader &loader) {
 	auto state = make_shared_ptr<RecyclerState>();
 
@@ -598,21 +584,25 @@ void LoadRecycler(ExtensionLoader &loader) {
 
 	auto &db = loader.GetDatabaseInstance();
 	ExtensionCallbackManager::Get(db).Register(std::move(optimizer_extension));
-	ExtensionCallbackManager::Get(db).Register(make_shared_ptr<RecyclerConnectionCallback>(state));
-	// the connections opened before LOAD: from now on their writes are announced. A transaction open on a database
-	// now may already have written, unannounced, and commit before its connection's next callback: then until every
-	// connection open now has ended the transaction it is in (an idle one: until it runs a statement or closes), no
-	// transaction that begins is tracked. A statement planned before the hooks were registered has bound, and so
-	// started its transaction on every database it writes, before this check.
-	bool predating = HasOpenTransaction(db);
+	ExtensionCallbackManager::Get(db).Register(make_shared_ptr<RecyclerConnectionCallback>(state->cache));
+	// the connections opened before LOAD: from now on their writes are announced
 	for (auto &connection : db.GetConnectionManager().GetConnectionList()) {
-		if (predating) {
-			connection->registered_state->GetOrCreate<RecyclerClientState>("recycler", *state);
-		} else {
-			RecyclerClientState::Get(*connection);
-		}
+		RecyclerClientState::Get(*connection);
 	}
-	state->predating--;
+	// a transaction open on a database now may already have written, unannounced, and commit before its connection's
+	// next callback: no transaction is tracked until every one open now has ended. A transaction begun here draws a
+	// higher id than all of them; its context is no connection, so that ending it is not the last connection closing.
+	// A statement planned before the hooks were registered has bound, and so started its transaction on every
+	// database it writes, before this one.
+	auto probe = make_shared_ptr<ClientContext>(db.shared_from_this());
+	probe->RunFunctionInTransaction([&]() {
+		for (auto &database : DatabaseManager::Get(db).GetDatabases()) {
+			if (IsTrackedDatabase(*database)) {
+				state->load_horizon[database->oid] = DuckTransaction::Get(*probe, *database).transaction_id;
+			}
+		}
+	});
+	state->load_horizon_set = true;
 
 	auto &config = DBConfig::GetConfig(db);
 	RecyclerSettings defaults;
