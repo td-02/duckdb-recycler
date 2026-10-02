@@ -166,9 +166,8 @@ void RecyclerCache::Erase(const CachedEntry &entry) {
 		auto shape = blocks.find(entry.hash);
 		D_ASSERT(shape != blocks.end());
 		auto &list = shape->second;
-		auto stored = std::find_if(list.begin(), list.end(), [&](const shared_ptr<CachedEntry> &candidate) {
-			return candidate.get() == &entry;
-		});
+		auto stored = std::find_if(list.begin(), list.end(),
+		                           [&](const shared_ptr<CachedEntry> &candidate) { return candidate.get() == &entry; });
 		D_ASSERT(stored != list.end());
 		list.erase(stored);
 		if (list.empty()) {

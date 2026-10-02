@@ -424,7 +424,7 @@ void PlanSignatures::RenderBinding(ColumnBinding binding, const Frame &frame, Si
 			sink.Tag("P");
 			sink.U64(entry->second - frame.start);
 			sink.U64(binding.column_index < column_ids.size() ? column_ids[binding.column_index].GetPrimaryIndex()
-			                                                   : DConstants::INVALID_INDEX);
+			                                                  : DConstants::INVALID_INDEX);
 			return;
 		}
 	}
@@ -1100,7 +1100,8 @@ void PlanSignatures::Compute(LogicalOperator &op) {
 		// the delim gets on the delim side belong to this join unless there are nested delim joins there,
 		// in which case we cannot tell them apart and stay conservative
 		bool own_gets_resolved = delim_info.delim_joins == 0 && delim_info.delim_gets > 0;
-		info.unresolved_delim_get = other_info.unresolved_delim_get || (!own_gets_resolved && delim_info.delim_gets > 0);
+		info.unresolved_delim_get =
+		    other_info.unresolved_delim_get || (!own_gets_resolved && delim_info.delim_gets > 0);
 		info.delim_gets = other_info.delim_gets + (own_gets_resolved ? 0 : delim_info.delim_gets);
 		break;
 	}
@@ -1115,7 +1116,8 @@ void PlanSignatures::Compute(LogicalOperator &op) {
 	case LogicalOperatorType::LOGICAL_LIMIT: {
 		auto &limit = op.Cast<LogicalLimit>();
 		bool child_ordered = !op.children.empty() && Get(*op.children[0]).ordered;
-		bool has_limit = limit.limit_val.Type() != LimitNodeType::UNSET || limit.offset_val.Type() != LimitNodeType::UNSET;
+		bool has_limit =
+		    limit.limit_val.Type() != LimitNodeType::UNSET || limit.offset_val.Type() != LimitNodeType::UNSET;
 		if (has_limit && !child_ordered) {
 			// which rows survive depends on execution order
 			info.nondeterministic = true;
@@ -1266,8 +1268,8 @@ bool PlanSignatures::TryParseConstraint(const Expression &expr, vector<RangeCons
 		lower.op = between.lower_inclusive ? ExpressionType::COMPARE_GREATERTHANOREQUALTO
 		                                   : ExpressionType::COMPARE_GREATERTHAN;
 		upper.column = identity;
-		upper.op = between.upper_inclusive ? ExpressionType::COMPARE_LESSTHANOREQUALTO
-		                                   : ExpressionType::COMPARE_LESSTHAN;
+		upper.op =
+		    between.upper_inclusive ? ExpressionType::COMPARE_LESSTHANOREQUALTO : ExpressionType::COMPARE_LESSTHAN;
 		out.push_back(std::move(lower));
 		out.push_back(std::move(upper));
 		return true;
@@ -1353,10 +1355,18 @@ static bool ConstraintImplied(const RangeConstraint &c, const RangeConstraint &q
 	}
 	auto &qv = q.value;
 	auto &cv = c.value;
-	auto ge = [&]() { return !(qv < cv); };
-	auto gt = [&]() { return cv < qv; };
-	auto le = [&]() { return !(cv < qv); };
-	auto lt = [&]() { return qv < cv; };
+	auto ge = [&]() {
+		return !(qv < cv);
+	};
+	auto gt = [&]() {
+		return cv < qv;
+	};
+	auto le = [&]() {
+		return !(cv < qv);
+	};
+	auto lt = [&]() {
+		return qv < cv;
+	};
 	switch (c.op) {
 	case ExpressionType::COMPARE_EQUAL:
 		return q.op == ExpressionType::COMPARE_EQUAL && qv == cv;

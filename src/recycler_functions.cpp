@@ -505,8 +505,7 @@ static Value Milliseconds(uint64_t ns) {
 	return Value::DOUBLE(double(ns) / 1e6);
 }
 
-static unique_ptr<GlobalTableFunctionState> RecyclerEntriesInit(ClientContext &context,
-                                                                TableFunctionInitInput &input) {
+static unique_ptr<GlobalTableFunctionState> RecyclerEntriesInit(ClientContext &context, TableFunctionInitInput &input) {
 	auto result = make_uniq<RecyclerEntriesGlobalState>();
 	auto state = GetRecyclerState(context);
 	if (state) {
@@ -568,8 +567,7 @@ static unique_ptr<FunctionData> RecyclerHistoryBind(ClientContext &context, Tabl
 	return nullptr;
 }
 
-static unique_ptr<GlobalTableFunctionState> RecyclerHistoryInit(ClientContext &context,
-                                                                TableFunctionInitInput &input) {
+static unique_ptr<GlobalTableFunctionState> RecyclerHistoryInit(ClientContext &context, TableFunctionInitInput &input) {
 	auto result = make_uniq<RecyclerHistoryGlobalState>();
 	auto state = GetRecyclerState(context);
 	if (state) {
@@ -644,15 +642,16 @@ void LoadRecycler(ExtensionLoader &loader) {
 	RecyclerSettings defaults;
 	config.AddExtensionOption("recycler_enabled", "Enable query recycling", LogicalType::BOOLEAN,
 	                          Value::BOOLEAN(defaults.enabled));
-	config.AddExtensionOption("recycler_whole_result", "Cache and serve complete query results",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(defaults.whole_result));
+	config.AddExtensionOption("recycler_whole_result", "Cache and serve complete query results", LogicalType::BOOLEAN,
+	                          Value::BOOLEAN(defaults.whole_result));
 	config.AddExtensionOption("recycler_blocks", "Serve nested query blocks from cached query results",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(defaults.blocks));
 	config.AddExtensionOption("recycler_subtrees", "Cache and reuse intermediate results of optimized plans",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(defaults.subtrees));
-	config.AddExtensionOption("recycler_subsumption",
-	                          "Reuse cached SPJ blocks for narrower predicates and column subsets (predicate subsumption)",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(defaults.subsumption));
+	config.AddExtensionOption(
+	    "recycler_subsumption",
+	    "Reuse cached SPJ blocks for narrower predicates and column subsets (predicate subsumption)",
+	    LogicalType::BOOLEAN, Value::BOOLEAN(defaults.subsumption));
 	config.AddExtensionOption("recycler_budget_mb", "Memory budget of the recycler cache in MB", LogicalType::BIGINT,
 	                          Value::BIGINT(int64_t(defaults.budget_bytes / (1024 * 1024))));
 	config.AddExtensionOption("recycler_entry_cap_mb", "Largest cache entry in MB", LogicalType::BIGINT,
@@ -669,12 +668,12 @@ void LoadRecycler(ExtensionLoader &loader) {
 	                          "Largest entry in rows kept in memory sized to its data rather than in buffer blocks",
 	                          LogicalType::BIGINT, Value::BIGINT(int64_t(defaults.compact_rows)));
 
-	loader.RegisterFunction(TableFunction("recycler_stats", {}, RecyclerStatsFunction, RecyclerStatsBind,
-	                                      RecyclerStatsInit));
-	loader.RegisterFunction(TableFunction("recycler_entries", {}, RecyclerEntriesFunction, RecyclerEntriesBind,
-	                                      RecyclerEntriesInit));
-	loader.RegisterFunction(TableFunction("recycler_history", {}, RecyclerHistoryFunction, RecyclerHistoryBind,
-	                                      RecyclerHistoryInit));
+	loader.RegisterFunction(
+	    TableFunction("recycler_stats", {}, RecyclerStatsFunction, RecyclerStatsBind, RecyclerStatsInit));
+	loader.RegisterFunction(
+	    TableFunction("recycler_entries", {}, RecyclerEntriesFunction, RecyclerEntriesBind, RecyclerEntriesInit));
+	loader.RegisterFunction(
+	    TableFunction("recycler_history", {}, RecyclerHistoryFunction, RecyclerHistoryBind, RecyclerHistoryInit));
 	loader.RegisterFunction(PragmaFunction::PragmaStatement("recycler_clear", RecyclerClearPragma));
 }
 

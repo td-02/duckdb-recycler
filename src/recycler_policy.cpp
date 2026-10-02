@@ -70,10 +70,9 @@ bool AdmitSubtreeWrite(ClientContext &context, const RecyclerCache &cache, const
 		}
 		// aggregates are the safest speculation (their output is bounded by their input and usually far
 		// smaller), plain joins the riskiest
-		auto speculate_bytes = IsAggregation(op.type) ? settings.speculate_bytes * 2
-		                       : op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN
-		                           ? settings.speculate_bytes / 8
-		                           : settings.speculate_bytes;
+		auto speculate_bytes = IsAggregation(op.type)                                    ? settings.speculate_bytes * 2
+		                       : op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ? settings.speculate_bytes / 8
+		                                                                                 : settings.speculate_bytes;
 		if (est_bytes > speculate_bytes) {
 			return false;
 		}

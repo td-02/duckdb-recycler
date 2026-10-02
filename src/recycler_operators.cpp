@@ -147,8 +147,8 @@ void LogicalRecyclerScan::ResolveTypes() {
 PhysicalRecyclerScan::PhysicalRecyclerScan(PhysicalPlan &physical_plan, vector<LogicalType> types_p,
                                            idx_t estimated_cardinality, idx_t id, shared_ptr<CachedEntry> entry_p,
                                            bool ordered, vector<column_t> column_ids_p)
-    : PhysicalRecyclerOperator(physical_plan, std::move(types_p), estimated_cardinality, id),
-      entry(std::move(entry_p)), ordered(ordered), column_ids(std::move(column_ids_p)) {
+    : PhysicalRecyclerOperator(physical_plan, std::move(types_p), estimated_cardinality, id), entry(std::move(entry_p)),
+      ordered(ordered), column_ids(std::move(column_ids_p)) {
 }
 
 string PhysicalRecyclerScan::GetName() const {
@@ -212,8 +212,8 @@ LogicalRecyclerMaterialize::LogicalRecyclerMaterialize(RecyclerWriteSpec spec_p,
 PhysicalOperator &LogicalRecyclerMaterialize::CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) {
 	D_ASSERT(children.size() == 1);
 	auto &child = planner.CreatePlan(*children[0]);
-	auto estimated = children[0]->has_estimated_cardinality ? children[0]->estimated_cardinality
-	                                                         : child.estimated_cardinality;
+	auto estimated =
+	    children[0]->has_estimated_cardinality ? children[0]->estimated_cardinality : child.estimated_cardinality;
 	auto id = RecyclerClientState::Get(context).NextOperatorId();
 	return planner.Make<PhysicalRecyclerMaterialize>(types, estimated, id, spec, cache, child);
 }
@@ -267,8 +267,7 @@ void LogicalRecyclerMaterialize::ResolveTypes() {
 class RecyclerMaterializeGlobalSinkState : public GlobalSinkState {
 public:
 	RecyclerMaterializeGlobalSinkState(ClientContext &context, const vector<LogicalType> &types)
-	    : collection(make_shared_ptr<ColumnDataCollection>(context, types)),
-	      start(std::chrono::steady_clock::now()) {
+	    : collection(make_shared_ptr<ColumnDataCollection>(context, types)), start(std::chrono::steady_clock::now()) {
 	}
 
 	//! Wall time from the sink's creation (executor start) to Finalize: stands in for the cost of producing the
