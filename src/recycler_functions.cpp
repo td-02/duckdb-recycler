@@ -13,6 +13,7 @@
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/connection_manager.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/extension_callback_manager.hpp"
 #include "duckdb/main/profiling_node.hpp"
@@ -43,6 +44,10 @@ optional_ptr<RecyclerState> GetRecyclerState(ClientContext &context) {
 //===----------------------------------------------------------------------===//
 // Connection state and the end-of-query callback
 //===----------------------------------------------------------------------===//
+RecyclerClientState::RecyclerClientState(RecyclerState &state) : predates_load(true) {
+	state.predating++;
+}
+
 RecyclerClientState &RecyclerClientState::Get(ClientContext &context) {
 	return *context.registered_state->GetOrCreate<RecyclerClientState>("recycler");
 }
@@ -208,8 +213,8 @@ void RecyclerClientState::QueryBegin(ClientContext &context) {
 	// modified is stamped with its commit (see TransactionCommit for a statement that commits together with it)
 	bool unplanned = !ClientConfig::GetConfig(context).enable_optimizer ||
 	                 Optimizer::OptimizerDisabled(context, OptimizerType::EXTENSION);
-	// a database this transaction may have written without an announcement (by an unplanned statement) is announced
-	// as a whole before the transaction can commit
+	// a database this transaction may have written without an announcement (by an unplanned statement, or by one
+	// that ran before LOAD registered this state) is announced as a whole before the transaction can commit
 	auto db = StampableDatabase(MetaTransaction::Get(context));
 	if (!unplanned && (!db || !MayWriteUnannounced(db->oid))) {
 		return;
@@ -248,27 +253,42 @@ void RecyclerClientState::StampUnstampedCommit(RecyclerCache &cache) {
 	unstamped_catalog = DConstants::INVALID_INDEX;
 }
 
+void RecyclerClientState::EndPredating(RecyclerState &state) {
+	if (!predates_load) {
+		return;
+	}
+	predates_load = false;
+	state.predating--;
+}
+
 void RecyclerClientState::TransactionBegin(MetaTransaction &transaction, ClientContext &context) {
-	StampUnstampedCommit(*GetRecyclerState(context)->cache);
+	auto &state = *GetRecyclerState(context);
+	StampUnstampedCommit(*state.cache);
+	// a connection idle at LOAD ended the transaction it was in before this one
+	EndPredating(state);
+	transaction_tracked = state.predating == 0;
 }
 
 void RecyclerClientState::TransactionCommit(MetaTransaction &transaction, ClientContext &context) {
 	// the announcements of writes to a database the cache cannot stamp are only retracted
 	auto db = StampableDatabase(transaction);
-	if (!db && pending_writes.empty()) {
+	if (!db && pending_writes.empty() && !predates_load) {
 		return;
 	}
 	// this runs after DuckDB made the commit durable: nothing here allocates, since a throw would report a failed
 	// commit for a transaction that committed, and leave its writes announced. Every version it settles exists since
 	// the write's announcement.
-	auto &cache = *GetRecyclerState(context)->cache;
+	auto &state = *GetRecyclerState(context);
+	auto &cache = *state.cache;
 	transaction_t commit = 0;
 	if (db) {
 		// the catalog's DuckTransaction is gone by now (the manager removed it before this callback), so the commit
 		// id is bounded from above by the catalog's last commit, which the manager assigned right after drawing the
 		// id under the same lock
 		commit = DuckTransactionManager::Get(*db).GetLastCommit();
-		if (MayWriteUnannounced(db->oid)) {
+		// a write that ran before LOAD registered this state needs no stamp: no transaction that began before this
+		// commit is tracked
+		if (MayWriteUnannounced(db->oid) && !predates_load) {
 			// a write no hook announced, by an unplanned statement that committed together with it (QueryBegin
 			// announced the database for every later statement): the tables it wrote are unknown and stamping its
 			// whole database may allocate the database's version, so an unplanned writer (whose version always
@@ -287,17 +307,19 @@ void RecyclerClientState::TransactionCommit(MetaTransaction &transaction, Client
 		}
 	}
 	pending_writes.clear();
+	EndPredating(state);
 }
 
 void RecyclerClientState::TransactionRollback(MetaTransaction &transaction, ClientContext &context) {
-	if (pending_writes.empty()) {
+	if (pending_writes.empty() && !predates_load) {
 		return;
 	}
-	auto &cache = *GetRecyclerState(context)->cache;
+	auto &state = *GetRecyclerState(context);
 	for (auto &write : pending_writes) {
-		cache.RetractWriter(write);
+		state.cache->RetractWriter(write);
 	}
 	pending_writes.clear();
+	EndPredating(state);
 }
 
 //===----------------------------------------------------------------------===//
@@ -305,7 +327,7 @@ void RecyclerClientState::TransactionRollback(MetaTransaction &transaction, Clie
 //===----------------------------------------------------------------------===//
 class RecyclerConnectionCallback : public ExtensionCallback {
 public:
-	explicit RecyclerConnectionCallback(shared_ptr<RecyclerCache> cache_p) : cache(std::move(cache_p)) {
+	explicit RecyclerConnectionCallback(shared_ptr<RecyclerState> state_p) : state(std::move(state_p)) {
 	}
 
 	void OnConnectionOpened(ClientContext &context) override {
@@ -316,19 +338,22 @@ public:
 	}
 
 	void OnConnectionClosed(ClientContext &context) override {
-		// a connection that closes without another transaction settles what its last one left
-		RecyclerClientState::Get(context).StampUnstampedCommit(*cache);
+		// a connection that closes without another transaction settles what its last one left. LOAD may register a
+		// closing connection: whichever of the two creates its state, the predating count is released.
+		auto &client = RecyclerClientState::Get(context);
+		client.StampUnstampedCommit(*state->cache);
+		client.EndPredating(*state);
 		// cached ColumnDataCollections are buffer-managed. DatabaseInstance destroys the buffer manager before the
 		// DBConfig that (transitively) owns this cache, so the collections must be released while the last
 		// connection closes.
 		auto &db = DatabaseInstance::GetDatabase(context);
 		if (db.GetConnectionManager().GetConnectionCount() <= 1) {
-			cache->Clear();
+			state->cache->Clear();
 		}
 	}
 
 private:
-	shared_ptr<RecyclerCache> cache;
+	shared_ptr<RecyclerState> state;
 };
 
 //===----------------------------------------------------------------------===//
@@ -388,6 +413,7 @@ static unique_ptr<GlobalTableFunctionState> RecyclerStatsInit(ClientContext &con
 		add("skip_disabled", s.skip_disabled);
 		add("skip_modified_databases", s.skip_modified_databases);
 		add("skip_write_transaction", s.skip_write_transaction);
+		add("skip_untracked_transaction", s.skip_untracked_transaction);
 		add("skip_analyze_failed", s.skip_analyze_failed);
 		add("root_not_cacheable", s.root_not_cacheable);
 		add("swap_bytes", BufferManager::GetBufferManager(context).GetUsedSwap());
@@ -562,6 +588,22 @@ static void RecyclerClearPragma(ClientContext &context, const FunctionParameters
 //===----------------------------------------------------------------------===//
 // Registration
 //===----------------------------------------------------------------------===//
+//! Whether a transaction (or a checkpoint) is active on a database whose commits the cache stamps
+static bool HasOpenTransaction(DatabaseInstance &db) {
+	for (auto &database : DatabaseManager::Get(db).GetDatabases()) {
+		if (database->IsSystem() || database->IsTemporary() ||
+		    !database->GetTransactionManager().IsDuckTransactionManager()) {
+			continue;
+		}
+		// the manager sets the lowest active start to a start time while a transaction is active, and to at least
+		// TRANSACTION_ID_START when none is
+		if (DuckTransactionManager::Get(*database).LowestActiveStart() < TRANSACTION_ID_START) {
+			return true;
+		}
+	}
+	return false;
+}
+
 void LoadRecycler(ExtensionLoader &loader) {
 	auto state = make_shared_ptr<RecyclerState>();
 
@@ -572,7 +614,21 @@ void LoadRecycler(ExtensionLoader &loader) {
 
 	auto &db = loader.GetDatabaseInstance();
 	ExtensionCallbackManager::Get(db).Register(std::move(optimizer_extension));
-	ExtensionCallbackManager::Get(db).Register(make_shared_ptr<RecyclerConnectionCallback>(state->cache));
+	ExtensionCallbackManager::Get(db).Register(make_shared_ptr<RecyclerConnectionCallback>(state));
+	// the connections opened before LOAD: from now on their writes are announced. A transaction open on a database
+	// now may already have written, unannounced, and commit before its connection's next callback: then until every
+	// connection open now has ended the transaction it is in (an idle one: until it runs a statement or closes), no
+	// transaction that begins is tracked. A statement planned before the hooks were registered has bound, and so
+	// started its transaction on every database it writes, before this check.
+	bool predating = HasOpenTransaction(db);
+	for (auto &connection : db.GetConnectionManager().GetConnectionList()) {
+		if (predating) {
+			connection->registered_state->GetOrCreate<RecyclerClientState>("recycler", *state);
+		} else {
+			RecyclerClientState::Get(*connection);
+		}
+	}
+	state->predating--;
 
 	auto &config = DBConfig::GetConfig(db);
 	RecyclerSettings defaults;

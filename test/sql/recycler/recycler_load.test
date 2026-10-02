@@ -1,0 +1,187 @@
+# name: test/sql/recycler/recycler_load.test
+# description: transactions that are open while the extension loads may predate commits the cache never heard of,
+# and may commit writes no hook announced: until every connection open at LOAD has ended the transaction it was in,
+# no transaction that begins is served or stores
+# group: [recycler]
+
+statement ok con1
+CREATE TABLE t AS SELECT range AS id, range % 7 AS g FROM range(20000);
+
+statement ok con1
+CREATE TABLE u AS SELECT range AS id, range % 5 AS g FROM range(20000);
+
+# con1's snapshot predates con2's insert into t, which commits before the extension loads
+statement ok con1
+BEGIN TRANSACTION;
+
+query I con1
+SELECT count(*) FROM t
+----
+20000
+
+statement ok con2
+INSERT INTO t VALUES (20000, 0);
+
+# con3 writes u before the extension loads and commits after it: its write is never announced
+statement ok con3
+BEGIN TRANSACTION;
+
+statement ok con3
+INSERT INTO u VALUES (20000, 0);
+
+# the default connection, con1, con2 and con3 are open; con1 and con3 are in a transaction
+require waddle
+
+statement ok con2
+SET recycler_min_input_rows = 1;
+
+query II con2
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g
+----
+0	2859
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+query II con2
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g
+----
+0	2859
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+# con2 is neither served nor stores
+query I con2
+SELECT count(*) FROM recycler_entries()
+----
+0
+
+# con1 is answered from its own snapshot
+query II con1
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g
+----
+0	2858
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+statement ok con1
+COMMIT;
+
+# con2's transaction begins before con3's commit, and its snapshot misses con3's insert: it stores nothing for a
+# later transaction to be served
+statement ok con2
+BEGIN TRANSACTION;
+
+query II con2
+SELECT g, count(*) AS c FROM u GROUP BY g ORDER BY g
+----
+0	4000
+1	4000
+2	4000
+3	4000
+4	4000
+
+statement ok con3
+COMMIT;
+
+query II con2
+SELECT g, count(*) AS c FROM u GROUP BY g ORDER BY g
+----
+0	4000
+1	4000
+2	4000
+3	4000
+4	4000
+
+statement ok con2
+COMMIT;
+
+# the default connection has run nothing since LOAD: until it does, con2 is still not tracked
+query II con2
+SELECT g, count(*) AS c FROM u GROUP BY g ORDER BY g
+----
+0	4001
+1	4000
+2	4000
+3	4000
+4	4000
+
+query I con2
+SELECT count(*) FROM recycler_entries()
+----
+0
+
+statement ok
+SELECT 42;
+
+query II con2
+SELECT g, count(*) AS c FROM u GROUP BY g ORDER BY g
+----
+0	4001
+1	4000
+2	4000
+3	4000
+4	4000
+
+query II con2
+SELECT g, count(*) AS c FROM u GROUP BY g ORDER BY g
+----
+0	4001
+1	4000
+2	4000
+3	4000
+4	4000
+
+query I con2
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+1
+
+# con2's seven queries before the default connection's statement, recycler_entries() included, and con1's query in
+# the transaction it was in at LOAD
+query I con2
+SELECT value FROM recycler_stats() WHERE name = 'skip_untracked_transaction'
+----
+8
+
+# con1 is answered from the cache too
+statement ok con1
+SET recycler_min_input_rows = 1;
+
+query II con1
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g
+----
+0	2859
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+query II con1
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g
+----
+0	2859
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+2

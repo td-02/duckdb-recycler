@@ -543,6 +543,10 @@ static unique_ptr<LogicalOperator> *GateStatement(OptimizerExtensionInput &input
 		cache.stats.skip_write_transaction++;
 		return nullptr;
 	}
+	if (!client.transaction_tracked) {
+		cache.stats.skip_untracked_transaction++;
+		return nullptr;
+	}
 	return root_slot;
 }
 

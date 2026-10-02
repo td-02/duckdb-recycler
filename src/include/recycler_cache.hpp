@@ -118,7 +118,8 @@ struct TableVersion {
 	//! Transactions that announced a write and have not ended: while any exists, entries over the table (every
 	//! table of the catalog) are neither served nor stored
 	idx_t writers = 0;
-	//! Upper bound of the commit ids that wrote the table (0: no commit since the cache exists). An entry or a
+	//! Upper bound of the commit ids that wrote the table (0: no commit since the cache exists; a transaction older
+	//! than the cache is refused by its connection, see RecyclerClientState::transaction_tracked). An entry or a
 	//! reader whose start time does not exceed it may miss that commit.
 	transaction_t last_commit = 0;
 };
@@ -196,6 +197,8 @@ struct RecyclerStats {
 	//! announced for every table of the database
 	std::atomic<uint64_t> skip_modified_databases {0};
 	std::atomic<uint64_t> skip_write_transaction {0};
+	//! statements of a transaction that was open when LOAD registered its connection
+	std::atomic<uint64_t> skip_untracked_transaction {0};
 	std::atomic<uint64_t> skip_analyze_failed {0};
 	std::atomic<uint64_t> root_not_cacheable {0};
 	//! root_not_cacheable by reason

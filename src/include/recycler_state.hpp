@@ -6,6 +6,7 @@
 #include "duckdb/main/client_context_state.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
 
+#include <atomic>
 #include <mutex>
 
 namespace duckdb {
@@ -19,6 +20,11 @@ struct RecyclerState : public OptimizerExtensionInfo {
 	RecyclerState() : cache(make_shared_ptr<RecyclerCache>()) {
 	}
 	shared_ptr<RecyclerCache> cache;
+	//! One held by LOAD while it registers the open connections, and, when a transaction was open on a database at
+	//! LOAD, one per connection open then until it ends the transaction it was in. Such a transaction may commit
+	//! writes no hook announced, so a transaction that begins while any remains is not tracked
+	//! (RecyclerClientState::transaction_tracked); one that begins later sees them all.
+	std::atomic<idx_t> predating {1};
 };
 
 //! A cache entry a recycler operator of the running statement touched, with the operator's id
@@ -31,6 +37,11 @@ struct TouchedEntry {
 //! recycler operators to QueryEnd. The hooks, physical planning and QueryEnd of a connection run one statement at
 //! a time.
 struct RecyclerClientState : public ClientContextState {
+	RecyclerClientState() = default;
+	//! The state LOAD gives a connection open before it while a transaction was open, counted in
+	//! RecyclerState::predating
+	explicit RecyclerClientState(RecyclerState &state);
+
 	static RecyclerClientState &Get(ClientContext &context);
 
 	//! The pre hook decided this statement takes part in recycling
@@ -57,6 +68,13 @@ struct RecyclerClientState : public ClientContextState {
 	//! The writes of the open transaction, each announced once (RecyclerCache::AnnounceWriter) before the first
 	//! statement to name it runs, and settled by the transaction callbacks
 	vector<PendingWrite> pending_writes;
+	//! TransactionBegin ran for the open transaction when no transaction that predates LOAD remained
+	//! (RecyclerState::predating). A transaction that began earlier may predate commits the cache never heard of: it
+	//! is neither served nor stores.
+	bool transaction_tracked = false;
+	//! The connection holds RecyclerState::predating: it was open at LOAD and has not yet ended the transaction it was
+	//! in
+	bool predates_load = false;
 	//! A commit of a database that no hook announced (an unplanned statement's, committed with it), which the
 	//! connection's next transaction stamps: the commit callback must not allocate the database's version. Until
 	//! then an unplanned writer withholds every entry.
@@ -92,6 +110,8 @@ struct RecyclerClientState : public ClientContextState {
 	bool MayWriteUnannounced(idx_t catalog) const;
 	//! Stamps the commit TransactionCommit could not, and releases the unplanned writer that stood in for it
 	void StampUnstampedCommit(RecyclerCache &cache);
+	//! The connection ended the transaction it was in at LOAD (or closes): it no longer holds RecyclerState::predating
+	void EndPredating(RecyclerState &state);
 	//! Announces an unplanned write for a statement the extension optimizer will not see, and the database the
 	//! transaction modified without an announcement
 	void QueryBegin(ClientContext &context) override;
