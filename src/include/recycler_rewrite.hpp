@@ -21,6 +21,11 @@ bool SubstituteScan(unique_ptr<LogicalOperator> &slot, shared_ptr<CachedEntry> e
 void WrapMaterialize(unique_ptr<LogicalOperator> &slot, RecyclerWriteSpec spec, shared_ptr<RecyclerCache> cache,
                      vector<unique_ptr<Expression>> keep_alive = vector<unique_ptr<Expression>>());
 
+//! Remove from `owners`, joins outside `subtree`, the runtime filters they push into the scans of `subtree`, so that a
+//! write of the subtree stores all of its rows. A runtime filter only drops probe rows its join drops anyway, so no
+//! result changes. Returns the number of filters removed.
+idx_t StripRuntimeFilters(const LogicalOperator &subtree, const vector<LogicalOperator *> &owners);
+
 //! The consumer side of a CTE, or nullptr when `op` is not a CTE. CTE inlining deep-copies a CTE's definition and
 //! cannot copy our operators, so the pre-optimize walkers rewrite the consumer side only.
 unique_ptr<LogicalOperator> *CteConsumerSlot(LogicalOperator &op);

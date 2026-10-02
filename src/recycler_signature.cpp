@@ -354,7 +354,7 @@ void PlanSignatures::Analyze(LogicalOperator &root) {
 	Compute(root);
 }
 
-void PlanSignatures::CollectDynamicOwners(const LogicalOperator &op) {
+void PlanSignatures::CollectDynamicOwners(LogicalOperator &op) {
 	if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN || op.type == LogicalOperatorType::LOGICAL_DELIM_JOIN ||
 	    op.type == LogicalOperatorType::LOGICAL_ASOF_JOIN) {
 		auto &join = op.Cast<LogicalComparisonJoin>();

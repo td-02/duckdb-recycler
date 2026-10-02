@@ -1,14 +1,17 @@
 #include "recycler_rewrite.hpp"
 
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/execution/operator/join/join_filter_pushdown.hpp"
 #include "duckdb/optimizer/column_binding_replacer.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_empty_result.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 
+#include <algorithm>
 #include <unordered_map>
 
 namespace duckdb {
@@ -42,6 +45,35 @@ void WrapMaterialize(unique_ptr<LogicalOperator> &slot, RecyclerWriteSpec spec, 
 	wrapper->expressions = std::move(keep_alive);
 	wrapper->ResolveOperatorTypes();
 	slot = std::move(wrapper);
+}
+
+static void CollectDynamicFilterSets(const LogicalOperator &op, vector<const DynamicTableFilterSet *> &sets) {
+	if (op.type == LogicalOperatorType::LOGICAL_GET) {
+		auto &get = op.Cast<LogicalGet>();
+		if (get.dynamic_filters) {
+			sets.push_back(get.dynamic_filters.get());
+		}
+	}
+	for (auto &child : op.children) {
+		CollectDynamicFilterSets(*child, sets);
+	}
+}
+
+idx_t StripRuntimeFilters(const LogicalOperator &subtree, const vector<LogicalOperator *> &owners) {
+	vector<const DynamicTableFilterSet *> sets;
+	CollectDynamicFilterSets(subtree, sets);
+	idx_t stripped = 0;
+	for (auto owner : owners) {
+		// an owner whose probe_info ends up empty still computes the build side's min/max, which only picks the
+		// perfect hash join (JoinFilterPushdownInfo::FinalizeFilters pushes nothing)
+		auto &probe_info = owner->Cast<LogicalComparisonJoin>().filter_pushdown->probe_info;
+		auto kept = std::remove_if(probe_info.begin(), probe_info.end(), [&](const JoinFilterPushdownFilter &probe) {
+			return std::find(sets.begin(), sets.end(), probe.dynamic_filters.get()) != sets.end();
+		});
+		stripped += NumericCast<idx_t>(probe_info.end() - kept);
+		probe_info.erase(kept, probe_info.end());
+	}
+	return stripped;
 }
 
 unique_ptr<LogicalOperator> *CteConsumerSlot(LogicalOperator &op) {

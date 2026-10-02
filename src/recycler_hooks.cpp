@@ -693,7 +693,8 @@ struct SubtreeWalker {
 			return;
 		}
 		auto &info = sig.Get(op);
-		bool candidate = !is_root && (force_candidate || IsSubtreeCandidateType(op.type)) && info.Cacheable();
+		bool candidate =
+		    !is_root && (force_candidate || IsSubtreeCandidateType(op.type)) && info.CacheableWithoutOuterFilters();
 		if (candidate) {
 			cache->NoteSeen(info.hash);
 			auto entry = cache->Lookup(RecyclerEntryKind::SUBTREE, info, sig, op, snapshot);
@@ -710,6 +711,8 @@ struct SubtreeWalker {
 				    RecyclerWriteSpec::Make(RecyclerEntryKind::SUBTREE, info.hash, sig.Render(op), info.ordered,
 				                            info.est_leaf_rows, TableDependencies(info.tables, snapshot), settings);
 				cache->stats.writes_planned++;
+				// after rendering: the joins whose filters are removed are outside the subtree and its key
+				cache->stats.stripped_runtime_filters += StripRuntimeFilters(op, info.pending_dynamic_owners);
 				WrapMaterialize(slot, std::move(spec), cache);
 				// below the wrapper: hits, and at most one more nested aggregation
 				auto &wrapped = *slot->children[0];

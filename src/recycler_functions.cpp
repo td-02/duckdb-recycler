@@ -409,6 +409,7 @@ static unique_ptr<GlobalTableFunctionState> RecyclerStatsInit(ClientContext &con
 		add("whole_stores", s.whole_stores);
 		add("subtree_stores", s.subtree_stores);
 		add("writes_planned", s.writes_planned);
+		add("stripped_runtime_filters", s.stripped_runtime_filters);
 		add("blocks_planted", s.blocks_planted);
 		add("block_stores", s.block_stores);
 		add("subsumption_hits", s.subsumption_hits);

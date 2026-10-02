@@ -176,9 +176,11 @@ optimizer extension with two hooks (`src/recycler_hooks.cpp`):
 Correctness rules: results are keyed on the exact bound/optimized structure including types; subtrees with
 volatile functions, parameters, table functions, temporary tables (private to their connection), tables of
 non-DuckDB catalogs (attached SQLite/Postgres/... databases change outside DuckDB's transactions), LIMIT
-without ORDER BY, runtime (dynamic) filters owned outside the subtree, or references into a delim join's other
-side are never cached; any statement that modifies data or the catalog clears the cache, and nothing is cached
-or served inside a transaction that has written. The values of the result-affecting session settings `TimeZone`,
+without ORDER BY, runtime (dynamic) filters without an owning join (a Top-N's), or references into a delim join's
+other side are never cached; the runtime filters that joins above a subtree push into its scans are removed from
+those joins before the subtree is written (`stripped_runtime_filters`), so it stores all of its rows; any statement
+that modifies data or the catalog clears the cache, and nothing is cached or served inside a transaction that has
+written. The values of the result-affecting session settings `TimeZone`,
 `Calendar`, `ieee_floating_point_ops`, `default_order`, `default_null_order` and
 `scalar_subquery_error_on_multiple_rows` (the settings that change a result at execution time without changing the
 bound plan: ICU and the `list_sort` family read them into function bind data, the flag picks the division callback,

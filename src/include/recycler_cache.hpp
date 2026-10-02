@@ -179,6 +179,8 @@ struct RecyclerStats {
 	std::atomic<uint64_t> evictions {0};
 	std::atomic<uint64_t> hash_collisions {0};
 	std::atomic<uint64_t> writes_planned {0};
+	//! runtime filters removed from joins above a subtree written to the cache (StripRuntimeFilters)
+	std::atomic<uint64_t> stripped_runtime_filters {0};
 	std::atomic<uint64_t> blocks_planted {0};
 	std::atomic<uint64_t> block_stores {0};
 	std::atomic<uint64_t> subsumption_hits {0};

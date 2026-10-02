@@ -110,14 +110,18 @@ struct NodeInfo {
 	//! cross products); nothing above it is materialized on first sight
 	bool unreliable_estimate = false;
 	//! Owners of dynamic filter sets that some scan in this subtree depends on but which are not in the subtree
-	vector<const LogicalOperator *> pending_dynamic_owners;
+	vector<LogicalOperator *> pending_dynamic_owners;
 	//! The base tables the subtree reads, each once, in scan order; a RecyclerScan reads those of the subtree it
 	//! replaced
 	vector<reference<const TableCatalogEntry>> tables;
 
 	bool Cacheable() const {
-		return !refused && !external_ref && !unresolved_delim_get && !nondeterministic && !runtime_filtered &&
-		       pending_dynamic_owners.empty();
+		return CacheableWithoutOuterFilters() && pending_dynamic_owners.empty();
+	}
+	//! Cacheable once the runtime filters of the joins in pending_dynamic_owners stop reaching the subtree's scans
+	//! (StripRuntimeFilters); a hit needs no stripping, since the scan of the entry replaces those scans
+	bool CacheableWithoutOuterFilters() const {
+		return !refused && !external_ref && !unresolved_delim_get && !nondeterministic && !runtime_filtered;
 	}
 	//! Why the subtree is not cacheable (NONE when it is)
 	RefusalReason Reason() const;
@@ -203,7 +207,7 @@ private:
 	void RenderBinding(ColumnBinding binding, const Frame &frame, Sink &sink, NodeInfo &info) const;
 	void RenderOwnIndex(idx_t table_index, const Frame &frame, Sink &sink) const;
 	void RenderJoin(const LogicalComparisonJoin &join, const Frame &frame, Sink &sink, NodeInfo &info) const;
-	void CollectDynamicOwners(const LogicalOperator &op);
+	void CollectDynamicOwners(LogicalOperator &op);
 	//! Identity of a binding that refers to a scan of the analyzed (sub)tree
 	ColumnIdentity IdentityOf(ColumnBinding binding) const;
 	//! Recognize `column <op> constant` / `column IS NOT NULL` conjuncts over base columns
@@ -229,7 +233,7 @@ private:
 	std::unordered_map<const LogicalOperator *, NodeInfo> infos;
 	//! DynamicTableFilterSet* -> every join that pushes runtime filters into it: JoinFilterPushdownOptimizer gives a
 	//! scan one set that all of them share
-	std::unordered_map<const void *, vector<const LogicalOperator *>> dynamic_owners;
+	std::unordered_map<const void *, vector<LogicalOperator *>> dynamic_owners;
 };
 
 //! Compute the shape of the SPJ block rooted at `root` (a LOGICAL_FILTER on the bound plan); `plan_info` is the
