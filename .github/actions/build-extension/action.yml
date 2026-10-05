@@ -35,6 +35,20 @@ runs:
         sudo docker image prune --all --force > /dev/null
         df -h /
 
+    # The sanitizer build's last links need more than the runner's 16 GB of memory: twice (2026-10-05)
+    # the runner was shut down (exit 143) at step 528 and 539 of 542, with 33 GB of disk free. The swap
+    # lives on /mnt, the runner's second disk, so it takes nothing from the build's space on /.
+    - name: Add swap
+      shell: bash
+      run: |
+        sudo swapoff -a
+        sudo rm -f /mnt/swapfile
+        sudo fallocate -l 16G /mnt/swapfile
+        sudo chmod 600 /mnt/swapfile
+        sudo mkswap /mnt/swapfile > /dev/null
+        sudo swapon /mnt/swapfile
+        free -h
+
     # The shallow submodule checkout carries no tags, so this fetches the one tag: duckdb's CMake
     # derives the version from `git describe`, and stock DuckDB refuses to load an extension
     # stamped with another version.
@@ -77,9 +91,11 @@ runs:
       run: make "$TARGET" && ccache --show-stats
 
     # Saved before the caller's tests so that a red test run still warms the next build, and after a
-    # failed build too: the objects it did compile are valid, and a cold sanitizer build is over an hour.
+    # failed or cancelled build too: the objects it did compile are valid, and a cold sanitizer build is
+    # over an hour. A runner shut down in the build reports the run as cancelled, so !cancelled() skipped
+    # this step and every sanitizer run started cold.
     - name: Save ccache
-      if: ${{ !cancelled() }}
+      if: ${{ always() }}
       uses: actions/cache/save@v4
       with:
         path: ${{ github.workspace }}/.ccache

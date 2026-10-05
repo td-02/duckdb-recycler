@@ -99,6 +99,9 @@ jobs:
     timeout-minutes: 150
     env:
       UBSAN_OPTIONS: print_stacktrace=1
+      # duckdb runs two links at once in a non-Release build; one sanitizer link of unittest alone takes
+      # several GB
+      EXT_FLAGS: -DDUCKDB_DEBUG_LINK_JOBS=1
     steps:
       - uses: actions/checkout@v4
         with:
