@@ -65,6 +65,24 @@ public:
 	ColumnDataLocalScanState local_state;
 };
 
+//! ColumnDataCollection::Scan over a parallel state, without its D_ASSERT that the chunk holds every column of the
+//! collection: in v1.5.5 that assertion also fires when the state projects a subset of the columns, which the scan
+//! itself (ScanAtIndex reads the state's column_ids) supports
+static void ScanParallel(const ColumnDataCollection &collection, ColumnDataParallelScanState &state,
+                         ColumnDataLocalScanState &lstate, DataChunk &result) {
+	result.Reset();
+	idx_t chunk_index;
+	idx_t segment_index;
+	idx_t row_index;
+	{
+		lock_guard<mutex> guard(state.lock);
+		if (!collection.NextScanIndex(state.scan_state, chunk_index, segment_index, row_index)) {
+			return;
+		}
+	}
+	collection.ScanAtIndex(state, lstate, result, chunk_index, segment_index, row_index);
+}
+
 static SourceResultType ScanCollection(const ColumnDataCollection &collection, DataChunk &chunk,
                                        OperatorSourceInput &input) {
 	auto &gstate = input.global_state.Cast<RecyclerScanGlobalState>();
@@ -72,7 +90,7 @@ static SourceResultType ScanCollection(const ColumnDataCollection &collection, D
 	if (gstate.ordered) {
 		collection.Scan(gstate.sequential_state, chunk);
 	} else {
-		collection.Scan(gstate.parallel_state, lstate.local_state, chunk);
+		ScanParallel(collection, gstate.parallel_state, lstate.local_state, chunk);
 	}
 	return chunk.size() == 0 ? SourceResultType::FINISHED : SourceResultType::HAVE_MORE_OUTPUT;
 }
