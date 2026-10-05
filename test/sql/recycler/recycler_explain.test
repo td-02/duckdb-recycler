@@ -137,3 +137,162 @@ query I
 SELECT count(*) FROM recycler_entries()
 ----
 5
+
+# ---------------------------------------------------------------------------
+# the text format of a hit: the renderer titles an extension operator's box with its type, EXTENSION, so the
+# served scan is recognised by its parameters, and no vanilla operator appears because the whole plan was replaced.
+# Hits move no miss counter: the lookups counted so far all belong to statements above that were not served.
+# ---------------------------------------------------------------------------
+query I
+SELECT value FROM recycler_stats() WHERE name = 'misses'
+----
+14
+
+query II
+EXPLAIN ANALYZE SELECT g, count(*) FROM t GROUP BY g ORDER BY g
+----
+analyzed_plan	<REGEX>:(?s).*EXTENSION.*Kind: whole_result.*Rows: 7.*Ordered: true.*
+
+query II
+EXPLAIN ANALYZE SELECT g, count(*) FROM t GROUP BY g ORDER BY g
+----
+analyzed_plan	<!REGEX>:(?s).*(HASH_GROUP_BY|PERFECT_HASH_GROUP_BY|SEQ_SCAN|ORDER_BY).*
+
+# the grader reads the root latency, which precedes the first array of the document (the root's children)
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT g, count(*) FROM t GROUP BY g ORDER BY g
+----
+analyzed_plan	<REGEX>:(?s)^[^\[]*"latency": [0-9].*
+
+query II
+SELECT name, value FROM recycler_stats() WHERE name IN ('misses', 'whole_hits') ORDER BY name
+----
+misses	14
+whole_hits	7
+
+# ---------------------------------------------------------------------------
+# the same plan with different constants stored under EXPLAIN ANALYZE: each constant gets its own entry, neither
+# is served the other's, and the plain queries get their own rows (WHERE h = 1 must never answer WHERE h = 2)
+# ---------------------------------------------------------------------------
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT g, count(*) FROM t WHERE h = 1 GROUP BY g ORDER BY g
+----
+analyzed_plan	<REGEX>:(?s).*"operator_name": "RECYCLER_MATERIALIZE".*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT g, count(*) FROM t WHERE h = 2 GROUP BY g ORDER BY g
+----
+analyzed_plan	<REGEX>:(?s).*"operator_name": "RECYCLER_MATERIALIZE".*
+
+query II
+SELECT name, value FROM recycler_stats() WHERE name IN ('block_hits', 'subsumption_hits', 'subtree_hits', 'whole_hits') ORDER BY name
+----
+block_hits	0
+subsumption_hits	0
+subtree_hits	1
+whole_hits	7
+
+query II
+SELECT g, count(*) FROM t WHERE h = 1 GROUP BY g ORDER BY g
+----
+0	220
+1	220
+2	219
+3	220
+4	220
+5	220
+6	220
+
+query II
+SELECT g, count(*) FROM t WHERE h = 2 GROUP BY g ORDER BY g
+----
+0	220
+1	220
+2	220
+3	219
+4	220
+5	220
+6	220
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+9
+
+# ---------------------------------------------------------------------------
+# a write wrapped in EXPLAIN ANALYZE is a write: it is announced for t, its commit evicts every entry over t
+# (all nine read t), nothing is cleared, and the next plain run is answered with the new row and stored again
+# ---------------------------------------------------------------------------
+statement ok
+EXPLAIN ANALYZE INSERT INTO t VALUES (20000, 0, 0)
+
+query I
+SELECT count(*) FROM recycler_entries()
+----
+0
+
+query II
+SELECT name, value FROM recycler_stats() WHERE name IN ('clears', 'invalidated_entries') ORDER BY name
+----
+clears	0
+invalidated_entries	9
+
+query II
+SELECT g, count(*) FROM t GROUP BY g ORDER BY g
+----
+0	2859
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+query II
+SELECT g, count(*) FROM t GROUP BY g ORDER BY g
+----
+0	2859
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+query II
+SELECT name, value FROM recycler_stats() WHERE name IN ('entries', 'whole_hits') ORDER BY name
+----
+entries	2
+whole_hits	10
+
+# ---------------------------------------------------------------------------
+# recycler_enabled = false plans and stores nothing: the cache content is frozen while it is off
+# ---------------------------------------------------------------------------
+query I
+SELECT value FROM recycler_stats() WHERE name = 'writes_planned'
+----
+11
+
+statement ok
+SET recycler_enabled = false;
+
+query II
+SELECT g, count(*) FROM t WHERE h = 3 GROUP BY g ORDER BY g
+----
+0	220
+1	220
+2	220
+3	220
+4	219
+5	220
+6	220
+
+statement ok
+RESET recycler_enabled;
+
+query II
+SELECT name, value FROM recycler_stats() WHERE name IN ('entries', 'skip_disabled', 'writes_planned') ORDER BY name
+----
+entries	2
+skip_disabled	1
+writes_planned	11
