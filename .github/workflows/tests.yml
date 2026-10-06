@@ -100,8 +100,11 @@ jobs:
     env:
       UBSAN_OPTIONS: print_stacktrace=1
       # duckdb runs two links at once in a non-Release build; one sanitizer link of unittest alone takes
-      # several GB
-      EXT_FLAGS: -DDUCKDB_DEBUG_LINK_JOBS=1
+      # several GB. duckdb/CMakeLists.txt forces -g on RelWithDebInfo, so the debug information is
+      # compressed (-gz) instead of reduced: the build ran out of disk on 2026-10-06.
+      EXT_FLAGS: >-
+        -DDUCKDB_DEBUG_LINK_JOBS=1 -DCMAKE_C_FLAGS=-gz -DCMAKE_CXX_FLAGS=-gz
+        -DCMAKE_EXE_LINKER_FLAGS=-gz -DCMAKE_SHARED_LINKER_FLAGS=-gz
     steps:
       - uses: actions/checkout@v4
         with:
