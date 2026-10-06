@@ -37,6 +37,7 @@ class ClientContext;
 class Expression;
 class LogicalComparisonJoin;
 class LogicalGet;
+class TableCatalogEntry;
 
 //! 128-bit compositional hash of a subtree
 struct SigHash {
@@ -55,6 +56,30 @@ struct SigHashHasher {
 	}
 };
 
+//! Why a subtree is not cacheable; counted per query root in recycler_stats()
+enum class RefusalReason : uint8_t {
+	NONE = 0,
+	TABLE_FUNCTION,
+	SAMPLED_SCAN,
+	SCAN_OPTIONS,
+	CORRELATED_COLUMN,
+	VOLATILE_FUNCTION,
+	PARAMETER,
+	EXPRESSION,
+	OPERATOR,
+	CONSTANT_COLLECTION,
+	EXTERNAL_REFERENCE,
+	DELIM_GET,
+	LIMIT_WITHOUT_ORDER,
+	RUNTIME_FILTER,
+	TEMPORARY_TABLE,
+	FOREIGN_CATALOG,
+	SESSION_BOUND_FUNCTION,
+	COUNT
+};
+
+const char *RefusalReasonName(RefusalReason reason);
+
 //! Per-node analysis results
 struct NodeInfo {
 	//! Compositional hash of the subtree rooted at this node (valid iff !refused && !external_ref)
@@ -63,8 +88,9 @@ struct NodeInfo {
 	idx_t start = 0;
 	idx_t count = 0;
 	//! The subtree contains an operator/expression the renderer does not support (volatile functions,
-	//! parameters, table functions, unknown operator types, ...)
+	//! parameters, table functions, unknown operator types, ...); `refusal` is the first one met
 	bool refused = false;
+	RefusalReason refusal = RefusalReason::NONE;
 	//! The subtree references a column binding that is produced outside of it
 	bool external_ref = false;
 	//! The subtree contains a LogicalDelimGet whose owning delim join is not inside the subtree
@@ -84,12 +110,21 @@ struct NodeInfo {
 	//! cross products); nothing above it is materialized on first sight
 	bool unreliable_estimate = false;
 	//! Owners of dynamic filter sets that some scan in this subtree depends on but which are not in the subtree
-	vector<const LogicalOperator *> pending_dynamic_owners;
+	vector<LogicalOperator *> pending_dynamic_owners;
+	//! The base tables the subtree reads, each once, in scan order; a RecyclerScan reads those of the subtree it
+	//! replaced
+	vector<reference<const TableCatalogEntry>> tables;
 
 	bool Cacheable() const {
-		return !refused && !external_ref && !unresolved_delim_get && !nondeterministic && !runtime_filtered &&
-		       pending_dynamic_owners.empty();
+		return CacheableWithoutOuterFilters() && pending_dynamic_owners.empty();
 	}
+	//! Cacheable once the runtime filters of the joins in pending_dynamic_owners stop reaching the subtree's scans
+	//! (StripRuntimeFilters); a hit needs no stripping, since the scan of the entry replaces those scans
+	bool CacheableWithoutOuterFilters() const {
+		return !refused && !external_ref && !unresolved_delim_get && !nondeterministic && !runtime_filtered;
+	}
+	//! Why the subtree is not cacheable (NONE when it is)
+	RefusalReason Reason() const;
 };
 
 //! A base-table column: block-relative canonical table id plus the physical column id in that table
@@ -136,7 +171,11 @@ struct BlockShape {
 //! Analyzes a plan once and exposes per-node signatures
 class PlanSignatures {
 public:
-	explicit PlanSignatures(ClientContext &context, bool shape_mode = false);
+	//! Rendering of the session settings that change a result without changing the plan (see the definition); the
+	//! pre hook reads it once per statement and both hooks analyze under it
+	static string SettingsSalt(const ClientContext &context);
+	//! Every signature of this analysis carries salt
+	PlanSignatures(ClientContext &context, const string &salt);
 
 	//! Analyze the plan rooted at root (assigns canonical ids, computes NodeInfo for every node)
 	void Analyze(LogicalOperator &root);
@@ -158,6 +197,8 @@ private:
 		idx_t count;
 	};
 
+	PlanSignatures(ClientContext &context, const string &salt, bool shape_mode);
+
 	void AssignIds(const LogicalOperator &op);
 	void Compute(LogicalOperator &op);
 	void RenderNode(const LogicalOperator &op, const Frame &frame, Sink &sink, NodeInfo &info,
@@ -166,7 +207,7 @@ private:
 	void RenderBinding(ColumnBinding binding, const Frame &frame, Sink &sink, NodeInfo &info) const;
 	void RenderOwnIndex(idx_t table_index, const Frame &frame, Sink &sink) const;
 	void RenderJoin(const LogicalComparisonJoin &join, const Frame &frame, Sink &sink, NodeInfo &info) const;
-	void CollectDynamicOwners(const LogicalOperator &op);
+	void CollectDynamicOwners(LogicalOperator &op);
 	//! Identity of a binding that refers to a scan of the analyzed (sub)tree
 	ColumnIdentity IdentityOf(ColumnBinding binding) const;
 	//! Recognize `column <op> constant` / `column IS NOT NULL` conjuncts over base columns
@@ -176,6 +217,9 @@ private:
 	ClientContext &context;
 	//! Shape mode: block normal form (see file comment)
 	const bool shape_mode;
+	//! Written at the start of every node, in the hash and in the stored rendering; RecyclerClientState::settings_salt,
+	//! which outlives every analysis of the statement (a block analysis is nested in the plan analysis)
+	const string &salt;
 	const LogicalOperator *block_root = nullptr;
 	//! Sorted canonical strings of the block root's non-parameterized conjuncts
 	vector<string> root_conjuncts;
@@ -187,8 +231,9 @@ private:
 	idx_t joins = 0;
 	//! node -> info
 	std::unordered_map<const LogicalOperator *, NodeInfo> infos;
-	//! DynamicTableFilterSet* -> owning join operator
-	std::unordered_map<const void *, const LogicalOperator *> dynamic_owners;
+	//! DynamicTableFilterSet* -> every join that pushes runtime filters into it: JoinFilterPushdownOptimizer gives a
+	//! scan one set that all of them share
+	std::unordered_map<const void *, vector<LogicalOperator *>> dynamic_owners;
 };
 
 //! Compute the shape of the SPJ block rooted at `root` (a LOGICAL_FILTER on the bound plan); `plan_info` is the

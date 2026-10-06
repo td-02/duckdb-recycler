@@ -1,0 +1,744 @@
+# name: test/sql/recycler/recycler_invalidation_statements.test
+# description: every statement that writes a table invalidates the entries over it: those the pre hook names a table
+# for (TRUNCATE, COPY FROM, MERGE, RETURNING) per table, the others (EXECUTE of a prepared write, a write with the
+# optimizer disabled) for their whole database, and none of them lets a reader with an older snapshot store
+# group: [recycler]
+
+require waddle
+
+statement ok con1
+SET recycler_min_input_rows = 1;
+
+statement ok con2
+SET recycler_min_input_rows = 1;
+
+statement ok con1
+CREATE TABLE a AS SELECT range AS id, range % 7 AS g FROM range(20000);
+
+statement ok con1
+CREATE TABLE b AS SELECT range AS id, range % 5 AS g FROM range(20000);
+
+# every labeled query hashes to the first query under its label, which runs with the recycler disabled
+
+statement ok con1
+SET recycler_enabled = false;
+
+query II con1 a0
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+0	2858
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+query II con1 b0
+SELECT g, count(*) AS c FROM b GROUP BY g ORDER BY g
+----
+0	4000
+1	4000
+2	4000
+3	4000
+4	4000
+
+statement ok con1
+RESET recycler_enabled;
+
+query II con1 a0
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+
+query II con1 b0
+SELECT g, count(*) AS c FROM b GROUP BY g ORDER BY g
+----
+
+# the whole result and the aggregate of each query
+query I con1
+SELECT count(*) FROM recycler_entries()
+----
+4
+
+# ---------------------------------------------------------------------------
+# (a) COPY TO only reads; COPY FROM plans as an INSERT into a
+# ---------------------------------------------------------------------------
+statement ok con2
+COPY (SELECT * FROM a WHERE id < 3) TO '__TEST_DIR__/recycler_invalidation_rows.csv' (HEADER);
+
+query I con1
+SELECT count(*) FROM recycler_entries()
+----
+4
+
+statement ok con2
+COPY a FROM '__TEST_DIR__/recycler_invalidation_rows.csv' (HEADER);
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'invalidated_entries'
+----
+2
+
+query II con1 b0
+SELECT g, count(*) AS c FROM b GROUP BY g ORDER BY g
+----
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+1
+
+statement ok con1
+SET recycler_enabled = false;
+
+query II con1 a1
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+0	2859
+1	2858
+2	2858
+3	2857
+4	2857
+5	2857
+6	2857
+
+statement ok con1
+RESET recycler_enabled;
+
+query II con1 a1
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+
+query I con1
+SELECT count(*) FROM recycler_entries()
+----
+4
+
+# ---------------------------------------------------------------------------
+# (b) MERGE INTO a
+# ---------------------------------------------------------------------------
+statement ok con2
+MERGE INTO a USING (SELECT range AS id, 6 AS g FROM range(19998, 20002)) AS s ON a.id = s.id
+WHEN MATCHED THEN UPDATE SET g = s.g
+WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.g);
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'invalidated_entries'
+----
+4
+
+query II con1 b0
+SELECT g, count(*) AS c FROM b GROUP BY g ORDER BY g
+----
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+2
+
+statement ok con1
+SET recycler_enabled = false;
+
+query II con1 a2
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+0	2858
+1	2858
+2	2858
+3	2857
+4	2857
+5	2857
+6	2860
+
+statement ok con1
+RESET recycler_enabled;
+
+query II con1 a2
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+
+# ---------------------------------------------------------------------------
+# (c) a write with RETURNING is a projection over the write
+# ---------------------------------------------------------------------------
+query I con2
+INSERT INTO a VALUES (30000, 0), (30001, 0) RETURNING id
+----
+30000
+30001
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'invalidated_entries'
+----
+6
+
+query II con1 b0
+SELECT g, count(*) AS c FROM b GROUP BY g ORDER BY g
+----
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+3
+
+statement ok con1
+SET recycler_enabled = false;
+
+query II con1 a3
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+0	2860
+1	2858
+2	2858
+3	2857
+4	2857
+5	2857
+6	2860
+
+statement ok con1
+RESET recycler_enabled;
+
+query II con1 a3
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+
+# ---------------------------------------------------------------------------
+# (d) TRUNCATE plans as a DELETE from a
+# ---------------------------------------------------------------------------
+statement ok con2
+TRUNCATE a;
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'invalidated_entries'
+----
+8
+
+query II con1 b0
+SELECT g, count(*) AS c FROM b GROUP BY g ORDER BY g
+----
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+4
+
+query I con1
+SELECT count(*) FROM a
+----
+0
+
+statement ok con2
+INSERT INTO a SELECT range AS id, range % 7 AS g FROM range(20000);
+
+query II con1 a0
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+
+# no write cleared the cache
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'clears'
+----
+0
+
+# ---------------------------------------------------------------------------
+# (e) EXECUTE of a prepared write names no table: it is announced for the whole database. In a transaction that
+# also announced a, the write to b still invalidates b's entries. A statement prepared through the client API
+# (Connection::Prepare, the C API, parameters in Python or JDBC) runs without the pre hook and is announced by
+# OnExecutePrepared instead, which also has a plan holding a recycler operator planned again, so that a prepared
+# SELECT is not served an entry a commit evicted after the PREPARE; this runner sends every statement as SQL text,
+# so its PREPARE and EXECUTE reach the pre hook (LOGICAL_EXECUTE) and that path cannot be tested here.
+# ---------------------------------------------------------------------------
+statement ok con2
+PREPARE insert_b AS INSERT INTO b VALUES ($1, $2);
+
+query I con1
+SELECT count(*) FROM recycler_entries()
+----
+4
+
+statement ok con2
+BEGIN TRANSACTION;
+
+statement ok con2
+INSERT INTO a VALUES (20000, 0);
+
+statement ok con2
+EXECUTE insert_b(20000, 0);
+
+statement ok con2
+EXECUTE insert_b(20001, 0);
+
+statement ok con2
+COMMIT;
+
+query I con1
+SELECT count(*) FROM recycler_entries()
+----
+0
+
+statement ok con1
+SET recycler_enabled = false;
+
+query II con1 b1
+SELECT g, count(*) AS c FROM b GROUP BY g ORDER BY g
+----
+0	4002
+1	4000
+2	4000
+3	4000
+4	4000
+
+statement ok con1
+RESET recycler_enabled;
+
+query II con1 b1
+SELECT g, count(*) AS c FROM b GROUP BY g ORDER BY g
+----
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+4
+
+# the two EXECUTEs, and the two CREATE TABLEs at the start
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'skip_modified_databases'
+----
+4
+
+# ---------------------------------------------------------------------------
+# (f) a write with the optimizer disabled reaches no pre hook: its commit evicts the whole database, also in a
+# transaction that announced another table
+# ---------------------------------------------------------------------------
+statement ok con1
+SET recycler_enabled = false;
+
+query II con1 a4
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+0	2859
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+statement ok con1
+RESET recycler_enabled;
+
+query II con1 a4
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+
+query I con1
+SELECT count(*) FROM recycler_entries()
+----
+4
+
+statement ok con2
+BEGIN TRANSACTION;
+
+statement ok con2
+INSERT INTO b VALUES (20002, 1);
+
+statement ok con2
+PRAGMA disable_optimizer;
+
+statement ok con2
+INSERT INTO a VALUES (20001, 0);
+
+statement ok con2
+PRAGMA enable_optimizer;
+
+statement ok con2
+COMMIT;
+
+query I con1
+SELECT count(*) FROM recycler_entries()
+----
+0
+
+statement ok con1
+SET recycler_enabled = false;
+
+query II con1 a5
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+0	2860
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+statement ok con1
+RESET recycler_enabled;
+
+query II con1 a5
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+4
+
+# ---------------------------------------------------------------------------
+# (g) the race, for each kind of write: con1's transaction starts before con2's write commits and reads a after it;
+# con1's result must not be stored, so con2 is answered with its own commit
+# ---------------------------------------------------------------------------
+statement ok con2
+PREPARE insert_a AS INSERT INTO a VALUES ($1, $2);
+
+# RETURNING
+statement ok con1
+BEGIN TRANSACTION;
+
+query I con1
+SELECT count(*) FROM b
+----
+20003
+
+query I con2
+INSERT INTO a VALUES (20002, 0), (20003, 0) RETURNING id
+----
+20002
+20003
+
+query II con1 a5
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+
+statement ok con1
+COMMIT;
+
+statement ok con2
+SET recycler_enabled = false;
+
+query II con2 a6
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+0	2862
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+statement ok con2
+RESET recycler_enabled;
+
+query II con2 a6
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+
+query II con2 a6
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+
+# EXECUTE
+statement ok con1
+BEGIN TRANSACTION;
+
+query I con1
+SELECT count(*) FROM b
+----
+20003
+
+statement ok con2
+EXECUTE insert_a(20004, 0);
+
+statement ok con2
+EXECUTE insert_a(20005, 0);
+
+query II con1 a6
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+
+statement ok con1
+COMMIT;
+
+statement ok con2
+SET recycler_enabled = false;
+
+query II con2 a7
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+0	2864
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+statement ok con2
+RESET recycler_enabled;
+
+query II con2 a7
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+
+query II con2 a7
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+
+# a write with the optimizer disabled
+statement ok con1
+BEGIN TRANSACTION;
+
+query I con1
+SELECT count(*) FROM b
+----
+20003
+
+statement ok con2
+PRAGMA disable_optimizer;
+
+statement ok con2
+INSERT INTO a VALUES (20006, 0), (20007, 0);
+
+statement ok con2
+PRAGMA enable_optimizer;
+
+query II con1 a7
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+
+statement ok con1
+COMMIT;
+
+statement ok con2
+SET recycler_enabled = false;
+
+query II con2 a8
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+0	2866
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+statement ok con2
+RESET recycler_enabled;
+
+query II con2 a8
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+
+query II con2 a8
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+
+# in each race, con1's stale result was never stored and con2's second query was served its first
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+7
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'hash_collisions'
+----
+0
+
+# ---------------------------------------------------------------------------
+# (h) which tables a statement without the extension optimizer writes is unknown: while its transaction is open,
+# even a read-only one, no connection is served or stores
+# ---------------------------------------------------------------------------
+statement ok con2
+BEGIN TRANSACTION;
+
+statement ok con2
+PRAGMA disable_optimizer;
+
+query I con2
+SELECT count(*) FROM b
+----
+20003
+
+query II con1 a8
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+7
+
+statement ok con2
+PRAGMA enable_optimizer;
+
+statement ok con2
+COMMIT;
+
+query II con1 a8
+SELECT g, count(*) AS c FROM a GROUP BY g ORDER BY g
+----
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+8
+
+# ---------------------------------------------------------------------------
+# (i) a plain EXPLAIN writes nothing, but DuckDB commits the database the explained write modifies: the write is
+# announced for the table it names, so a connection that explained a write and stays idle stops no other connection
+# from being served, and the entries over other tables stay
+# ---------------------------------------------------------------------------
+statement ok con1
+SET recycler_enabled = false;
+
+query II con1 b2
+SELECT g, count(*) AS c FROM b GROUP BY g ORDER BY g
+----
+0	4002
+1	4001
+2	4000
+3	4000
+4	4000
+
+statement ok con1
+RESET recycler_enabled;
+
+query II con1 b2
+SELECT g, count(*) AS c FROM b GROUP BY g ORDER BY g
+----
+
+# the entries over a and over b
+query I con1
+SELECT count(*) FROM recycler_entries()
+----
+4
+
+statement ok con2
+EXPLAIN INSERT INTO a VALUES (40000, 0);
+
+query II con1 b2
+SELECT g, count(*) AS c FROM b GROUP BY g ORDER BY g
+----
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+9
+
+# the commit evicted the entries over a only
+query I con1
+SELECT count(*) FROM recycler_entries()
+----
+2
+
+query I con1
+SELECT count(*) FROM a WHERE id = 40000
+----
+0
+
+# in an open transaction, the explained write blocks a, not b
+statement ok con2
+BEGIN TRANSACTION;
+
+statement ok con2
+EXPLAIN DELETE FROM a;
+
+query II con1 b2
+SELECT g, count(*) AS c FROM b GROUP BY g ORDER BY g
+----
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+10
+
+statement ok con2
+COMMIT;
+
+# ---------------------------------------------------------------------------
+# (j) an auto-commit write with the optimizer disabled announces every database before it runs and stamps the one it
+# wrote at its commit: a connection that stays idle afterwards stops no other connection from being served
+# ---------------------------------------------------------------------------
+statement ok con2
+PRAGMA disable_optimizer;
+
+statement ok con2
+INSERT INTO a VALUES (40001, 0);
+
+# the commit evicted every entry of the database
+query I con1
+SELECT count(*) FROM recycler_entries()
+----
+0
+
+query II con1 b2
+SELECT g, count(*) AS c FROM b GROUP BY g ORDER BY g
+----
+
+query II con1 b2
+SELECT g, count(*) AS c FROM b GROUP BY g ORDER BY g
+----
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+11
+
+statement ok con2
+PRAGMA enable_optimizer;
+
+# ---------------------------------------------------------------------------
+# (k) the cache keeps the version of a written table while a transaction may predate its commit, and forgets it at a
+# later commit of the database; a write to a temporary table creates no version, since no entry reads one
+# ---------------------------------------------------------------------------
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'versions'
+----
+0
+
+statement ok con1
+BEGIN TRANSACTION;
+
+query I con1
+SELECT count(*) FROM b
+----
+20003
+
+statement ok con2
+INSERT INTO a VALUES (40002, 0);
+
+# the database's version and a's
+query I con2
+SELECT value FROM recycler_stats() WHERE name = 'versions'
+----
+2
+
+statement ok con1
+COMMIT;
+
+statement ok con2
+INSERT INTO b VALUES (40003, 0);
+
+query I con2
+SELECT value FROM recycler_stats() WHERE name = 'versions'
+----
+0
+
+statement ok con2
+CREATE TEMP TABLE scratch (id INTEGER);
+
+statement ok con2
+BEGIN TRANSACTION;
+
+statement ok con2
+INSERT INTO scratch VALUES (1);
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'versions'
+----
+0
+
+statement ok con2
+COMMIT;

@@ -1,0 +1,125 @@
+# name: test/sql/recycler/recycler_session_functions_icu.test
+# description: ICU's CONSISTENT functions that read the transaction's start (unary age, current_localtimestamp, current_localtime) are refused; the answer is vanilla's and no statement is served
+# group: [recycler]
+
+# Runs only with ICU linked into the unittest binary: EXT_FLAGS=-DBUILD_EXTENSIONS=icu make release (what the
+# build-test and debug jobs of tests.yml do); a plain build skips it here.
+
+require icu
+
+require waddle
+
+statement ok
+SET threads = 4;
+
+statement ok
+SET recycler_min_input_rows = 1;
+
+statement ok
+SET TimeZone = 'UTC';
+
+statement ok
+CREATE TABLE e AS
+SELECT range AS id, range % 7 AS g, TIMESTAMPTZ '1990-01-01 00:00:00+00' + to_days(range % 3000) AS ts
+FROM range(20000);
+
+# ---------------------------------------------------------------------------
+# age(TIMESTAMPTZ) with one argument measures from the midnight of the transaction's start (ICUCalendarAge through
+# CurrentMidnight)
+# ---------------------------------------------------------------------------
+query IIT
+SELECT g, count(*) AS c, min(age(ts)) > INTERVAL 20 YEAR AS old FROM e GROUP BY g ORDER BY g
+----
+0	2858	true
+1	2857	true
+2	2857	true
+3	2857	true
+4	2857	true
+5	2857	true
+6	2857	true
+
+query IIT
+SELECT g, count(*) AS c, min(age(ts)) > INTERVAL 20 YEAR AS old FROM e GROUP BY g ORDER BY g
+----
+0	2858	true
+1	2857	true
+2	2857	true
+3	2857	true
+4	2857	true
+5	2857	true
+6	2857	true
+
+query II
+SELECT name, value FROM recycler_stats() WHERE name IN ('refused_session_bound_function', 'whole_hits', 'whole_stores')
+ORDER BY name
+----
+refused_session_bound_function	2
+whole_hits	0
+whole_stores	0
+
+# ---------------------------------------------------------------------------
+# current_localtimestamp() and current_localtime() hold the transaction's start in bind data (BindDataNow); the
+# expression rewriter folds them into a constant of the plan, so they reach the renderer only with it disabled
+# ---------------------------------------------------------------------------
+statement ok
+SET disabled_optimizers = 'expression_rewriter';
+
+query IIT
+SELECT g, count(*) AS c, max(current_localtimestamp()) > TIMESTAMP '2020-01-01' AS late FROM e GROUP BY g ORDER BY g
+----
+0	2858	true
+1	2857	true
+2	2857	true
+3	2857	true
+4	2857	true
+5	2857	true
+6	2857	true
+
+query IIT
+SELECT g, count(*) AS c, max(current_localtimestamp()) > TIMESTAMP '2020-01-01' AS late FROM e GROUP BY g ORDER BY g
+----
+0	2858	true
+1	2857	true
+2	2857	true
+3	2857	true
+4	2857	true
+5	2857	true
+6	2857	true
+
+query II
+SELECT name, value FROM recycler_stats() WHERE name IN ('refused_session_bound_function', 'whole_hits', 'whole_stores')
+ORDER BY name
+----
+refused_session_bound_function	4
+whole_hits	0
+whole_stores	0
+
+query IIT
+SELECT g, count(*) AS c, max(current_localtime()) >= TIME '00:00:00' AS t FROM e GROUP BY g ORDER BY g
+----
+0	2858	true
+1	2857	true
+2	2857	true
+3	2857	true
+4	2857	true
+5	2857	true
+6	2857	true
+
+query IIT
+SELECT g, count(*) AS c, max(current_localtime()) >= TIME '00:00:00' AS t FROM e GROUP BY g ORDER BY g
+----
+0	2858	true
+1	2857	true
+2	2857	true
+3	2857	true
+4	2857	true
+5	2857	true
+6	2857	true
+
+query II
+SELECT name, value FROM recycler_stats() WHERE name IN ('refused_session_bound_function', 'whole_hits', 'whole_stores')
+ORDER BY name
+----
+refused_session_bound_function	6
+whole_hits	0
+whole_stores	0

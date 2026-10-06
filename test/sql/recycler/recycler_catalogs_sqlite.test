@@ -1,0 +1,99 @@
+# name: test/sql/recycler/recycler_catalogs_sqlite.test
+# description: tables of an attached non-DuckDB catalog are refused: never stored, never served
+# group: [recycler]
+
+# Runs only with sqlite_scanner linked into the unittest binary:
+# EXTRA_EXTENSION_CONFIGS=$PWD/duckdb/.github/config/extensions/sqlite_scanner.cmake make release (what the build-test
+# and debug jobs of tests.yml do); a plain build skips it here.
+
+require sqlite_scanner
+
+require waddle
+
+statement ok
+SET recycler_min_input_rows = 1;
+
+statement ok
+ATTACH '__TEST_DIR__/foreign.sqlite' AS s (TYPE sqlite);
+
+statement ok
+CREATE TABLE s.t (id BIGINT, g BIGINT);
+
+statement ok
+INSERT INTO s.t SELECT range, range % 3 FROM range(3000);
+
+statement ok
+CREATE TABLE p AS SELECT range AS id, 'role' || range AS role FROM range(3);
+
+query II
+SELECT g, count(*) AS c FROM s.t GROUP BY g ORDER BY g
+----
+0	1000
+1	1000
+2	1000
+
+query II
+SELECT g, count(*) AS c FROM s.t GROUP BY g ORDER BY g
+----
+0	1000
+1	1000
+2	1000
+
+# a join with a DuckDB table is refused as a whole: the foreign scan poisons every subtree above it
+query TI
+SELECT p.role, count(*) AS c FROM s.t JOIN p ON s.t.g = p.id GROUP BY p.role ORDER BY p.role
+----
+role0	1000
+role1	1000
+role2	1000
+
+# every query above was refused at its root, nothing was planned, stored or served
+query I
+SELECT value FROM recycler_stats() WHERE name = 'refused_foreign_catalog'
+----
+3
+
+query I
+SELECT sum(value) FROM recycler_stats()
+WHERE name IN ('whole_hits', 'block_hits', 'subtree_hits', 'subsumption_hits', 'whole_stores', 'subtree_stores',
+               'block_stores', 'writes_planned', 'blocks_planted', 'entries')
+----
+0
+
+# the SQLite rows change through the attached catalog and the answer follows (a write through DuckDB is announced
+# like any other; the refusal is for the changes SQLite's file takes outside DuckDB, which no entry over s.t could
+# outlive)
+statement ok
+INSERT INTO s.t VALUES (3000, 0);
+
+query II
+SELECT g, count(*) AS c FROM s.t GROUP BY g ORDER BY g
+----
+0	1001
+1	1000
+2	1000
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'refused_foreign_catalog'
+----
+4
+
+# the DuckDB table alone is cached as usual
+query TI
+SELECT role, count(*) AS c FROM p GROUP BY role ORDER BY role
+----
+role0	1
+role1	1
+role2	1
+
+query TI
+SELECT role, count(*) AS c FROM p GROUP BY role ORDER BY role
+----
+role0	1
+role1	1
+role2	1
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+1

@@ -1,0 +1,117 @@
+# name: test/sql/recycler/recycler_catalogs.test
+# description: temporary tables are private to their connection: never stored, never served
+# group: [recycler]
+
+# Tables of attached non-DuckDB catalogs (SQLite, Postgres, ...) go through the same LOGICAL_GET refusal
+# (refused_foreign_catalog): recycler_catalogs_sqlite.test, which needs sqlite_scanner linked into the binary.
+
+require waddle
+
+statement ok con1
+SET recycler_min_input_rows = 1;
+
+statement ok con2
+SET recycler_min_input_rows = 1;
+
+statement ok con1
+CREATE TABLE p AS SELECT range AS id, 'role' || range AS role FROM range(5);
+
+# same name, same shape, different rows on each connection
+statement ok con1
+CREATE TEMP TABLE t AS SELECT range AS id, range % 3 AS g FROM range(3000);
+
+statement ok con2
+CREATE TEMP TABLE t AS SELECT range AS id, range % 5 AS g FROM range(5000);
+
+query II con1
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g
+----
+0	1000
+1	1000
+2	1000
+
+query II con2
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g
+----
+0	1000
+1	1000
+2	1000
+3	1000
+4	1000
+
+query II con1
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g
+----
+0	1000
+1	1000
+2	1000
+
+# a join with a persistent table is refused as a whole: the temp scan poisons every subtree above it
+query TI con1
+SELECT p.role, count(*) AS c FROM t JOIN p ON t.g = p.id GROUP BY p.role ORDER BY p.role
+----
+role0	1000
+role1	1000
+role2	1000
+
+query TI con2
+SELECT p.role, count(*) AS c FROM t JOIN p ON t.g = p.id GROUP BY p.role ORDER BY p.role
+----
+role0	1000
+role1	1000
+role2	1000
+role3	1000
+role4	1000
+
+# nested block over the temp table
+query I con2
+SELECT count(*) FROM (SELECT g, count(*) AS c FROM t GROUP BY g) b WHERE c = 1000
+----
+5
+
+query I con1
+SELECT count(*) FROM (SELECT g, count(*) AS c FROM t GROUP BY g) b WHERE c = 1000
+----
+3
+
+# every query above was refused at its root, nothing was planned, stored or served
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'refused_temporary_table'
+----
+7
+
+query I con2
+SELECT sum(value) FROM recycler_stats()
+WHERE name IN ('whole_hits', 'block_hits', 'subtree_hits', 'subsumption_hits', 'whole_stores', 'subtree_stores',
+               'block_stores', 'writes_planned', 'blocks_planted', 'entries')
+----
+0
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'refused_foreign_catalog'
+----
+0
+
+# the persistent table alone is cached as usual
+query TI con1
+SELECT role, count(*) AS c FROM p GROUP BY role ORDER BY role
+----
+role0	1
+role1	1
+role2	1
+role3	1
+role4	1
+
+query TI con2
+SELECT role, count(*) AS c FROM p GROUP BY role ORDER BY role
+----
+role0	1
+role1	1
+role2	1
+role3	1
+role4	1
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+1

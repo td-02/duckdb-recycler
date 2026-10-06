@@ -2,43 +2,58 @@
 // recycler_hooks.cpp - the pre- and post-optimizer passes
 //
 // Pre-optimize (before any built-in optimizer, i.e. on the bound plan):
+//   * writes announce their target table (or the database they modify) before
+//     they run; statements outside any database (ATTACH, LOAD) clear the cache
 //   * whole-result hit: the query's plan matches a cached result -> replace the
 //     whole plan with a RecyclerScan; miss -> remember the key for the post hook
 //   * nested-block hit: a sub-query block equals an earlier whole query
 //     (before filter pushdown rewrites it) -> replace the block
+//   * subsumption: an SPJ block narrower than a cached block -> scan the cached
+//     rows plus the residual predicates; admissible misses get a block marker
 // Post-optimize (after all built-in optimizers):
-//   * whole-result write: wrap the root in an ordered RecyclerMaterialize
+//   * block markers learn which base columns their pruned child produces
 //   * subtree cache: top-down, one materialization per root-to-leaf path,
 //     exact hits replace subtrees, admissible misses get a RecyclerMaterialize
+//   * whole-result write: wrap the root in a RecyclerMaterialize
+//
+// The decisions live in recycler_policy, the plan surgery in recycler_rewrite;
+// this file only orders the steps.
 //===----------------------------------------------------------------------===//
 #include "recycler_state.hpp"
 #include "recycler_operators.hpp"
+#include "recycler_policy.hpp"
+#include "recycler_rewrite.hpp"
 #include "recycler_signature.hpp"
 
-#include "duckdb/common/string_util.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/common/limits.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/query_profiler.hpp"
 #include "duckdb/optimizer/column_binding_replacer.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/column_binding_map.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
-#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/logical_operator_visitor.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
-#include "duckdb/planner/operator/logical_empty_result.hpp"
+#include "duckdb/planner/operator/logical_delete.hpp"
+#include "duckdb/planner/operator/logical_distinct.hpp"
 #include "duckdb/planner/operator/logical_explain.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
-#include "duckdb/planner/operator/logical_get.hpp"
-#include "duckdb/planner/operator/logical_projection.hpp"
-
-#include <algorithm>
-#include <unordered_set>
+#include "duckdb/planner/operator/logical_insert.hpp"
+#include "duckdb/planner/operator/logical_merge_into.hpp"
+#include "duckdb/planner/operator/logical_update.hpp"
+#include "duckdb/storage/buffer_manager.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 
+#include <algorithm>
 #include <chrono>
+#include <unordered_set>
 
 namespace duckdb {
 
@@ -62,6 +77,14 @@ static idx_t GetIntSetting(ClientContext &context, const char *name, idx_t defau
 	return default_value;
 }
 
+//! A setting given in MB, as bytes: clamped so that scaling it cannot wrap (a wrapped cap of 0 would silently
+//! disable every store)
+static idx_t GetByteSetting(ClientContext &context, const char *name, idx_t default_bytes) {
+	static constexpr idx_t MB = 1024 * 1024;
+	auto mb = GetIntSetting(context, name, default_bytes / MB);
+	return MinValue<idx_t>(mb, NumericLimits<idx_t>::Maximum() / MB) * MB;
+}
+
 RecyclerSettings LoadRecyclerSettings(ClientContext &context) {
 	RecyclerSettings s;
 	s.enabled = GetBoolSetting(context, "recycler_enabled", s.enabled);
@@ -69,18 +92,23 @@ RecyclerSettings LoadRecyclerSettings(ClientContext &context) {
 	s.blocks = GetBoolSetting(context, "recycler_blocks", s.blocks);
 	s.subtrees = GetBoolSetting(context, "recycler_subtrees", s.subtrees);
 	s.subsumption = GetBoolSetting(context, "recycler_subsumption", s.subsumption);
-	s.budget_bytes = GetIntSetting(context, "recycler_budget_mb", s.budget_bytes / (1024 * 1024)) * 1024 * 1024;
-	s.entry_cap_bytes =
-	    GetIntSetting(context, "recycler_entry_cap_mb", s.entry_cap_bytes / (1024 * 1024)) * 1024 * 1024;
+	// cached results compete with the queries for memory: whatever the setting says, at most a quarter of the limit
+	s.budget_bytes = MinValue<idx_t>(GetByteSetting(context, "recycler_budget_mb", s.budget_bytes),
+	                                 BufferManager::GetBufferManager(context).GetMaxMemory() / 4);
+	s.entry_cap_bytes = GetByteSetting(context, "recycler_entry_cap_mb", s.entry_cap_bytes);
 	s.entry_cap_rows = GetIntSetting(context, "recycler_entry_cap_rows", s.entry_cap_rows);
 	s.min_input_rows = GetIntSetting(context, "recycler_min_input_rows", s.min_input_rows);
-	s.speculate_bytes =
-	    GetIntSetting(context, "recycler_speculate_mb", s.speculate_bytes / (1024 * 1024)) * 1024 * 1024;
+	s.speculate_bytes = GetByteSetting(context, "recycler_speculate_mb", s.speculate_bytes);
+	s.compact_rows = GetIntSetting(context, "recycler_compact_rows", s.compact_rows);
 	return s;
 }
 
-static shared_ptr<RecyclerClientState> GetClientState(ClientContext &context) {
-	return context.registered_state->GetOrCreate<RecyclerClientState>("recycler");
+const RecyclerSettings &RecyclerClientState::GetSettings(ClientContext &context) {
+	if (!settings_loaded) {
+		settings = LoadRecyclerSettings(context);
+		settings_loaded = true;
+	}
+	return settings;
 }
 
 static RecyclerState *StateFromInput(OptimizerExtensionInput &input) {
@@ -104,13 +132,30 @@ struct ScopedTimer {
 //===----------------------------------------------------------------------===//
 // Root classification
 //===----------------------------------------------------------------------===//
-//! Statements that may change data or catalog state: drop everything we cached
+//! Statements that write the rows of one table (TRUNCATE is a DELETE, COPY FROM an INSERT, RETURNING a projection
+//! over the write): the target is announced to the cache, which withholds entries over it until the transaction
+//! ends
+static optional_ptr<TableCatalogEntry> WriteTarget(LogicalOperator &root) {
+	switch (root.type) {
+	case LogicalOperatorType::LOGICAL_PROJECTION:
+		return root.children.size() == 1 ? WriteTarget(*root.children[0]) : nullptr;
+	case LogicalOperatorType::LOGICAL_INSERT:
+		return root.Cast<LogicalInsert>().table;
+	case LogicalOperatorType::LOGICAL_DELETE:
+		return root.Cast<LogicalDelete>().table;
+	case LogicalOperatorType::LOGICAL_UPDATE:
+		return root.Cast<LogicalUpdate>().table;
+	case LogicalOperatorType::LOGICAL_MERGE_INTO:
+		return root.Cast<LogicalMergeInto>().table;
+	default:
+		return nullptr;
+	}
+}
+
+//! Statements that may change state the cache does not track and that modify no database the cache can stamp
+//! (ATTACH, DETACH, LOAD, ...): drop everything we cached
 static bool IsModifyingRoot(LogicalOperatorType type) {
 	switch (type) {
-	case LogicalOperatorType::LOGICAL_INSERT:
-	case LogicalOperatorType::LOGICAL_DELETE:
-	case LogicalOperatorType::LOGICAL_UPDATE:
-	case LogicalOperatorType::LOGICAL_MERGE_INTO:
 	case LogicalOperatorType::LOGICAL_ALTER:
 	case LogicalOperatorType::LOGICAL_CREATE_TABLE:
 	case LogicalOperatorType::LOGICAL_CREATE_INDEX:
@@ -121,7 +166,6 @@ static bool IsModifyingRoot(LogicalOperatorType type) {
 	case LogicalOperatorType::LOGICAL_CREATE_TYPE:
 	case LogicalOperatorType::LOGICAL_CREATE_SECRET:
 	case LogicalOperatorType::LOGICAL_DROP:
-	case LogicalOperatorType::LOGICAL_TRANSACTION:
 	case LogicalOperatorType::LOGICAL_ATTACH:
 	case LogicalOperatorType::LOGICAL_DETACH:
 	case LogicalOperatorType::LOGICAL_COPY_DATABASE:
@@ -188,59 +232,19 @@ static unique_ptr<LogicalOperator> *FindQueryRoot(unique_ptr<LogicalOperator> &p
 }
 
 //===----------------------------------------------------------------------===//
-// Rewrites
-//===----------------------------------------------------------------------===//
-//! Replace the operator in `slot` by a scan over `entry`, recording the binding replacements
-static bool SubstituteScan(unique_ptr<LogicalOperator> &slot, shared_ptr<CachedEntry> entry, bool ordered,
-                           Binder &binder, ColumnBindingReplacer &replacer) {
-	auto &old_op = *slot;
-	if (old_op.types != entry->types) {
-		return false;
-	}
-	auto old_bindings = old_op.GetColumnBindings();
-	if (old_bindings.size() != entry->types.size()) {
-		return false;
-	}
-	auto scan = make_uniq<LogicalRecyclerScan>(binder.GenerateTableIndex(), old_op.types, std::move(entry), ordered);
-	scan->ResolveOperatorTypes();
-	auto new_bindings = scan->GetColumnBindings();
-	for (idx_t i = 0; i < old_bindings.size(); i++) {
-		replacer.replacement_bindings.emplace_back(old_bindings[i], new_bindings[i]);
-	}
-	slot = std::move(scan);
-	return true;
-}
-
-//! `keep_alive` are column references the wrapper carries so that column pruning keeps those columns in the
-//! wrapped subtree's output even when nothing above the wrapper needs them
-static void WrapMaterialize(unique_ptr<LogicalOperator> &slot, RecyclerWriteSpec spec, shared_ptr<RecyclerCache> cache,
-                            vector<unique_ptr<Expression>> keep_alive = vector<unique_ptr<Expression>>()) {
-	auto child = std::move(slot);
-	auto wrapper = make_uniq<LogicalRecyclerMaterialize>(std::move(spec), std::move(cache), std::move(child));
-	wrapper->expressions = std::move(keep_alive);
-	wrapper->ResolveOperatorTypes();
-	slot = std::move(wrapper);
-}
-
-static bool IsRecyclerOperator(const LogicalOperator &op) {
-	return op.type == LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR &&
-	       (dynamic_cast<const LogicalRecyclerScan *>(&op) || dynamic_cast<const LogicalRecyclerMaterialize *>(&op));
-}
-
-//===----------------------------------------------------------------------===//
-// Pre-optimize: whole-result hits, nested-block hits
+// Pre-optimize: nested-block hits
 //===----------------------------------------------------------------------===//
 struct BlockMatcher {
-	BlockMatcher(ClientContext &context, Binder &binder, RecyclerCache &cache, const RecyclerSettings &settings,
-	             PlanSignatures &sig, bool preserve_order)
-	    : context(context), binder(binder), cache(cache), settings(settings), sig(sig),
+	BlockMatcher(Binder &binder, RecyclerCache &cache, const RecyclerClientState &client, PlanSignatures &sig,
+	             bool preserve_order)
+	    : binder(binder), cache(cache), settings(client.settings), snapshot(client.snapshot), sig(sig),
 	      preserve_order(preserve_order) {
 	}
 
-	ClientContext &context;
 	Binder &binder;
 	RecyclerCache &cache;
 	const RecyclerSettings &settings;
+	const TableSnapshot &snapshot;
 	PlanSignatures &sig;
 	bool preserve_order;
 	ColumnBindingReplacer replacer;
@@ -248,22 +252,19 @@ struct BlockMatcher {
 
 	void Walk(unique_ptr<LogicalOperator> &slot) {
 		auto &op = *slot;
-		if (IsRecyclerOperator(op)) {
+		if (AsRecyclerOperator(op)) {
 			return;
 		}
-		if (op.type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE || op.type == LogicalOperatorType::LOGICAL_RECURSIVE_CTE) {
-			// the definition (children[0]) may be deep-copied by CTE inlining, which cannot copy our operators;
-			// only look at the consumer side
-			if (op.children.size() == 2) {
-				Walk(op.children[1]);
-			}
+		auto consumer = CteConsumerSlot(op);
+		if (consumer) {
+			Walk(*consumer);
 			return;
 		}
 		auto &info = sig.Get(op);
 		if (info.Cacheable() && info.est_leaf_rows >= settings.min_input_rows && op.children.size() > 0) {
-			auto entry = cache.Lookup(RecyclerEntryKind::WHOLE_RESULT, info.hash, [&]() { return sig.Render(op); });
-			if (entry && (entry->ordered || !preserve_order) &&
-			    SubstituteScan(slot, entry, entry->ordered, binder, replacer)) {
+			auto entry = cache.Lookup(RecyclerEntryKind::WHOLE_RESULT, info, sig, op, snapshot);
+			if (entry && CanServe(*entry, preserve_order) &&
+			    SubstituteScan(slot, entry, entry->ordered, info.tables, binder, replacer)) {
 				cache.stats.block_hits++;
 				replaced = true;
 				return;
@@ -280,10 +281,33 @@ struct BlockMatcher {
 //===----------------------------------------------------------------------===//
 using binding_set_t = std::unordered_set<ColumnBinding, ColumnBindingHashFunction, ColumnBindingEquality>;
 
+//! Operators that consume their child's output by position and rebind it: what they need from the child appears in
+//! no expression of theirs, so a reference collector never sees it
+static bool ConsumesChildrenPositionally(const LogicalOperator &op) {
+	switch (op.type) {
+	case LogicalOperatorType::LOGICAL_UNION:
+	case LogicalOperatorType::LOGICAL_EXCEPT:
+	case LogicalOperatorType::LOGICAL_INTERSECT:
+	case LogicalOperatorType::LOGICAL_RECURSIVE_CTE:
+	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
+	case LogicalOperatorType::LOGICAL_PIVOT:
+	case LogicalOperatorType::LOGICAL_INSERT:
+	case LogicalOperatorType::LOGICAL_CREATE_TABLE:
+	case LogicalOperatorType::LOGICAL_COPY_TO_FILE:
+		return true;
+	case LogicalOperatorType::LOGICAL_DISTINCT:
+		// without targets, DISTINCT is over every column of the child
+		return op.Cast<LogicalDistinct>().distinct_targets.empty();
+	default:
+		return false;
+	}
+}
+
 //! Collects every column binding referenced by operators outside of `block`
 class ExternalReferenceCollector : public LogicalOperatorVisitor {
 public:
-	explicit ExternalReferenceCollector(const LogicalOperator &block) : block(block) {
+	ExternalReferenceCollector(const LogicalOperator &block, const vector<ColumnBinding> &block_bindings)
+	    : block(block), block_bindings(block_bindings.begin(), block_bindings.end()) {
 	}
 
 	void VisitOperator(LogicalOperator &op) override {
@@ -291,6 +315,17 @@ public:
 			return;
 		}
 		VisitOperatorExpressions(op);
+		if (ConsumesChildrenPositionally(op)) {
+			// the block's own columns still reach this operator (nothing in between rebound them), and it reads
+			// them by position without naming them in an expression
+			for (auto &child : op.children) {
+				for (auto &binding : child->GetColumnBindings()) {
+					if (block_bindings.find(binding) != block_bindings.end()) {
+						opaque_parent = true;
+					}
+				}
+			}
+		}
 		VisitOperatorChildren(op);
 	}
 
@@ -300,7 +335,11 @@ public:
 	}
 
 	const LogicalOperator &block;
+	binding_set_t block_bindings;
 	binding_set_t references;
+	//! An operator above consumes the block's columns by position: `references` does not describe what the rest of
+	//! the query needs from the block, so no column may be dropped on its word
+	bool opaque_parent = false;
 };
 
 static void CollectBindings(const Expression &expr, vector<ColumnBinding> &out) {
@@ -312,8 +351,10 @@ static void CollectBindings(const Expression &expr, vector<ColumnBinding> &out) 
 
 struct SubsumptionPass {
 	SubsumptionPass(ClientContext &context, Binder &binder, shared_ptr<RecyclerCache> cache,
-	                const RecyclerSettings &settings, PlanSignatures &sig, LogicalOperator &plan)
-	    : context(context), binder(binder), cache(std::move(cache)), settings(settings), sig(sig), plan(plan) {
+	                const RecyclerSettings &settings, PlanSignatures &sig, const TableSnapshot &snapshot,
+	                LogicalOperator &plan)
+	    : context(context), binder(binder), cache(std::move(cache)), settings(settings), sig(sig), snapshot(snapshot),
+	      plan(plan) {
 	}
 
 	ClientContext &context;
@@ -321,30 +362,30 @@ struct SubsumptionPass {
 	shared_ptr<RecyclerCache> cache;
 	const RecyclerSettings &settings;
 	PlanSignatures &sig;
+	const TableSnapshot &snapshot;
 	LogicalOperator &plan;
 	ColumnBindingReplacer replacer;
 	bool replaced = false;
 
 	void Walk(unique_ptr<LogicalOperator> &slot) {
 		auto &op = *slot;
-		if (IsRecyclerOperator(op)) {
+		if (AsRecyclerOperator(op)) {
 			return;
 		}
-		if (op.type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE || op.type == LogicalOperatorType::LOGICAL_RECURSIVE_CTE) {
-			// CTE definitions may be deep-copied by CTE inlining, which cannot copy our operators
-			if (op.children.size() == 2) {
-				Walk(op.children[1]);
-			}
+		auto consumer = CteConsumerSlot(op);
+		if (consumer) {
+			Walk(*consumer);
 			return;
 		}
 		if (op.type == LogicalOperatorType::LOGICAL_FILTER && sig.Get(op).Cacheable()) {
 			auto shape = ComputeBlockShape(context, op, sig);
 			if (shape.ok) {
-				if (TryHit(slot, shape)) {
+				auto &tables = sig.Get(op).tables;
+				if (TryHit(slot, shape, tables)) {
 					replaced = true;
 					return;
 				}
-				if (Admit(shape)) {
+				if (AdmitBlockWrite(*cache, settings, shape) && cache->Admissible(tables, snapshot)) {
 					Plant(slot, shape);
 					return;
 				}
@@ -353,12 +394,6 @@ struct SubsumptionPass {
 		for (auto &child : op.children) {
 			Walk(child);
 		}
-	}
-
-	bool Admit(const BlockShape &shape) {
-		// multi-table blocks only: the target is the FROM/WHERE part of dashboard-style queries, whose output is
-		// far smaller than the tables they join
-		return shape.joins >= 2 && shape.est_leaf_rows >= settings.min_input_rows && !cache->IsTooBig(shape.hash);
 	}
 
 	void Plant(unique_ptr<LogicalOperator> &slot, BlockShape &shape) {
@@ -379,15 +414,9 @@ struct SubsumptionPass {
 				}
 			}
 		}
-		RecyclerWriteSpec spec;
-		spec.kind = RecyclerEntryKind::BLOCK;
-		spec.hash = shape.hash;
-		spec.canonical = std::move(shape.canonical);
-		spec.ordered = false;
-		spec.est_input_rows = shape.est_leaf_rows;
-		spec.cap_rows = settings.entry_cap_rows;
-		spec.cap_bytes = settings.entry_cap_bytes;
-		spec.budget_bytes = settings.budget_bytes;
+		auto spec =
+		    RecyclerWriteSpec::Make(RecyclerEntryKind::BLOCK, shape.hash, std::move(shape.canonical), false,
+		                            shape.est_leaf_rows, TableDependencies(sig.Get(*slot).tables, snapshot), settings);
 		spec.constraints = std::move(shape.constraints);
 		spec.conjuncts = std::move(shape.conjuncts);
 		spec.table_ids = std::move(shape.table_ids);
@@ -395,7 +424,8 @@ struct SubsumptionPass {
 		WrapMaterialize(slot, std::move(spec), cache, std::move(keep_alive));
 	}
 
-	bool TryHit(unique_ptr<LogicalOperator> &slot, const BlockShape &shape) {
+	bool TryHit(unique_ptr<LogicalOperator> &slot, const BlockShape &shape,
+	            const vector<reference<const TableCatalogEntry>> &tables) {
 		auto entries = cache->LookupBlocks(shape.hash);
 		if (entries.empty()) {
 			return false;
@@ -404,13 +434,19 @@ struct SubsumptionPass {
 		auto bindings = root.GetColumnBindings();
 		auto &types = root.types;
 		// which of the block's output columns does the rest of the query need?
-		ExternalReferenceCollector collector(root);
+		ExternalReferenceCollector collector(root, bindings);
 		collector.VisitOperator(plan);
+		if (collector.opaque_parent) {
+			return false;
+		}
 		for (auto &entry : entries) {
 			if (entry->canonical != shape.canonical) {
 				continue;
 			}
 			if (!RangeConstraintsImply(shape.constraints, entry->constraints)) {
+				continue;
+			}
+			if (!cache->IsCurrent(*entry, tables, snapshot)) {
 				continue;
 			}
 			if (entry->rows > shape.est_leaf_rows / 2) {
@@ -482,7 +518,7 @@ struct SubsumptionPass {
 			}
 			// rewrite: scan of the stored columns, plus the residual predicates
 			auto new_index = binder.GenerateTableIndex();
-			auto scan = make_uniq<LogicalRecyclerScan>(new_index, scan_types, entry, false, scan_columns);
+			auto scan = make_uniq<LogicalRecyclerScan>(new_index, scan_types, entry, false, tables, scan_columns);
 			scan->ResolveOperatorTypes();
 			for (auto &m : mapping) {
 				replacer.replacement_bindings.emplace_back(m.first, ColumnBinding(new_index, m.second));
@@ -507,127 +543,118 @@ struct SubsumptionPass {
 };
 
 //===----------------------------------------------------------------------===//
-// Post-optimize: resolve the stored columns of planted block markers
+// Pre-optimize: the hook
 //===----------------------------------------------------------------------===//
-struct BlockFinalizer {
-	struct Resolution {
-		ColumnIdentity identity;
-		bool compressed = false;
-		bool valid = false;
-	};
+//! Gate: which statements take part. Returns the query root's slot, or nullptr with the reason counted.
+static unique_ptr<LogicalOperator> *GateStatement(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan,
+                                                  RecyclerCache &cache, RecyclerClientState &client) {
+	auto &context = input.context;
+	if (plan->type == LogicalOperatorType::LOGICAL_SET || plan->type == LogicalOperatorType::LOGICAL_RESET ||
+	    plan->type == LogicalOperatorType::LOGICAL_PRAGMA) {
+		client.settings_loaded = false;
+	}
+	// announced before the write runs, whatever this session's settings say: a reader that starts after the commit
+	// must never find an entry the cache has not yet heard about (the stamp follows at commit). A database the
+	// statement modifies without a table named here is announced as a whole: DDL, and EXECUTE, whose root
+	// (LOGICAL_EXECUTE) carries the prepared statement's modified databases. PREPARE (LOGICAL_PREPARE) runs
+	// nothing and modifies nothing. A plain EXPLAIN writes nothing, but DuckDB marks the databases the explained
+	// statement modifies as modified, and so commits them.
+	auto explained = plan->type == LogicalOperatorType::LOGICAL_EXPLAIN && plan->children.size() == 1;
+	auto &statement = explained ? *plan->children[0] : *plan;
+	auto target = WriteTarget(statement);
+	auto &modified = input.optimizer.binder.GetStatementProperties().modified_databases;
+	client.AnnounceStatement(context, cache, target, modified);
+	auto root_slot = FindQueryRoot(plan);
+	if (!root_slot) {
+		cache.stats.skip_not_query++;
+		return nullptr;
+	}
+	auto &root = **root_slot;
+	if (target) {
+		cache.stats.announced_table_writes++;
+		return nullptr;
+	}
+	if (!modified.empty()) {
+		cache.stats.skip_modified_databases++;
+		return nullptr;
+	}
+	if (IsModifyingRoot(root.type)) {
+		cache.stats.skip_modifying++;
+		cache.Clear();
+		return nullptr;
+	}
+	if (!IsReadRoot(root.type)) {
+		cache.stats.skip_not_read++;
+		return nullptr;
+	}
+	if (!client.GetSettings(context).enabled) {
+		cache.stats.skip_disabled++;
+		return nullptr;
+	}
+	// a running write transaction must not be served from or written into the cache
+	if (context.transaction.HasActiveTransaction() && MetaTransaction::Get(context).ModifiedDatabase()) {
+		cache.stats.skip_write_transaction++;
+		return nullptr;
+	}
+	if (!client.transaction_tracked) {
+		cache.stats.skip_untracked_transaction++;
+		return nullptr;
+	}
+	return root_slot;
+}
 
-	std::unordered_map<idx_t, const LogicalOperator *> producers;
-	const std::unordered_map<idx_t, idx_t> *table_ids = nullptr;
-
-	void CollectProducers(const LogicalOperator &op) {
-		if (op.type == LogicalOperatorType::LOGICAL_EMPTY_RESULT) {
-			for (auto &binding : op.Cast<LogicalEmptyResult>().bindings) {
-				producers[binding.table_index] = &op;
-			}
-		} else {
-			for (auto idx : op.GetTableIndex()) {
-				producers[idx] = &op;
-			}
-		}
-		for (auto &child : op.children) {
-			CollectProducers(*child);
+//! Whole result: serve a cached result (true), or remember the key so the post hook can write one
+static bool ServeOrPlanWholeResult(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &root_slot,
+                                   RecyclerCache &cache, RecyclerClientState &client, PlanSignatures &sig,
+                                   bool preserve_order) {
+	auto &root = *root_slot;
+	auto &root_info = sig.Get(root);
+	auto entry = cache.Lookup(RecyclerEntryKind::WHOLE_RESULT, root_info, sig, root, client.snapshot);
+	if (entry && CanServe(*entry, preserve_order)) {
+		ColumnBindingReplacer unused;
+		if (SubstituteScan(root_slot, entry, entry->ordered, root_info.tables, input.optimizer.binder, unused)) {
+			cache.stats.whole_hits++;
+			return true;
 		}
 	}
-
-	Resolution Resolve(ColumnBinding binding, idx_t depth) {
-		Resolution result;
-		if (depth > 32) {
-			return result;
-		}
-		auto producer = producers.find(binding.table_index);
-		if (producer == producers.end()) {
-			return result;
-		}
-		auto &op = *producer->second;
-		switch (op.type) {
-		case LogicalOperatorType::LOGICAL_GET: {
-			auto &get = op.Cast<LogicalGet>();
-			auto &column_ids = get.GetColumnIds();
-			auto id = table_ids->find(get.table_index);
-			if (id == table_ids->end() || binding.column_index >= column_ids.size()) {
-				return result;
-			}
-			result.identity.table = id->second;
-			result.identity.column = column_ids[binding.column_index].GetPrimaryIndex();
-			result.valid = true;
-			return result;
-		}
-		case LogicalOperatorType::LOGICAL_PROJECTION: {
-			auto &proj = op.Cast<LogicalProjection>();
-			if (binding.column_index >= proj.expressions.size()) {
-				return result;
-			}
-			return ResolveExpression(*proj.expressions[binding.column_index], depth + 1);
-		}
-		default:
-			return result;
-		}
+	// unordered results are written by a parallel sink; with preserve_insertion_order that would change the
+	// observable row order, and a serial sink would run the whole pipeline on one thread: neither is acceptable
+	bool writable = root_info.ordered || !preserve_order;
+	if (writable && root_info.est_leaf_rows >= client.settings.min_input_rows &&
+	    cache.Admissible(root_info.tables, client.snapshot)) {
+		client.has_pending_whole = true;
+		client.whole_hash = root_info.hash;
+		client.whole_canonical = sig.Render(root);
+		client.whole_est_input_rows = root_info.est_leaf_rows;
+		client.whole_tables = TableDependencies(root_info.tables, client.snapshot);
 	}
+	return false;
+}
 
-	//! Follow column references through DuckDB's compressed-materialization projections: the value that leaves a
-	//! decompress(compress(col)) pair is col again
-	Resolution ResolveExpression(const Expression &expr, idx_t depth) {
-		if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
-			return Resolve(expr.Cast<BoundColumnRefExpression>().binding, depth);
-		}
-		if (expr.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
-			auto &func = expr.Cast<BoundFunctionExpression>();
-			if (func.children.empty()) {
-				return Resolution();
-			}
-			if (StringUtil::StartsWith(func.function.name, "__internal_decompress_")) {
-				auto inner = ResolveExpression(*func.children[0], depth + 1);
-				if (inner.valid && inner.compressed) {
-					inner.compressed = false;
-					return inner;
-				}
-				return Resolution();
-			}
-			if (StringUtil::StartsWith(func.function.name, "__internal_compress_")) {
-				auto inner = ResolveExpression(*func.children[0], depth + 1);
-				inner.compressed = true;
-				return inner;
-			}
-		}
-		return Resolution();
+//! Nested blocks: sub-queries below the root that equal an earlier whole query
+static void ServeNestedBlocks(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan, LogicalOperator &root,
+                              RecyclerCache &cache, const RecyclerClientState &client, PlanSignatures &sig,
+                              bool preserve_order) {
+	BlockMatcher matcher(input.optimizer.binder, cache, client, sig, preserve_order);
+	for (auto &child : root.children) {
+		matcher.Walk(child);
 	}
+	if (matcher.replaced) {
+		matcher.replacer.VisitOperator(*plan);
+	}
+}
 
-	void Walk(unique_ptr<LogicalOperator> &slot) {
-		auto marker = dynamic_cast<LogicalRecyclerMaterialize *>(slot.get());
-		if (marker && marker->spec.kind == RecyclerEntryKind::BLOCK && marker->spec.columns.empty() &&
-		    marker->children.size() == 1) {
-			auto &child = *marker->children[0];
-			producers.clear();
-			table_ids = &marker->spec.table_ids;
-			CollectProducers(child);
-			idx_t usable = 0;
-			for (auto &binding : child.GetColumnBindings()) {
-				auto resolution = Resolve(binding, 0);
-				if (resolution.valid && !resolution.compressed) {
-					marker->spec.columns.push_back(resolution.identity);
-					usable++;
-				} else {
-					marker->spec.columns.push_back(ColumnIdentity());
-				}
-			}
-			if (usable == 0) {
-				// nothing a later query could pick up: run the block as vanilla would
-				auto child_ptr = std::move(marker->children[0]);
-				slot = std::move(child_ptr);
-				Walk(slot);
-				return;
-			}
-		}
-		for (auto &child : slot->children) {
-			Walk(child);
-		}
+//! Subsumption: SPJ blocks served from wider cached blocks, admissible misses planted with a marker
+static void ServeSubsumedBlocks(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan,
+                                unique_ptr<LogicalOperator> &root_slot, RecyclerState &state,
+                                const RecyclerClientState &client, PlanSignatures &sig) {
+	SubsumptionPass pass(input.context, input.optimizer.binder, state.cache, client.settings, sig, client.snapshot,
+	                     *plan);
+	pass.Walk(root_slot);
+	if (pass.replaced) {
+		pass.replacer.VisitOperator(*plan);
 	}
-};
+}
 
 void RecyclerPreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
 	auto state = StateFromInput(input);
@@ -638,146 +665,56 @@ void RecyclerPreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOpera
 	auto &context = input.context;
 	ScopedTimer timer(cache.stats.pre_ns);
 
-	auto client = GetClientState(context);
-	client->Reset();
-	if (plan->type == LogicalOperatorType::LOGICAL_SET || plan->type == LogicalOperatorType::LOGICAL_RESET ||
-	    plan->type == LogicalOperatorType::LOGICAL_PRAGMA) {
-		client->settings_loaded = false;
-	}
-
-	auto root_slot = FindQueryRoot(plan);
+	auto &client = RecyclerClientState::Get(context);
+	client.Reset();
+	auto root_slot = GateStatement(input, plan, cache, client);
 	if (!root_slot) {
-		cache.stats.skip_not_query++;
-		return;
-	}
-	auto &root = **root_slot;
-	if (IsModifyingRoot(root.type)) {
-		cache.stats.skip_modifying++;
-		cache.Clear();
-		return;
-	}
-	if (!IsReadRoot(root.type)) {
-		cache.stats.skip_not_read++;
-		return;
-	}
-	if (!client->settings_loaded) {
-		client->settings = LoadRecyclerSettings(context);
-		client->settings_loaded = true;
-	}
-	auto &settings = client->settings;
-	if (!settings.enabled) {
-		cache.stats.skip_disabled++;
-		return;
-	}
-	// statements that modify data are detected at bind time; a running write transaction must not be served
-	// from or written into the cache either
-	if (!input.optimizer.binder.GetStatementProperties().modified_databases.empty()) {
-		cache.stats.skip_modified_databases++;
-		cache.Clear();
-		return;
-	}
-	if (context.transaction.HasActiveTransaction() && MetaTransaction::Get(context).ModifiedDatabase()) {
-		cache.stats.skip_write_transaction++;
 		return;
 	}
 	cache.stats.pre_calls++;
-	client->active = true;
-	// with preserve_insertion_order the order of an unordered query's rows is observable, so only results that
-	// were stored in a defined order may be served
+	client.active = true;
+	auto &settings = client.settings;
 	bool preserve_order = Settings::Get<PreserveInsertionOrderSetting>(context);
 
-	PlanSignatures sig(context);
+	auto &root = **root_slot;
+	client.settings_salt = PlanSignatures::SettingsSalt(context);
+	PlanSignatures sig(context, client.settings_salt);
 	try {
 		plan->ResolveOperatorTypes();
 		sig.Analyze(root);
 	} catch (std::exception &) {
 		cache.stats.skip_analyze_failed++;
-		client->active = false;
+		client.active = false;
 		return;
 	}
-
 	auto &root_info = sig.Get(root);
 	if (!root_info.Cacheable()) {
+		// the hash of a refused subtree is undefined, so the refusal is counted but not remembered per signature
+		auto reason = root_info.Reason();
+		D_ASSERT(reason != RefusalReason::NONE);
 		cache.stats.root_not_cacheable++;
+		cache.stats.refused[static_cast<idx_t>(reason)]++;
 	}
+	client.snapshot = TakeTableSnapshot(context, root_info.tables);
+
 	if (settings.whole_result && root_info.Cacheable()) {
-		auto entry = cache.Lookup(RecyclerEntryKind::WHOLE_RESULT, root_info.hash, [&]() { return sig.Render(root); });
-		if (entry && (entry->ordered || !preserve_order)) {
-			ColumnBindingReplacer unused;
-			if (SubstituteScan(*root_slot, entry, entry->ordered, input.optimizer.binder, unused)) {
-				cache.stats.whole_hits++;
-				return;
-			}
-		}
-		// unordered results are written by a parallel sink; with preserve_insertion_order that would change the
-		// observable row order, and a serial sink would run the whole pipeline on one thread: neither is acceptable
-		bool writable = root_info.ordered || !preserve_order;
-		if (writable && root_info.est_leaf_rows >= settings.min_input_rows) {
-			client->has_pending_whole = true;
-			client->whole_hash = root_info.hash;
-			client->whole_canonical = sig.Render(root);
-			client->whole_est_input_rows = root_info.est_leaf_rows;
+		if (ServeOrPlanWholeResult(input, *root_slot, cache, client, sig, preserve_order)) {
+			return;
 		}
 	}
 	if (settings.blocks) {
-		BlockMatcher matcher(context, input.optimizer.binder, cache, settings, sig, preserve_order);
-		for (auto &child : root.children) {
-			matcher.Walk(child);
-		}
-		if (matcher.replaced) {
-			matcher.replacer.VisitOperator(*plan);
-		}
+		ServeNestedBlocks(input, plan, root, cache, client, sig, preserve_order);
 	}
 	if (settings.subsumption && !preserve_order) {
 		// block results are written by a parallel sink, so their row order is arbitrary: only usable when the
 		// session does not promise insertion order
-		SubsumptionPass pass(context, input.optimizer.binder, state->cache, settings, sig, *plan);
-		pass.Walk(*root_slot);
-		if (pass.replaced) {
-			pass.replacer.VisitOperator(*plan);
-		}
+		ServeSubsumedBlocks(input, plan, *root_slot, *state, client, sig);
 	}
 }
 
 //===----------------------------------------------------------------------===//
-// Post-optimize: subtree hits/writes, whole-result writes
+// Post-optimize: subtree hits/writes
 //===----------------------------------------------------------------------===//
-static bool IsSubtreeCandidateType(LogicalOperatorType type) {
-	switch (type) {
-	case LogicalOperatorType::LOGICAL_DELIM_JOIN:
-	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
-	case LogicalOperatorType::LOGICAL_ANY_JOIN:
-	case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
-	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
-	case LogicalOperatorType::LOGICAL_DISTINCT:
-		return true;
-	default:
-		return false;
-	}
-}
-
-//! Whether we trust the optimizer's cardinality estimate enough to materialize on first sight
-static bool SpeculationAllowed(const LogicalOperator &op, const NodeInfo &info, bool force_candidate) {
-	if (info.unreliable_estimate) {
-		// non-equality joins below make every estimate above them worthless (a self join with an inequality
-		// was 60x off in the workload); wait for a repeat before paying for a materialization
-		return false;
-	}
-	switch (op.type) {
-	case LogicalOperatorType::LOGICAL_DELIM_JOIN:
-	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
-	case LogicalOperatorType::LOGICAL_DISTINCT:
-	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
-		return true;
-	default:
-		return force_candidate;
-	}
-}
-
-static bool IsAggregation(LogicalOperatorType type) {
-	return type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY || type == LogicalOperatorType::LOGICAL_DISTINCT;
-}
-
 //! Which candidates below the current node may still be materialized. One materialization per root-to-leaf path is
 //! the rule; the exception is a single nested aggregation, because a shared aggregate (a CTE-like
 //! "GROUP BY person_id" feeding different consumers) is exactly the unit that recurs while its consumers differ.
@@ -785,8 +722,8 @@ enum class WritePolicy : uint8_t { NONE, AGGREGATES_ONLY, ALL };
 
 struct SubtreeWalker {
 	SubtreeWalker(ClientContext &context, Binder &binder, shared_ptr<RecyclerCache> cache,
-	              const RecyclerSettings &settings, PlanSignatures &sig)
-	    : context(context), binder(binder), cache(std::move(cache)), settings(settings), sig(sig) {
+	              const RecyclerSettings &settings, PlanSignatures &sig, const TableSnapshot &snapshot)
+	    : context(context), binder(binder), cache(std::move(cache)), settings(settings), sig(sig), snapshot(snapshot) {
 	}
 
 	ClientContext &context;
@@ -794,76 +731,37 @@ struct SubtreeWalker {
 	shared_ptr<RecyclerCache> cache;
 	const RecyclerSettings &settings;
 	PlanSignatures &sig;
+	const TableSnapshot &snapshot;
 	ColumnBindingReplacer replacer;
 	bool replaced = false;
-
-	bool Admit(LogicalOperator &op, const NodeInfo &info, bool under_delim_lhs, bool force_candidate) {
-		if (cache->IsTooBig(info.hash)) {
-			return false;
-		}
-		auto est_in = info.est_leaf_rows;
-		if (est_in < settings.min_input_rows) {
-			return false;
-		}
-		auto est_out = op.EstimateCardinality(context);
-		if (!IsAggregation(op.type) && est_out > est_in / 2) {
-			// a join result that is not much smaller than its inputs saves little when scanned back; an aggregate
-			// always folds its input and its estimate is bounded by the input anyway
-			return false;
-		}
-		auto width = RecyclerEstimateRowWidth(op.types);
-		auto est_bytes = est_out * width;
-		auto cap_rows = under_delim_lhs ? MinValue<idx_t>(settings.entry_cap_rows, 200000) : settings.entry_cap_rows;
-		if (est_out > cap_rows || est_bytes > settings.entry_cap_bytes) {
-			return false;
-		}
-		auto seen_before = cache->Seen(info.hash) > 1;
-		if (!seen_before) {
-			if (!SpeculationAllowed(op, info, force_candidate)) {
-				return false;
-			}
-			// aggregates are the safest speculation (their output is bounded by their input and usually far
-			// smaller), plain joins the riskiest
-			auto speculate_bytes = IsAggregation(op.type) ? settings.speculate_bytes * 2
-			                       : op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN
-			                           ? settings.speculate_bytes / 8
-			                           : settings.speculate_bytes;
-			if (est_bytes > speculate_bytes) {
-				return false;
-			}
-		}
-		return true;
-	}
 
 	void Walk(unique_ptr<LogicalOperator> &slot, bool is_root, WritePolicy policy, bool under_delim_lhs,
 	          bool force_candidate) {
 		auto &op = *slot;
-		if (IsRecyclerOperator(op)) {
+		if (AsRecyclerOperator(op)) {
 			return;
 		}
 		auto &info = sig.Get(op);
-		bool candidate = !is_root && (force_candidate || IsSubtreeCandidateType(op.type)) && info.Cacheable();
+		bool candidate =
+		    !is_root && (force_candidate || IsSubtreeCandidateType(op.type)) && info.CacheableWithoutOuterFilters();
 		if (candidate) {
 			cache->NoteSeen(info.hash);
-			auto entry = cache->Lookup(RecyclerEntryKind::SUBTREE, info.hash, [&]() { return sig.Render(op); });
-			if (entry && SubstituteScan(slot, entry, entry->ordered, binder, replacer)) {
+			auto entry = cache->Lookup(RecyclerEntryKind::SUBTREE, info, sig, op, snapshot);
+			if (entry && SubstituteScan(slot, entry, entry->ordered, info.tables, binder, replacer)) {
 				cache->stats.subtree_hits++;
 				replaced = true;
 				return;
 			}
-			bool may_write = policy == WritePolicy::ALL ||
-			                 (policy == WritePolicy::AGGREGATES_ONLY && IsAggregation(op.type));
-			if (may_write && Admit(op, info, under_delim_lhs, force_candidate)) {
-				RecyclerWriteSpec spec;
-				spec.kind = RecyclerEntryKind::SUBTREE;
-				spec.hash = info.hash;
-				spec.canonical = sig.Render(op);
-				spec.ordered = info.ordered;
-				spec.est_input_rows = info.est_leaf_rows;
-				spec.cap_rows = settings.entry_cap_rows;
-				spec.cap_bytes = settings.entry_cap_bytes;
-				spec.budget_bytes = settings.budget_bytes;
+			bool may_write =
+			    policy == WritePolicy::ALL || (policy == WritePolicy::AGGREGATES_ONLY && IsAggregation(op.type));
+			if (may_write && AdmitSubtreeWrite(context, *cache, settings, op, info, under_delim_lhs, force_candidate) &&
+			    cache->Admissible(info.tables, snapshot)) {
+				auto spec =
+				    RecyclerWriteSpec::Make(RecyclerEntryKind::SUBTREE, info.hash, sig.Render(op), info.ordered,
+				                            info.est_leaf_rows, TableDependencies(info.tables, snapshot), settings);
 				cache->stats.writes_planned++;
+				// after rendering: the joins whose filters are removed are outside the subtree and its key
+				cache->stats.stripped_runtime_filters += StripRuntimeFilters(op, info.pending_dynamic_owners);
 				WrapMaterialize(slot, std::move(spec), cache);
 				// below the wrapper: hits, and at most one more nested aggregation
 				auto &wrapped = *slot->children[0];
@@ -897,6 +795,37 @@ struct SubtreeWalker {
 	}
 };
 
+//===----------------------------------------------------------------------===//
+// Post-optimize: the hook
+//===----------------------------------------------------------------------===//
+//! Subtrees: exact hits replace subtrees, admissible misses get a RecyclerMaterialize
+static void RewriteSubtrees(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan,
+                            unique_ptr<LogicalOperator> &root_slot, RecyclerState &state,
+                            const RecyclerClientState &client, PlanSignatures &sig) {
+	SubtreeWalker walker(input.context, input.optimizer.binder, state.cache, client.settings, sig, client.snapshot);
+	walker.Walk(root_slot, true, WritePolicy::ALL, false, false);
+	if (walker.replaced) {
+		walker.replacer.VisitOperator(*plan);
+	}
+}
+
+//! Whole result: wrap the root so that the result the pre hook missed is written
+static void WriteWholeResult(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &root_slot,
+                             RecyclerState &state, RecyclerClientState &client, const RecyclerSettings &settings,
+                             const NodeInfo &root_info) {
+	auto &root = *root_slot;
+	if (!AdmitWholeWrite(input.context, *state.cache, settings, root, root_info, client.whole_hash)) {
+		return;
+	}
+	// an ordered result is written by a serial sink (only the sort's output stage is serialized) and replayed in
+	// that order; anything else is written and replayed in parallel
+	auto spec = RecyclerWriteSpec::Make(RecyclerEntryKind::WHOLE_RESULT, client.whole_hash,
+	                                    std::move(client.whole_canonical), root_info.ordered,
+	                                    client.whole_est_input_rows, std::move(client.whole_tables), settings);
+	state.cache->stats.writes_planned++;
+	WrapMaterialize(root_slot, std::move(spec), state.cache);
+}
+
 void RecyclerOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
 	auto state = StateFromInput(input);
 	if (!state) {
@@ -906,74 +835,44 @@ void RecyclerOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator
 	auto &context = input.context;
 	ScopedTimer timer(cache->stats.post_ns);
 
-	auto client = GetClientState(context);
-	if (!client->active) {
+	auto &client = RecyclerClientState::Get(context);
+	if (!client.active) {
 		return;
 	}
-	client->active = false;
-	auto settings = client->settings;
+	client.active = false;
+	client.profiled = QueryProfiler::Get(context).IsEnabled();
+	auto settings = client.settings;
 
 	auto root_slot = FindQueryRoot(plan);
-	if (!root_slot) {
-		return;
-	}
-	if (IsRecyclerOperator(**root_slot)) {
-		// whole-result hit at the pre hook
+	if (!root_slot || AsRecyclerOperator(**root_slot)) {
+		// nothing to rewrite: the pre hook served the whole result
+		client.Reset();
 		return;
 	}
 	cache->stats.post_calls++;
 
 	// planted block markers learn which base columns their (now pruned and reordered) child produces
-	BlockFinalizer finalizer;
-	finalizer.Walk(*root_slot);
+	ResolveBlockColumns(*root_slot);
 
-	PlanSignatures sig(context);
+	PlanSignatures sig(context, client.settings_salt);
 	try {
 		plan->ResolveOperatorTypes();
 		sig.Analyze(**root_slot);
 	} catch (std::exception &) {
+		client.Reset();
 		return;
 	}
 	// the root's analysis (rewrites below the root do not touch the analysis map)
 	const auto &root_info = sig.Get(**root_slot);
+	client.snapshot = TakeTableSnapshot(context, root_info.tables);
 
 	if (settings.subtrees) {
-		SubtreeWalker walker(context, input.optimizer.binder, cache, settings, sig);
-		walker.Walk(*root_slot, true, WritePolicy::ALL, false, false);
-		if (walker.replaced) {
-			walker.replacer.VisitOperator(*plan);
-		}
+		RewriteSubtrees(input, plan, *root_slot, *state, client, sig);
 	}
-
-	if (settings.whole_result && client->has_pending_whole && !cache->IsTooBig(client->whole_hash)) {
-		auto &root = **root_slot;
-		bool admissible = !root_info.refused && !root_info.nondeterministic && !root_info.unresolved_delim_get;
-		if (admissible) {
-			// the estimate only guards against materializing table-sized results before the runtime row cap
-			// stops the store; estimates above a planted block marker are coarse (the semi-join reduction is
-			// lost), so leave a wide margin
-			auto est_out = root.EstimateCardinality(context);
-			if (est_out > 4 * settings.whole_cap_rows) {
-				admissible = false;
-			}
-		}
-		if (admissible) {
-			RecyclerWriteSpec spec;
-			spec.kind = RecyclerEntryKind::WHOLE_RESULT;
-			spec.hash = client->whole_hash;
-			spec.canonical = std::move(client->whole_canonical);
-			// an ordered result is written by a serial sink (only the sort's output stage is serialized) and
-			// replayed in that order; anything else is written and replayed in parallel
-			spec.ordered = root_info.ordered;
-			spec.est_input_rows = client->whole_est_input_rows;
-			spec.cap_rows = MinValue<idx_t>(settings.whole_cap_rows, settings.entry_cap_rows);
-			spec.cap_bytes = settings.entry_cap_bytes;
-			spec.budget_bytes = settings.budget_bytes;
-			cache->stats.writes_planned++;
-			WrapMaterialize(*root_slot, std::move(spec), cache);
-		}
+	if (settings.whole_result && client.has_pending_whole) {
+		WriteWholeResult(input, *root_slot, *state, client, settings, root_info);
 	}
-	client->Reset();
+	client.Reset();
 }
 
 } // namespace duckdb

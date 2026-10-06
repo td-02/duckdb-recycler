@@ -174,15 +174,32 @@ optimizer extension with two hooks (`src/recycler_hooks.cpp`):
   `preserve_insertion_order` is false; `SET recycler_subsumption = false` disables it.
 
 Correctness rules: results are keyed on the exact bound/optimized structure including types; subtrees with
-volatile functions, parameters, table functions, LIMIT without ORDER BY, runtime (dynamic) filters owned
-outside the subtree, or references into a delim join's other side are never cached; any statement that
-modifies data or the catalog clears the cache, and nothing is cached or served inside a transaction that
-has written. Cached collections are buffer-managed and bounded by `recycler_budget_mb` with
-benefit-density eviction.
+volatile functions, parameters, table functions, temporary tables (private to their connection), tables of
+non-DuckDB catalogs (attached SQLite/Postgres/... databases change outside DuckDB's transactions), LIMIT
+without ORDER BY, runtime (dynamic) filters without an owning join (a Top-N's), or references into a delim join's
+other side are never cached; the runtime filters that joins above a subtree push into its scans are removed from
+those joins before the subtree is written (`stripped_runtime_filters`), so it stores all of its rows; any statement
+that modifies data or the catalog clears the cache, and nothing is cached or served inside a transaction that has
+written. The values of the result-affecting session settings `TimeZone`,
+`Calendar`, `ieee_floating_point_ops`, `default_order`, `default_null_order` and
+`scalar_subquery_error_on_multiple_rows` (the settings that change a result at execution time without changing the
+bound plan: ICU and the `list_sort` family read them into function bind data, the flag picks the division callback,
+and the hash table of a correlated scalar subquery's join reads the last one; `integer_division` is a parser option and
+an ORDER BY clause is resolved by the binder, so both already change the plan) are part of every key, so a statement is
+never served an entry computed under other values. Functions DuckDB declares consistent although their result depends on the session or the transaction
+are refused: `current_setting()`, whose bind data holds the value of whichever setting it names, `age()` with one
+argument, which measures from the transaction's start date, and ICU's `current_localtimestamp()` and
+`current_localtime()`, which hold the transaction's start. Cached collections are buffer-managed, except that an
+entry of at most `recycler_compact_rows` rows (8,192) is copied into memory allocated with its data when that takes
+less than its buffer blocks (at least one 256 KiB block per writer thread, however few the rows); the cache is
+bounded with benefit-density eviction by the smaller of `recycler_budget_mb` and a quarter of `memory_limit`, which a
+connection evaluates when it reloads its settings (after a SET, RESET or PRAGMA of its own) and `recycler_stats()`
+reports as `budget_bytes`.
 
 Settings: `recycler_enabled`, `recycler_whole_result`, `recycler_blocks`, `recycler_subtrees`, `recycler_subsumption`,
 `recycler_budget_mb`, `recycler_entry_cap_mb`, `recycler_entry_cap_rows`, `recycler_min_input_rows`,
-`recycler_speculate_mb`. Introspection: `SELECT * FROM recycler_stats()`, `SELECT * FROM recycler_entries()`,
-`PRAGMA recycler_clear`. Tests: `test/sql/recycler/`. Differential check against vanilla over the whole
-workload in several orders: `python3 ./scripts/recycler_diff.py`. The design and roadmap are in
+`recycler_speculate_mb`, `recycler_compact_rows`. Introspection: `SELECT * FROM recycler_stats()`,
+`SELECT * FROM recycler_entries()`, `SELECT * FROM recycler_history()` (what is known about a signature whether or
+not its result is cached), `PRAGMA recycler_clear`. Tests: `test/sql/recycler/`. Differential check against vanilla
+over the whole workload in several orders: `python3 ./scripts/recycler_diff.py`. The design and roadmap are in
 `docs/SOLUTION_PLAN.md`.

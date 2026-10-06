@@ -7,6 +7,7 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/common/enums/order_type.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/types/column/column_data_scan_states.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
@@ -14,6 +15,7 @@
 #include "duckdb/execution/operator/join/join_filter_pushdown.hpp"
 #include "duckdb/function/function.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_case_expression.hpp"
@@ -24,7 +26,9 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/filter/optional_filter.hpp"
 #include "duckdb/planner/filter/struct_filter.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
@@ -127,37 +131,140 @@ string SigHash::ToString() const {
 	return string(buf);
 }
 
+const char *RefusalReasonName(RefusalReason reason) {
+	switch (reason) {
+	case RefusalReason::NONE:
+		return "none";
+	case RefusalReason::TABLE_FUNCTION:
+		return "table_function";
+	case RefusalReason::SAMPLED_SCAN:
+		return "sampled_scan";
+	case RefusalReason::SCAN_OPTIONS:
+		return "scan_options";
+	case RefusalReason::CORRELATED_COLUMN:
+		return "correlated_column";
+	case RefusalReason::VOLATILE_FUNCTION:
+		return "volatile_function";
+	case RefusalReason::PARAMETER:
+		return "parameter";
+	case RefusalReason::EXPRESSION:
+		return "expression";
+	case RefusalReason::OPERATOR:
+		return "operator";
+	case RefusalReason::CONSTANT_COLLECTION:
+		return "constant_collection";
+	case RefusalReason::EXTERNAL_REFERENCE:
+		return "external_reference";
+	case RefusalReason::DELIM_GET:
+		return "delim_get";
+	case RefusalReason::LIMIT_WITHOUT_ORDER:
+		return "limit_without_order";
+	case RefusalReason::RUNTIME_FILTER:
+		return "runtime_filter";
+	case RefusalReason::TEMPORARY_TABLE:
+		return "temporary_table";
+	case RefusalReason::FOREIGN_CATALOG:
+		return "foreign_catalog";
+	case RefusalReason::SESSION_BOUND_FUNCTION:
+		return "session_bound_function";
+	default:
+		return "unknown";
+	}
+}
+
+RefusalReason NodeInfo::Reason() const {
+	if (refused) {
+		return refusal;
+	}
+	if (external_ref) {
+		return RefusalReason::EXTERNAL_REFERENCE;
+	}
+	if (unresolved_delim_get) {
+		return RefusalReason::DELIM_GET;
+	}
+	if (nondeterministic) {
+		// SAMPLE refuses with its own reason, so what is left is a LIMIT whose input has no order
+		return RefusalReason::LIMIT_WITHOUT_ORDER;
+	}
+	if (runtime_filtered || !pending_dynamic_owners.empty()) {
+		return RefusalReason::RUNTIME_FILTER;
+	}
+	return RefusalReason::NONE;
+}
+
 //===----------------------------------------------------------------------===//
 // Helpers
 //===----------------------------------------------------------------------===//
-static void Refuse(NodeInfo &info, const char *) {
+static void Refuse(NodeInfo &info, RefusalReason reason) {
 	info.refused = true;
+	if (info.refusal == RefusalReason::NONE) {
+		info.refusal = reason;
+	}
 }
 
-static bool ContainsDynamicFilter(const TableFilter &filter) {
+//! Functions registered as CONSISTENT whose result is a function of the session or the transaction, not of the
+//! arguments the renderer sees (audit of src/function/scalar, core_functions and ICU in v1.5.5): current_setting()
+//! folds the named setting's value into bind data, rendered only as current_setting('name'); age() with one argument
+//! measures from the transaction's start date (AgeFunctionStandard, ICU's unary ICUCalendarAge);
+//! current_localtimestamp() and current_localtime() (ICU) hold the transaction's start in bind data and reach the
+//! renderer when expression_rewriter, which folds them into constants, is disabled. The other session functions are
+//! not CONSISTENT and are refused as volatile (current_date, now, current_database, current_schema(s),
+//! in_search_path, txid_current, current_query, nextval, currval, random, uuid), and getvariable() and
+//! can_cast_implicitly() bind to a constant. Documented in the README; a new name here needs a sqllogictest.
+static bool IsSessionBound(const BoundFunctionExpression &func) {
+	auto &name = func.function.name;
+	if (name == "age") {
+		return func.children.size() == 1;
+	}
+	return name == "current_setting" || name == "current_localtimestamp" || name == "current_localtime";
+}
+
+//! Refuse a function whose result is not a function of its rendered arguments alone, whatever its children
+static void RefuseFunction(const BoundFunctionExpression &func, NodeInfo &info) {
+	if (func.function.GetStability() != FunctionStability::CONSISTENT) {
+		Refuse(info, RefusalReason::VOLATILE_FUNCTION);
+	} else if (IsSessionBound(func)) {
+		Refuse(info, RefusalReason::SESSION_BOUND_FUNCTION);
+	}
+}
+
+//! A table filter is rendered as text only: a dynamic filter marks the scan as runtime filtered, and the functions
+//! of an expression filter (a predicate on one column pushed into the scan) are refused as RenderExpression refuses
+//! them anywhere else
+static void AnalyzeTableFilter(const TableFilter &filter, NodeInfo &info) {
 	switch (filter.filter_type) {
 	case TableFilterType::DYNAMIC_FILTER:
-		return true;
+		info.runtime_filtered = true;
+		break;
+	case TableFilterType::EXPRESSION_FILTER:
+		ExpressionIterator::VisitExpression<BoundFunctionExpression>(
+		    *filter.Cast<ExpressionFilter>().expr,
+		    [&](const BoundFunctionExpression &func) { RefuseFunction(func, info); });
+		break;
 	case TableFilterType::OPTIONAL_FILTER: {
 		auto &opt = filter.Cast<OptionalFilter>();
-		return opt.child_filter && ContainsDynamicFilter(*opt.child_filter);
+		if (opt.child_filter) {
+			AnalyzeTableFilter(*opt.child_filter, info);
+		}
+		break;
 	}
 	case TableFilterType::CONJUNCTION_AND:
 	case TableFilterType::CONJUNCTION_OR: {
 		auto &conj = static_cast<const ConjunctionFilter &>(filter);
 		for (auto &child : conj.child_filters) {
-			if (ContainsDynamicFilter(*child)) {
-				return true;
-			}
+			AnalyzeTableFilter(*child, info);
 		}
-		return false;
+		break;
 	}
 	case TableFilterType::STRUCT_EXTRACT: {
 		auto &sf = filter.Cast<StructFilter>();
-		return sf.child_filter && ContainsDynamicFilter(*sf.child_filter);
+		if (sf.child_filter) {
+			AnalyzeTableFilter(*sf.child_filter, info);
+		}
+		break;
 	}
 	default:
-		return false;
+		break;
 	}
 }
 
@@ -190,7 +297,41 @@ idx_t RecyclerEstimateRowWidth(const vector<LogicalType> &types) {
 //===----------------------------------------------------------------------===//
 // PlanSignatures
 //===----------------------------------------------------------------------===//
-PlanSignatures::PlanSignatures(ClientContext &context, bool shape_mode) : context(context), shape_mode(shape_mode) {
+//! Session settings that change a query's result although the renderer sees the same plan: ICU reads TimeZone and
+//! Calendar into function bind data (not rendered), list_sort's family (list_sort, list_reverse_sort, list_grade_up)
+//! resolves its ORDER_DEFAULT through default_order and default_null_order into bind data (an ORDER BY clause is
+//! resolved by the binder, so a sort's direction is in the operator), and ieee_floating_point_ops swaps the callback of
+//! the same "/" function without bind data (BindBinaryFloatingPoint). scalar_subquery_error_on_multiple_rows is read by
+//! the hash table of a SINGLE join (a correlated scalar subquery) at execution: a second match is an error under true
+//! and dropped under false (the planner reads it too, for an uncorrelated subquery, into the plan). Everything else
+//! that affects a result is bound into the plan and rendered: integer_division is a parser option ("/" becomes "//"),
+//! collations, search_path and casts are in the operators; threads and memory_limit change speed only.
+//! current_setting(), whose bind data holds the value of whichever setting it names, is refused instead
+//! (IsSessionBound). The values are read once per statement after binding, so a SET GLOBAL on another connection
+//! between the bind and the pre hook is not detected, as for the recycler's own settings
+//! (RecyclerClientState::settings_loaded). Documented in the README; a new entry here needs a sqllogictest.
+static const char *const ICU_SETTINGS[] = {"TimeZone", "Calendar"};
+
+string PlanSignatures::SettingsSalt(const ClientContext &context) {
+	string salt;
+	StringSink sink(salt);
+	for (auto name : ICU_SETTINGS) {
+		// registered when ICU loads; absent, the setting renders as empty
+		Value value;
+		sink.Str(context.TryGetCurrentSetting(name, value) ? value.ToString() : string());
+	}
+	sink.Bool(Settings::Get<IeeeFloatingPointOpsSetting>(context));
+	sink.U8(static_cast<uint8_t>(Settings::Get<DefaultOrderSetting>(context)));
+	sink.U8(static_cast<uint8_t>(Settings::Get<DefaultNullOrderSetting>(context)));
+	sink.Bool(Settings::Get<ScalarSubqueryErrorOnMultipleRowsSetting>(context));
+	return salt;
+}
+
+PlanSignatures::PlanSignatures(ClientContext &context, const string &salt) : PlanSignatures(context, salt, false) {
+}
+
+PlanSignatures::PlanSignatures(ClientContext &context, const string &salt, bool shape_mode)
+    : context(context), shape_mode(shape_mode), salt(salt) {
 }
 
 const NodeInfo &PlanSignatures::Get(const LogicalOperator &op) const {
@@ -213,13 +354,13 @@ void PlanSignatures::Analyze(LogicalOperator &root) {
 	Compute(root);
 }
 
-void PlanSignatures::CollectDynamicOwners(const LogicalOperator &op) {
+void PlanSignatures::CollectDynamicOwners(LogicalOperator &op) {
 	if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN || op.type == LogicalOperatorType::LOGICAL_DELIM_JOIN ||
 	    op.type == LogicalOperatorType::LOGICAL_ASOF_JOIN) {
 		auto &join = op.Cast<LogicalComparisonJoin>();
 		if (join.filter_pushdown) {
 			for (auto &probe : join.filter_pushdown->probe_info) {
-				dynamic_owners[probe.dynamic_filters.get()] = &op;
+				dynamic_owners[probe.dynamic_filters.get()].push_back(&op);
 			}
 		}
 	}
@@ -283,7 +424,7 @@ void PlanSignatures::RenderBinding(ColumnBinding binding, const Frame &frame, Si
 			sink.Tag("P");
 			sink.U64(entry->second - frame.start);
 			sink.U64(binding.column_index < column_ids.size() ? column_ids[binding.column_index].GetPrimaryIndex()
-			                                                   : DConstants::INVALID_INDEX);
+			                                                  : DConstants::INVALID_INDEX);
 			return;
 		}
 	}
@@ -328,7 +469,7 @@ void PlanSignatures::RenderExpression(const Expression &expr, const Frame &frame
 	case ExpressionClass::BOUND_COLUMN_REF: {
 		auto &ref = expr.Cast<BoundColumnRefExpression>();
 		if (ref.depth != 0) {
-			Refuse(info, "correlated column reference");
+			Refuse(info, RefusalReason::CORRELATED_COLUMN);
 			info.external_ref = true;
 		}
 		RenderBinding(ref.binding, frame, sink, info);
@@ -345,9 +486,7 @@ void PlanSignatures::RenderExpression(const Expression &expr, const Frame &frame
 	}
 	case ExpressionClass::BOUND_FUNCTION: {
 		auto &func = expr.Cast<BoundFunctionExpression>();
-		if (func.function.GetStability() != FunctionStability::CONSISTENT) {
-			Refuse(info, "non-deterministic function");
-		}
+		RefuseFunction(func, info);
 		sink.Str(func.function.name);
 		sink.Bool(func.is_operator);
 		sink.U64(func.children.size());
@@ -364,7 +503,7 @@ void PlanSignatures::RenderExpression(const Expression &expr, const Frame &frame
 	case ExpressionClass::BOUND_AGGREGATE: {
 		auto &aggr = expr.Cast<BoundAggregateExpression>();
 		if (aggr.function.GetStability() != FunctionStability::CONSISTENT) {
-			Refuse(info, "non-deterministic aggregate");
+			Refuse(info, RefusalReason::VOLATILE_FUNCTION);
 		}
 		sink.Str(aggr.function.name);
 		sink.U8(static_cast<uint8_t>(aggr.aggr_type));
@@ -438,11 +577,11 @@ void PlanSignatures::RenderExpression(const Expression &expr, const Frame &frame
 		break;
 	}
 	case ExpressionClass::BOUND_PARAMETER:
-		Refuse(info, "prepared statement parameter");
+		Refuse(info, RefusalReason::PARAMETER);
 		break;
 	default:
 		// BOUND_REF, BOUND_SUBQUERY, BOUND_WINDOW, BOUND_UNNEST, BOUND_LAMBDA, BOUND_LAMBDA_REF, BOUND_DEFAULT, ...
-		Refuse(info, "unsupported expression class");
+		Refuse(info, RefusalReason::EXPRESSION);
 		break;
 	}
 }
@@ -488,22 +627,32 @@ void PlanSignatures::RenderJoin(const LogicalComparisonJoin &join, const Frame &
 void PlanSignatures::RenderNode(const LogicalOperator &op, const Frame &frame, Sink &sink, NodeInfo &info,
                                 bool render_children) const {
 	sink.Tag("{");
+	sink.Str(salt);
 	sink.U8(static_cast<uint8_t>(op.type));
 	switch (op.type) {
 	case LogicalOperatorType::LOGICAL_GET: {
 		auto &get = op.Cast<LogicalGet>();
 		auto table = get.GetTable();
 		if (!table) {
-			Refuse(info, "table function scan");
+			Refuse(info, RefusalReason::TABLE_FUNCTION);
 			break;
 		}
+		if (table->temporary) {
+			// a temp table is private to its connection: two connections with a same-named, same-shaped temp table
+			// are keyed alike (temp.main.t) but hold different rows
+			Refuse(info, RefusalReason::TEMPORARY_TABLE);
+		} else if (!table->catalog.IsDuckCatalog()) {
+			// tables of attached foreign catalogs (SQLite, Postgres, ...) change outside DuckDB's transactions, so
+			// no invalidation signal exists for them
+			Refuse(info, RefusalReason::FOREIGN_CATALOG);
+		}
 		if (get.extra_info.sample_options) {
-			Refuse(info, "sampled scan");
+			Refuse(info, RefusalReason::SAMPLED_SCAN);
 			info.nondeterministic = true;
 		}
 		if (!get.projected_input.empty() || !get.children.empty() || get.ordinality_idx.IsValid() ||
 		    get.row_group_order_options) {
-			Refuse(info, "unsupported scan options");
+			Refuse(info, RefusalReason::SCAN_OPTIONS);
 		}
 		RenderOwnIndex(get.table_index, frame, sink);
 		sink.Str(get.function.name);
@@ -526,16 +675,15 @@ void PlanSignatures::RenderNode(const LogicalOperator &op, const Frame &frame, S
 			sink.U64(entry.first);
 			sink.U8(static_cast<uint8_t>(entry.second->filter_type));
 			sink.Str(entry.second->ToString("c"));
-			if (ContainsDynamicFilter(*entry.second)) {
-				info.runtime_filtered = true;
-			}
+			AnalyzeTableFilter(*entry.second, info);
 		}
 		if (get.dynamic_filters) {
-			auto owner = dynamic_owners.find(get.dynamic_filters.get());
-			if (owner == dynamic_owners.end()) {
+			auto owners = dynamic_owners.find(get.dynamic_filters.get());
+			if (owners == dynamic_owners.end()) {
 				info.runtime_filtered = true;
 			} else {
-				info.pending_dynamic_owners.push_back(owner->second);
+				info.pending_dynamic_owners.insert(info.pending_dynamic_owners.end(), owners->second.begin(),
+				                                   owners->second.end());
 			}
 		}
 		break;
@@ -665,7 +813,7 @@ void PlanSignatures::RenderNode(const LogicalOperator &op, const Frame &frame, S
 				break;
 			}
 			default:
-				Refuse(info, "expression limit");
+				Refuse(info, RefusalReason::EXPRESSION);
 				break;
 			}
 		}
@@ -697,12 +845,12 @@ void PlanSignatures::RenderNode(const LogicalOperator &op, const Frame &frame, S
 			sink.Str(type.ToString());
 		}
 		if (!cdg.collection) {
-			Refuse(info, "chunk get without data");
+			Refuse(info, RefusalReason::OPERATOR);
 			break;
 		}
 		auto &collection = *cdg.collection;
 		if (collection.Count() > 4096) {
-			Refuse(info, "large constant collection");
+			Refuse(info, RefusalReason::CONSTANT_COLLECTION);
 			break;
 		}
 		sink.U64(collection.Count());
@@ -733,7 +881,7 @@ void PlanSignatures::RenderNode(const LogicalOperator &op, const Frame &frame, S
 	case LogicalOperatorType::LOGICAL_CTE_REF: {
 		auto &ref = op.Cast<LogicalCTERef>();
 		if (ref.is_recurring || ref.correlated_columns > 0) {
-			Refuse(info, "recursive/correlated cte reference");
+			Refuse(info, RefusalReason::OPERATOR);
 		}
 		RenderOwnIndex(ref.table_index, frame, sink);
 		// the referenced CTE must be part of the subtree for the result to be self-contained
@@ -794,30 +942,46 @@ void PlanSignatures::RenderNode(const LogicalOperator &op, const Frame &frame, S
 		break;
 	}
 	case LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR: {
-		if (dynamic_cast<const LogicalRecyclerMaterialize *>(&op)) {
+		auto ours = AsRecyclerOperator(op);
+		if (!ours) {
+			Refuse(info, RefusalReason::OPERATOR);
+			break;
+		}
+		if (ours->kind == RecyclerOperatorKind::MATERIALIZE) {
 			// a planted block marker is a transparent wrapper around its child
 			sink.Tag("RMAT");
 			break;
 		}
-		auto scan = dynamic_cast<const LogicalRecyclerScan *>(&op);
-		if (!scan) {
-			Refuse(info, "foreign extension operator");
-			break;
+		auto &scan = op.Cast<LogicalRecyclerScan>();
+		RenderOwnIndex(scan.table_index, frame, sink);
+		sink.Hash(scan.entry->hash);
+		if (scan.entry->kind == RecyclerEntryKind::BLOCK) {
+			// a block entry's hash is its shape's, which several entries of different stored columns share
+			// (StoreBlock keeps one per canonical/conjuncts/columns): render what tells them apart, or two
+			// scans of different stored results render alike
+			sink.Str(scan.entry->canonical);
+			sink.U64(scan.entry->conjuncts.size());
+			for (auto &conjunct : scan.entry->conjuncts) {
+				sink.Str(conjunct);
+			}
+			sink.U64(scan.entry->columns.size());
+			for (auto &column : scan.entry->columns) {
+				sink.U64(column.table);
+				sink.U64(column.column);
+			}
 		}
-		RenderOwnIndex(scan->table_index, frame, sink);
-		sink.Hash(scan->entry->hash);
-		sink.U64(scan->column_ids.size());
-		for (auto col : scan->column_ids) {
+		sink.U64(scan.column_ids.size());
+		for (auto col : scan.column_ids) {
 			sink.U64(col);
 		}
 		break;
 	}
 	case LogicalOperatorType::LOGICAL_SAMPLE:
 		info.nondeterministic = true;
-		Refuse(info, "sample");
+		Refuse(info, RefusalReason::SAMPLED_SCAN);
 		break;
 	default:
-		Refuse(info, "unsupported operator");
+		Refuse(info, RefusalReason::OPERATOR);
 		break;
 	}
 	// output types (a block's output columns depend on what the query references, so not in shape mode)
@@ -842,6 +1006,15 @@ void PlanSignatures::RenderNode(const LogicalOperator &op, const Frame &frame, S
 	sink.Tag("}");
 }
 
+static void AddTable(vector<reference<const TableCatalogEntry>> &tables, const TableCatalogEntry &table) {
+	for (auto &existing : tables) {
+		if (&existing.get() == &table) {
+			return;
+		}
+	}
+	tables.push_back(table);
+}
+
 void PlanSignatures::Compute(LogicalOperator &op) {
 	for (auto &child : op.children) {
 		Compute(*child);
@@ -856,6 +1029,9 @@ void PlanSignatures::Compute(LogicalOperator &op) {
 	for (auto &child : op.children) {
 		auto &child_info = Get(*child);
 		info.refused = info.refused || child_info.refused;
+		if (info.refusal == RefusalReason::NONE) {
+			info.refusal = child_info.refusal;
+		}
 		info.nondeterministic = info.nondeterministic || child_info.nondeterministic;
 		info.unreliable_estimate = info.unreliable_estimate || child_info.unreliable_estimate;
 		info.runtime_filtered = info.runtime_filtered || child_info.runtime_filtered;
@@ -867,14 +1043,34 @@ void PlanSignatures::Compute(LogicalOperator &op) {
 				info.pending_dynamic_owners.push_back(owner);
 			}
 		}
+		for (auto &table : child_info.tables) {
+			AddTable(info.tables, table.get());
+		}
 	}
 	// operator-specific derived flags
 	switch (op.type) {
-	case LogicalOperatorType::LOGICAL_GET:
+	case LogicalOperatorType::LOGICAL_GET: {
+		auto table = op.Cast<LogicalGet>().GetTable();
+		if (table) {
+			AddTable(info.tables, *table);
+		}
+		info.est_leaf_rows += op.EstimateCardinality(context);
+		break;
+	}
+	case LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR: {
+		// an entry stored above the scan of an earlier hit is invalidated with the tables behind that hit
+		auto ours = AsRecyclerOperator(op);
+		if (ours && ours->kind == RecyclerOperatorKind::SCAN) {
+			for (auto &table : op.Cast<LogicalRecyclerScan>().tables) {
+				AddTable(info.tables, table.get());
+			}
+		}
+		info.est_leaf_rows += op.EstimateCardinality(context);
+		break;
+	}
 	case LogicalOperatorType::LOGICAL_CHUNK_GET:
 	case LogicalOperatorType::LOGICAL_EXPRESSION_GET:
 	case LogicalOperatorType::LOGICAL_DUMMY_SCAN:
-	case LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR:
 		info.est_leaf_rows += op.EstimateCardinality(context);
 		break;
 	case LogicalOperatorType::LOGICAL_DELIM_GET:
@@ -904,7 +1100,8 @@ void PlanSignatures::Compute(LogicalOperator &op) {
 		// the delim gets on the delim side belong to this join unless there are nested delim joins there,
 		// in which case we cannot tell them apart and stay conservative
 		bool own_gets_resolved = delim_info.delim_joins == 0 && delim_info.delim_gets > 0;
-		info.unresolved_delim_get = other_info.unresolved_delim_get || (!own_gets_resolved && delim_info.delim_gets > 0);
+		info.unresolved_delim_get =
+		    other_info.unresolved_delim_get || (!own_gets_resolved && delim_info.delim_gets > 0);
 		info.delim_gets = other_info.delim_gets + (own_gets_resolved ? 0 : delim_info.delim_gets);
 		break;
 	}
@@ -919,7 +1116,8 @@ void PlanSignatures::Compute(LogicalOperator &op) {
 	case LogicalOperatorType::LOGICAL_LIMIT: {
 		auto &limit = op.Cast<LogicalLimit>();
 		bool child_ordered = !op.children.empty() && Get(*op.children[0]).ordered;
-		bool has_limit = limit.limit_val.Type() != LimitNodeType::UNSET || limit.offset_val.Type() != LimitNodeType::UNSET;
+		bool has_limit =
+		    limit.limit_val.Type() != LimitNodeType::UNSET || limit.offset_val.Type() != LimitNodeType::UNSET;
 		if (has_limit && !child_ordered) {
 			// which rows survive depends on execution order
 			info.nondeterministic = true;
@@ -1070,8 +1268,8 @@ bool PlanSignatures::TryParseConstraint(const Expression &expr, vector<RangeCons
 		lower.op = between.lower_inclusive ? ExpressionType::COMPARE_GREATERTHANOREQUALTO
 		                                   : ExpressionType::COMPARE_GREATERTHAN;
 		upper.column = identity;
-		upper.op = between.upper_inclusive ? ExpressionType::COMPARE_LESSTHANOREQUALTO
-		                                   : ExpressionType::COMPARE_LESSTHAN;
+		upper.op =
+		    between.upper_inclusive ? ExpressionType::COMPARE_LESSTHANOREQUALTO : ExpressionType::COMPARE_LESSTHAN;
 		out.push_back(std::move(lower));
 		out.push_back(std::move(upper));
 		return true;
@@ -1090,7 +1288,7 @@ BlockShape ComputeBlockShape(ClientContext &context, const LogicalOperator &root
 	if (!root_info.Cacheable()) {
 		return shape;
 	}
-	PlanSignatures block(context, true);
+	PlanSignatures block(context, plan_info.salt, true);
 	block.AssignIds(root);
 	if (block.joins == 0) {
 		return shape;
@@ -1157,10 +1355,18 @@ static bool ConstraintImplied(const RangeConstraint &c, const RangeConstraint &q
 	}
 	auto &qv = q.value;
 	auto &cv = c.value;
-	auto ge = [&]() { return !(qv < cv); };
-	auto gt = [&]() { return cv < qv; };
-	auto le = [&]() { return !(cv < qv); };
-	auto lt = [&]() { return qv < cv; };
+	auto ge = [&]() {
+		return !(qv < cv);
+	};
+	auto gt = [&]() {
+		return cv < qv;
+	};
+	auto le = [&]() {
+		return !(cv < qv);
+	};
+	auto lt = [&]() {
+		return qv < cv;
+	};
 	switch (c.op) {
 	case ExpressionType::COMPARE_EQUAL:
 		return q.op == ExpressionType::COMPARE_EQUAL && qv == cv;

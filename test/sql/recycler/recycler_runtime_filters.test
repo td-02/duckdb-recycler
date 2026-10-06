@@ -1,0 +1,137 @@
+# name: test/sql/recycler/recycler_runtime_filters.test
+# description: a subtree whose scan receives runtime filters from a join above it is stored with all of its rows
+# group: [recycler]
+
+require waddle
+
+# one thread makes the pruning deterministic: the build side of every join then completes before the pipelines of
+# its probe side start (PhysicalJoin::BuildJoinPipelines), so the outer join's filters reach the scan before it runs
+statement ok
+SET threads = 1;
+
+# g is far wider than 32 bits so that compressed materialization puts no projection the join filters cannot pass
+# through between the outer join and the scan
+statement ok
+CREATE TABLE facts AS SELECT range AS id, (range % 1000) * 10000000000 AS g, range % 5000 AS m FROM range(1000000);
+
+statement ok
+CREATE TABLE dims AS SELECT range AS id, range % 3 AS kind FROM range(5000);
+
+# the partners span the whole range of g, so the optimizer derives no static filter from their statistics; their w = 1
+# rows hit 50 groups each, disjoint between the two, and only those reach the join at runtime
+statement ok
+CREATE TABLE p1 AS
+SELECT range * 10000000000 AS g, 0 AS w FROM range(0, 1000, 9)
+UNION ALL SELECT 9990000000000, 0
+UNION ALL SELECT range * 40000000000, 1 FROM range(50);
+
+statement ok
+CREATE TABLE p2 AS
+SELECT range * 10000000000 AS g, 0 AS w FROM range(0, 1000, 9)
+UNION ALL SELECT 9990000000000, 0
+UNION ALL SELECT 5020000000000 + range * 40000000000, 1 FROM range(50);
+
+statement ok
+SET recycler_enabled = false;
+
+# the scan of facts below the aggregate carries the filter of the join above it (on g, through the group), and in a
+# release build also the one of the join inside the aggregate (on m). A debug build pads the plan with verification
+# projections, after which compressed materialization compresses m below that join and its filter stops there, and
+# adds a Bloom filter to the one on g.
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*), sum(s.c)
+FROM (SELECT f.g, count(DISTINCT f.m) AS c FROM facts f JOIN dims d ON f.m = d.id WHERE d.kind = 1 GROUP BY f.g) s
+JOIN p1 ON p1.g = s.g WHERE p1.w = 1
+----
+analyzed_plan	<REGEX>:(?s).*"Dynamic Filters": (\[\s*("optional: m>=1 AND optional: m<=4999",\s*)?)?"optional: g IN .* AND optional: g>=0 AND optional: g<=1960000000000( AND optional: g IN BF\(g\))?".*
+
+query I
+SELECT count(*) FROM (SELECT f.g, count(DISTINCT f.m) AS c FROM facts f JOIN dims d ON f.m = d.id WHERE d.kind = 1 GROUP BY f.g)
+----
+1000
+
+query II nosort q_p1
+SELECT count(*), sum(s.c)
+FROM (SELECT f.g, count(DISTINCT f.m) AS c FROM facts f JOIN dims d ON f.m = d.id WHERE d.kind = 1 GROUP BY f.g) s
+JOIN p1 ON p1.g = s.g WHERE p1.w = 1
+----
+
+query II nosort q_p2
+SELECT count(*), sum(s.c)
+FROM (SELECT f.g, count(DISTINCT f.m) AS c FROM facts f JOIN dims d ON f.m = d.id WHERE d.kind = 1 GROUP BY f.g) s
+JOIN p2 ON p2.g = s.g WHERE p2.w = 1
+----
+
+query II nosort q_topn
+SELECT s.g, s.c
+FROM (SELECT f.g, count(DISTINCT f.m) AS c FROM facts f JOIN dims d ON f.m = d.id WHERE d.kind = 1 GROUP BY f.g) s
+ORDER BY s.g DESC LIMIT 3
+----
+
+statement ok
+SET recycler_enabled = true;
+
+# a Top-N filter has no join to strip it from: the aggregate below the Top-N is refused, only the whole result is
+# stored
+query II nosort q_topn
+SELECT s.g, s.c
+FROM (SELECT f.g, count(DISTINCT f.m) AS c FROM facts f JOIN dims d ON f.m = d.id WHERE d.kind = 1 GROUP BY f.g) s
+ORDER BY s.g DESC LIMIT 3
+----
+
+query II
+SELECT kind, rows FROM recycler_entries() ORDER BY rows
+----
+whole_result	3
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'stripped_runtime_filters'
+----
+0
+
+query II nosort q_p1
+SELECT count(*), sum(s.c)
+FROM (SELECT f.g, count(DISTINCT f.m) AS c FROM facts f JOIN dims d ON f.m = d.id WHERE d.kind = 1 GROUP BY f.g) s
+JOIN p1 ON p1.g = s.g WHERE p1.w = 1
+----
+
+# the aggregate below the join is stored with all of its groups: the join above it no longer filters its scan
+query II
+SELECT kind, rows FROM recycler_entries() WHERE kind = 'subtree' ORDER BY rows
+----
+subtree	1
+subtree	1000
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'stripped_runtime_filters'
+----
+1
+
+# served from the stored aggregate (a hit strips nothing), joined with the other partner's groups
+query II nosort q_p2
+SELECT count(*), sum(s.c)
+FROM (SELECT f.g, count(DISTINCT f.m) AS c FROM facts f JOIN dims d ON f.m = d.id WHERE d.kind = 1 GROUP BY f.g) s
+JOIN p2 ON p2.g = s.g WHERE p2.w = 1
+----
+
+query II nosort q_p1
+SELECT count(*), sum(s.c)
+FROM (SELECT f.g, count(DISTINCT f.m) AS c FROM facts f JOIN dims d ON f.m = d.id WHERE d.kind = 1 GROUP BY f.g) s
+JOIN p1 ON p1.g = s.g WHERE p1.w = 1
+----
+
+query II
+SELECT rows, hits FROM recycler_entries() WHERE kind = 'subtree' ORDER BY rows, hits
+----
+1	0
+1	1
+1000	1
+
+query II
+SELECT name, value FROM recycler_stats()
+WHERE name IN ('stripped_runtime_filters', 'subtree_hits', 'subtree_stores') ORDER BY name
+----
+stripped_runtime_filters	1
+subtree_hits	2
+subtree_stores	3

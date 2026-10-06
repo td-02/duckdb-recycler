@@ -1,0 +1,542 @@
+# name: test/sql/recycler/recycler_settings.test
+# description: the result-affecting settings the renderer cannot see (ieee_floating_point_ops, default_order, default_null_order, scalar_subquery_error_on_multiple_rows) are part of every key; current_setting() is refused; integer_division is in the plan
+# group: [recycler]
+
+require waddle
+
+statement ok
+SET threads = 4;
+
+# subsumption serves blocks only when the session does not promise insertion order
+statement ok
+SET preserve_insertion_order = false;
+
+statement ok
+SET recycler_min_input_rows = 1;
+
+statement ok
+CREATE TABLE t AS SELECT range AS id, range % 7 AS g, 1990 + range % 30 AS y FROM range(20000);
+
+statement ok
+CREATE TABLE d AS SELECT range AS id, 'role' || range AS role FROM range(12);
+
+statement ok
+CREATE TABLE k AS SELECT range AS id, 'kind' || range AS kind FROM range(7);
+
+# ---------------------------------------------------------------------------
+# whole result: the same plan under each value gets its own entry and is never served across values
+# ---------------------------------------------------------------------------
+statement ok
+SET ieee_floating_point_ops = true;
+
+query II
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g
+----
+0	2858
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+statement ok
+SET ieee_floating_point_ops = false;
+
+query II
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g
+----
+0	2858
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_stores'
+----
+2
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+0
+
+# each value is served its own entry
+statement ok
+SET ieee_floating_point_ops = true;
+
+query II
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g
+----
+0	2858
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+1
+
+statement ok
+SET ieee_floating_point_ops = false;
+
+query II
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g
+----
+0	2858
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+2
+
+# ---------------------------------------------------------------------------
+# subtree: the aggregate stored under one value (the two whole queries above stored theirs too) is served only
+# under that value; the ORDER BY direction keeps the whole results apart
+# ---------------------------------------------------------------------------
+query II
+SELECT g, sum(id) AS s FROM t GROUP BY g ORDER BY g
+----
+0	28578571
+1	28561429
+2	28564286
+3	28567143
+4	28570000
+5	28572857
+6	28575714
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'subtree_stores'
+----
+3
+
+statement ok
+SET ieee_floating_point_ops = true;
+
+query II
+SELECT g, sum(id) AS s FROM t GROUP BY g ORDER BY g DESC
+----
+6	28575714
+5	28572857
+4	28570000
+3	28567143
+2	28564286
+1	28561429
+0	28578571
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'subtree_hits'
+----
+0
+
+statement ok
+SET ieee_floating_point_ops = false;
+
+query II
+SELECT g, sum(id) AS s FROM t GROUP BY g ORDER BY g DESC
+----
+6	28575714
+5	28572857
+4	28570000
+3	28567143
+2	28564286
+1	28561429
+0	28578571
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'subtree_hits'
+----
+1
+
+# ---------------------------------------------------------------------------
+# subsumption: the block stored under one value is not served to a narrower block under the other
+# ---------------------------------------------------------------------------
+query II
+SELECT g, count(*) AS c FROM t JOIN d ON t.g = d.id JOIN k ON k.id = t.g WHERE y IS NOT NULL AND d.id < 3 GROUP BY g ORDER BY g
+----
+0	2858
+1	2857
+2	2857
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'block_stores'
+----
+1
+
+statement ok
+SET ieee_floating_point_ops = true;
+
+query II
+SELECT g, count(*) AS c FROM t JOIN d ON t.g = d.id JOIN k ON k.id = t.g WHERE y BETWEEN 2000 AND 2005 AND d.id < 3 GROUP BY g ORDER BY g
+----
+0	572
+1	572
+2	571
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'subsumption_hits'
+----
+0
+
+statement ok
+SET ieee_floating_point_ops = false;
+
+query II
+SELECT g, count(*) AS c FROM t JOIN d ON t.g = d.id JOIN k ON k.id = t.g WHERE y BETWEEN 2000 AND 2005 AND d.id < 3 GROUP BY g ORDER BY g
+----
+0	572
+1	572
+2	571
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'subsumption_hits'
+----
+1
+
+# ---------------------------------------------------------------------------
+# under each value the stored and the served answers equal vanilla's (the labelled runs with the extension's
+# optimizer disabled): a division by zero is NULL or infinity
+# ---------------------------------------------------------------------------
+statement ok
+SET disabled_optimizers = 'extension';
+
+query IRI nosort div_zero_null
+SELECT g, max(1.0::DOUBLE / (id % 2)) AS m, count(1.0::DOUBLE / (id % 2)) AS n FROM t GROUP BY g ORDER BY g
+----
+
+statement ok
+SET disabled_optimizers = '';
+
+query IRI nosort div_zero_null
+SELECT g, max(1.0::DOUBLE / (id % 2)) AS m, count(1.0::DOUBLE / (id % 2)) AS n FROM t GROUP BY g ORDER BY g
+----
+
+query IRI nosort div_zero_null
+SELECT g, max(1.0::DOUBLE / (id % 2)) AS m, count(1.0::DOUBLE / (id % 2)) AS n FROM t GROUP BY g ORDER BY g
+----
+
+statement ok
+SET ieee_floating_point_ops = true;
+
+statement ok
+SET disabled_optimizers = 'extension';
+
+query IRI nosort div_zero_inf
+SELECT g, max(1.0::DOUBLE / (id % 2)) AS m, count(1.0::DOUBLE / (id % 2)) AS n FROM t GROUP BY g ORDER BY g
+----
+
+statement ok
+SET disabled_optimizers = '';
+
+query IRI nosort div_zero_inf
+SELECT g, max(1.0::DOUBLE / (id % 2)) AS m, count(1.0::DOUBLE / (id % 2)) AS n FROM t GROUP BY g ORDER BY g
+----
+
+query IRI nosort div_zero_inf
+SELECT g, max(1.0::DOUBLE / (id % 2)) AS m, count(1.0::DOUBLE / (id % 2)) AS n FROM t GROUP BY g ORDER BY g
+----
+
+statement ok
+SET ieee_floating_point_ops = false;
+
+query IRI nosort div_zero_null
+SELECT g, max(1.0::DOUBLE / (id % 2)) AS m, count(1.0::DOUBLE / (id % 2)) AS n FROM t GROUP BY g ORDER BY g
+----
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+5
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_stores'
+----
+10
+
+# ---------------------------------------------------------------------------
+# default_order: list_sort resolves its direction at bind time into bind data the renderer does not see, so the first
+# element is the group's smallest id under ASC and its largest under DESC; the ORDER BY is explicit so that the bound
+# plan is the same under both values (an ORDER BY without a direction is resolved by the binder)
+# ---------------------------------------------------------------------------
+statement ok
+SET default_order = 'ASC';
+
+statement ok
+SET disabled_optimizers = 'extension';
+
+query II nosort first_asc
+SELECT g, list_sort(list(id))[1] AS first FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+
+statement ok
+SET disabled_optimizers = '';
+
+query II nosort first_asc
+SELECT g, list_sort(list(id))[1] AS first FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+
+query II nosort first_asc
+SELECT g, list_sort(list(id))[1] AS first FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+
+statement ok
+SET default_order = 'DESC';
+
+statement ok
+SET disabled_optimizers = 'extension';
+
+query II nosort first_desc
+SELECT g, list_sort(list(id))[1] AS first FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+
+statement ok
+SET disabled_optimizers = '';
+
+# a miss: the entry stored under ASC is not served
+query II nosort first_desc
+SELECT g, list_sort(list(id))[1] AS first FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+
+query II nosort first_desc
+SELECT g, list_sort(list(id))[1] AS first FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_stores'
+----
+12
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+7
+
+# ---------------------------------------------------------------------------
+# default_null_order: the same bind data decides where list_sort puts NULLs, so the first element is the group's
+# smallest odd id under NULLS_LAST and NULL under NULLS_FIRST
+# ---------------------------------------------------------------------------
+statement ok
+SET default_order = 'ASC';
+
+statement ok
+SET default_null_order = 'NULLS_LAST';
+
+statement ok
+SET disabled_optimizers = 'extension';
+
+query II nosort nulls_last
+SELECT g, list_sort(list(CASE WHEN id % 2 = 0 THEN NULL ELSE id END))[1] AS first FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+
+statement ok
+SET disabled_optimizers = '';
+
+query II nosort nulls_last
+SELECT g, list_sort(list(CASE WHEN id % 2 = 0 THEN NULL ELSE id END))[1] AS first FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+
+query II nosort nulls_last
+SELECT g, list_sort(list(CASE WHEN id % 2 = 0 THEN NULL ELSE id END))[1] AS first FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+
+statement ok
+SET default_null_order = 'NULLS_FIRST';
+
+statement ok
+SET disabled_optimizers = 'extension';
+
+query II nosort nulls_first
+SELECT g, list_sort(list(CASE WHEN id % 2 = 0 THEN NULL ELSE id END))[1] AS first FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+
+statement ok
+SET disabled_optimizers = '';
+
+query II nosort nulls_first
+SELECT g, list_sort(list(CASE WHEN id % 2 = 0 THEN NULL ELSE id END))[1] AS first FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+
+query II nosort nulls_first
+SELECT g, list_sort(list(CASE WHEN id % 2 = 0 THEN NULL ELSE id END))[1] AS first FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_stores'
+----
+14
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+9
+
+# ---------------------------------------------------------------------------
+# current_setting folds the named setting's value into its bind data: a CONSISTENT function whose result is a function
+# of the session, not of its arguments, so the statement is refused rather than keyed
+# ---------------------------------------------------------------------------
+statement ok
+SET threads = 2;
+
+query II
+SELECT g, current_setting('threads') AS th FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+0	2
+1	2
+2	2
+3	2
+4	2
+5	2
+6	2
+
+statement ok
+SET threads = 3;
+
+query II
+SELECT g, current_setting('threads') AS th FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+0	3
+1	3
+2	3
+3	3
+4	3
+5	3
+6	3
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'refused_session_bound_function'
+----
+2
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+9
+
+# ---------------------------------------------------------------------------
+# integer_division needs no salt: it is a parser option that rewrites "/" into "//", so the two plans differ in the
+# rendered function and each value gets its own entry; under each value the stored and the served answers equal
+# vanilla's (a half is 0.5 or 0)
+# ---------------------------------------------------------------------------
+statement ok
+SET integer_division = false;
+
+statement ok
+SET disabled_optimizers = 'extension';
+
+query IR nosort div_float
+SELECT g, max(id / 2) AS m FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+
+statement ok
+SET disabled_optimizers = '';
+
+query IR nosort div_float
+SELECT g, max(id / 2) AS m FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+
+query IR nosort div_float
+SELECT g, max(id / 2) AS m FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+
+statement ok
+SET integer_division = true;
+
+statement ok
+SET disabled_optimizers = 'extension';
+
+query II nosort div_int
+SELECT g, max(id / 2) AS m FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+
+statement ok
+SET disabled_optimizers = '';
+
+# a miss: the entry stored under "/" is not served to "//"
+query II nosort div_int
+SELECT g, max(id / 2) AS m FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+
+query II nosort div_int
+SELECT g, max(id / 2) AS m FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+
+statement ok
+SET integer_division = false;
+
+query IR nosort div_float
+SELECT g, max(id / 2) AS m FROM t GROUP BY g ORDER BY g ASC NULLS LAST
+----
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_stores'
+----
+16
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+12
+
+# ---------------------------------------------------------------------------
+# scalar_subquery_error_on_multiple_rows is read at execution by the hash table of the SINGLE join a correlated scalar
+# subquery becomes: under false the second match of g = 0 is dropped, under true it is an error. The entry stored
+# under false is served under false, and never under true
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE s AS SELECT range % 7 AS id, 'v' || (range % 7) AS v FROM range(8);
+
+statement ok
+SET scalar_subquery_error_on_multiple_rows = false;
+
+query IIT
+SELECT g, count(*) AS c, (SELECT s.v FROM s WHERE s.id = t.g) AS v FROM t GROUP BY g ORDER BY g
+----
+0	2858	v0
+1	2857	v1
+2	2857	v2
+3	2857	v3
+4	2857	v4
+5	2857	v5
+6	2857	v6
+
+query IIT
+SELECT g, count(*) AS c, (SELECT s.v FROM s WHERE s.id = t.g) AS v FROM t GROUP BY g ORDER BY g
+----
+0	2858	v0
+1	2857	v1
+2	2857	v2
+3	2857	v3
+4	2857	v4
+5	2857	v5
+6	2857	v6
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+13
+
+statement ok
+SET scalar_subquery_error_on_multiple_rows = true;
+
+statement error
+SELECT g, count(*) AS c, (SELECT s.v FROM s WHERE s.id = t.g) AS v FROM t GROUP BY g ORDER BY g
+----
+More than one row returned by a subquery used as an expression
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+13

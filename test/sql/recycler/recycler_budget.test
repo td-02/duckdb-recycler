@@ -1,0 +1,46 @@
+# name: test/sql/recycler/recycler_budget.test
+# description: the cache budget is the smaller of recycler_budget_mb and a quarter of the memory limit, evaluated when a connection reloads its recycler settings
+# group: [recycler]
+
+require waddle
+
+# memory_limit is a global option, and a connection re-reads its recycler settings, the budget with them, only after
+# a SET, RESET or PRAGMA of its own: con1 issues one after con2 changed the limit
+statement ok con2
+SET memory_limit = '400MiB';
+
+statement ok con1
+SET recycler_enabled = true;
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'budget_bytes'
+----
+104857600
+
+# a quarter of 8,000 MB (10^6 bytes each) is below the default of 2,000 MiB
+statement ok con2
+SET memory_limit = '8000MB';
+
+statement ok con1
+SET recycler_enabled = true;
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'budget_bytes'
+----
+2000000000
+
+statement ok con1
+SET recycler_budget_mb = 1000;
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'budget_bytes'
+----
+1048576000
+
+statement ok con1
+RESET recycler_budget_mb;
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'budget_bytes'
+----
+2000000000

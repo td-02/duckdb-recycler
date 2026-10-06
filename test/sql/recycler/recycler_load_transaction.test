@@ -1,0 +1,100 @@
+# name: test/sql/recycler/recycler_load_transaction.test
+# description: a transaction open on the connection that goes on to use the extension while it loads keeps the cache
+# off until that transaction ends, and no longer: a connection idle at LOAD holds nothing. The runner loads the
+# extension through the database; scripts/ci_stock_duckdb.py runs LOAD itself inside the transaction.
+# group: [recycler]
+
+statement ok
+CREATE TABLE t AS SELECT range AS id, range % 7 AS g FROM range(20000);
+
+# con1 is open and idle at LOAD
+statement ok con1
+SELECT 42;
+
+statement ok
+BEGIN TRANSACTION;
+
+query I
+SELECT count(*) FROM t
+----
+20000
+
+require waddle
+
+statement ok
+SET recycler_min_input_rows = 1;
+
+query II
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g
+----
+0	2858
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+query II
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g
+----
+0	2858
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+# the transaction open at LOAD is neither served nor stores
+query I
+SELECT count(*) FROM recycler_entries()
+----
+0
+
+statement ok
+COMMIT;
+
+query II
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g
+----
+0	2858
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+query II
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g
+----
+0	2858
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+1
+
+# con1 has run nothing since LOAD, and is served too
+query II con1
+SELECT g, count(*) AS c FROM t GROUP BY g ORDER BY g
+----
+0	2858
+1	2857
+2	2857
+3	2857
+4	2857
+5	2857
+6	2857
+
+query I con1
+SELECT value FROM recycler_stats() WHERE name = 'whole_hits'
+----
+2

@@ -1,0 +1,202 @@
+#
+# Correctness gate for the recycler (docs/PRODUCTION_PLAN.md section 9.4, docs/CI.md).
+#
+# MainDistributionPipeline.yml stays the only producer of graded binaries; nothing here is
+# published. Every build job compiles the pinned duckdb submodule through
+# .github/actions/build-extension (the extension-ci-tools makefile under ccache) and runs the recycler
+# sqllogictests against the resulting unittest binary. The slow jobs (debug, asan-ubsan, tsan)
+# run for every pull request and, by hand, only when the "full" input is set.
+#
+name: Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      full:
+        description: Also run debug, asan-ubsan and tsan (pull requests always do)
+        type: boolean
+        default: false
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The tag MainDistributionPipeline.yml pins; .github/actions/build-extension checks the submodule is at it.
+  DUCKDB_TAG: v1.5.5
+
+jobs:
+  build-test:
+    name: Release build and recycler suites
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      # Links ICU and sqlite_scanner into the unittest binary so that recycler_settings_icu.test (TimeZone and
+      # Calendar in the key) and recycler_catalogs_sqlite.test (a non-DuckDB catalog's tables are refused) run
+      # instead of being skipped by their `require` lines; the waddle artifact is the same. sqlite_scanner is
+      # out of tree: duckdb's pinned config fetches it at configure time and links it statically.
+      EXT_FLAGS: -DBUILD_EXTENSIONS=icu
+      EXTRA_EXTENSION_CONFIGS: ${{ github.workspace }}/duckdb/.github/config/extensions/sqlite_scanner.cmake
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: ./.github/actions/build-extension
+        with:
+          target: release
+          duckdb-tag: ${{ env.DUCKDB_TAG }}
+
+      - name: Recycler suites
+        run: |
+          ./build/release/test/unittest "test/sql/recycler/*"
+          ./build/release/test/unittest "test/sql/waddle.test"
+
+      - name: Upload the loadable extension for the stock-duckdb job
+        uses: actions/upload-artifact@v4
+        with:
+          name: waddle-linux_amd64
+          path: build/release/extension/waddle/waddle.duckdb_extension
+          retention-days: 7
+
+  debug:
+    name: Debug build (D_ASSERT) and recycler suites
+    if: github.event_name == 'pull_request' || inputs.full == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      # Sanitizers are the asan-ubsan job's business; without them the -O0 binary runs the
+      # suites several times faster and a failure here is an assertion or a logic error.
+      DISABLE_SANITIZER: 1
+      EXT_FLAGS: -DBUILD_EXTENSIONS=icu
+      EXTRA_EXTENSION_CONFIGS: ${{ github.workspace }}/duckdb/.github/config/extensions/sqlite_scanner.cmake
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: ./.github/actions/build-extension
+        with:
+          target: debug
+          duckdb-tag: ${{ env.DUCKDB_TAG }}
+
+      - name: Recycler suites
+        run: |
+          ./build/debug/test/unittest "test/sql/recycler/*"
+          ./build/debug/test/unittest "test/sql/waddle.test"
+
+  asan-ubsan:
+    name: Address and undefined-behaviour sanitizers
+    if: github.event_name == 'pull_request' || inputs.full == true
+    runs-on: ubuntu-latest
+    # A cold build took 74 minutes before its link on 2026-10-02; the suites add about 10.
+    timeout-minutes: 150
+    env:
+      UBSAN_OPTIONS: print_stacktrace=1
+      # duckdb runs two links at once in a non-Release build; one sanitizer link of unittest alone takes
+      # several GB. duckdb/CMakeLists.txt forces -g on RelWithDebInfo, so the debug information is
+      # compressed (-gz) instead of reduced: the build ran out of disk on 2026-10-06.
+      EXT_FLAGS: >-
+        -DDUCKDB_DEBUG_LINK_JOBS=1 -DCMAKE_C_FLAGS=-gz -DCMAKE_CXX_FLAGS=-gz
+        -DCMAKE_EXE_LINKER_FLAGS=-gz -DCMAKE_SHARED_LINKER_FLAGS=-gz
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # The makefile has no variable that adds sanitizers to a Release build (DISABLE_SANITIZER
+      # and DISABLE_UBSAN only remove them). Its relassert target is RelWithDebInfo with
+      # FORCE_ASSERT=1, under which duckdb/CMakeLists.txt compiles with -fsanitize=address and
+      # -fsanitize=undefined -fno-sanitize-recover=all; DuckDB's own Main.yml uses the same target.
+      - uses: ./.github/actions/build-extension
+        with:
+          target: relassert
+          duckdb-tag: ${{ env.DUCKDB_TAG }}
+
+      - name: Recycler suites
+        run: |
+          ./build/relassert/test/unittest "test/sql/recycler/*"
+          ./build/relassert/test/unittest "test/sql/waddle.test"
+
+  tsan:
+    name: Thread sanitizer on the stress test
+    if: github.event_name == 'pull_request' || inputs.full == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      # THREADSAN=1 is the makefile's switch for -DENABLE_THREAD_SANITIZER=1; clang and the
+      # suppression list are what DuckDB's own thread-sanitizer job uses.
+      THREADSAN: 1
+      CC: clang
+      CXX: clang++
+      TSAN_OPTIONS: suppressions=${{ github.workspace }}/duckdb/.sanitizer-thread-suppressions.txt
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: ./.github/actions/build-extension
+        with:
+          target: reldebug
+          duckdb-tag: ${{ env.DUCKDB_TAG }}
+          extra-packages: clang
+
+      # The unittest runner exits 0 when a pattern matches no test, so the file is checked first.
+      - name: Stress test
+        run: |
+          test -f test/sql/recycler/recycler_stress.test
+          ./build/reldebug/test/unittest "test/sql/recycler/recycler_stress.test"
+
+  stock-duckdb:
+    name: Loadable extension in the PyPI duckdb wheel
+    needs: build-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: waddle-linux_amd64
+          path: build/release/extension/waddle
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # 1.5.5 is on PyPI (checked with `pip index versions duckdb` on 2026-10-01).
+      - name: Install stock DuckDB
+        run: pip install duckdb==1.5.5
+
+      - name: Differential check
+        run: python3 scripts/ci_stock_duckdb.py build/release/extension/waddle/waddle.duckdb_extension
+
+  format:
+    name: clang-format (DuckDB style)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # The version duckdb/scripts/format.py insists on; newer releases format differently.
+      - name: Install clang-format
+        run: pip install clang-format==11.0.1
+
+      # clang-format 11 reads the nearest .clang-format above each file, so the root copy must be
+      # DuckDB's; the comparison fails the job the day the submodule bump changes the style.
+      - name: Check
+        run: |
+          cmp .clang-format duckdb/.clang-format
+          clang-format --dry-run -Werror --sort-includes=0 -style=file src/*.cpp src/include/*.hpp
