@@ -120,6 +120,11 @@ static double CollectProfiledOperators(const ProfilingNode &node, vector<Profile
 }
 
 void RecyclerClientState::QueryEnd(ClientContext &context, optional_ptr<ErrorData> error) {
+	// a SET/RESET/PRAGMA has run (or failed): the next statement reads the settings again
+	if (settings_change_pending) {
+		settings_change_pending = false;
+		settings_loaded = false;
+	}
 	// the post hook resets the state, but never runs when an optimizer between the hooks throws: the snapshot's
 	// catalog-entry references must not outlive the statement either way
 	Reset();
@@ -275,6 +280,11 @@ RebindQueryInfo RecyclerClientState::OnExecutePrepared(ClientContext &context, P
 	auto &root = prepared.physical_plan->Root();
 	AnnounceStatement(context, *GetRecyclerState(context)->cache, PhysicalWriteTarget(root),
 	                  prepared.properties.modified_databases);
+	// a prepared SET/RESET/PRAGMA changes the settings without the pre hook seeing it (RESET is a SET statement)
+	if (prepared.statement_type == StatementType::SET_STATEMENT ||
+	    prepared.statement_type == StatementType::PRAGMA_STATEMENT) {
+		settings_change_pending = true;
+	}
 	return current_rebind;
 }
 
@@ -418,6 +428,10 @@ static unique_ptr<GlobalTableFunctionState> RecyclerStatsInit(ClientContext &con
 		add("blocks_planted", s.blocks_planted);
 		add("block_stores", s.block_stores);
 		add("subsumption_hits", s.subsumption_hits);
+		add("exists_rewrites", s.exists_rewrites);
+		add("exists_pushdowns", s.exists_pushdowns);
+		add("exists_refused", s.exists_refused);
+		add("exists_ns", s.exists_ns);
 		add("store_rejected", s.store_rejected);
 		add("too_big", s.too_big);
 		add("evictions", s.evictions);
@@ -656,6 +670,9 @@ void LoadRecycler(ExtensionLoader &loader) {
 	                          "Cache the sorted rows below LIMIT/OFFSET so that later pages skip the sort (needs "
 	                          "recycler_subtrees)",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(defaults.pagination));
+	config.AddExtensionOption("recycler_exists_rewrite",
+	                          "Plan correlated EXISTS subqueries as plain semi joins the join order optimizer places",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(defaults.exists_rewrite));
 	config.AddExtensionOption("recycler_budget_mb", "Memory budget of the recycler cache in MB", LogicalType::BIGINT,
 	                          Value::BIGINT(int64_t(defaults.budget_bytes / (1024 * 1024))));
 	config.AddExtensionOption("recycler_entry_cap_mb", "Largest cache entry in MB", LogicalType::BIGINT,

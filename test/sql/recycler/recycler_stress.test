@@ -233,6 +233,71 @@ SELECT id, h FROM t WHERE g = 5 AND id <> -1 - ${i} ORDER BY h DESC, id LIMIT 5
 statement ok
 RESET recycler_enabled;
 
+# shape 8: correlated EXISTS over a wide block (the EXISTS rewrite, then a subsumption payer)
+query II
+SELECT g, count(*) AS c FROM t JOIN k ON k.id = t.g WHERE y IS NOT NULL AND EXISTS (SELECT 1 FROM d WHERE d.id = t.g AND d.id < 3) GROUP BY g ORDER BY g
+----
+0	42858
+1	42857
+2	42857
+
+statement ok
+SET recycler_enabled = false;
+
+query II
+SELECT g, count(*) AS c FROM t JOIN k ON k.id = t.g WHERE y IS NOT NULL AND EXISTS (SELECT 1 FROM d WHERE d.id = t.g AND d.id < 3) GROUP BY g ORDER BY g
+----
+0	42858
+1	42857
+2	42857
+
+statement ok
+RESET recycler_enabled;
+
+# shape 9: the narrower EXISTS block, served by subsumption from shape 8 when that is cached
+query II
+SELECT g, count(*) AS c FROM t JOIN k ON k.id = t.g WHERE y BETWEEN 2000 AND 2005 AND EXISTS (SELECT 1 FROM d WHERE d.id = t.g AND d.id < 3) GROUP BY g ORDER BY g
+----
+0	8572
+1	8571
+2	8571
+
+statement ok
+SET recycler_enabled = false;
+
+query II
+SELECT g, count(*) AS c FROM t JOIN k ON k.id = t.g WHERE y BETWEEN 2000 AND 2005 AND EXISTS (SELECT 1 FROM d WHERE d.id = t.g AND d.id < 3) GROUP BY g ORDER BY g
+----
+0	8572
+1	8571
+2	8571
+
+statement ok
+RESET recycler_enabled;
+
+# shape 10: NOT EXISTS (an ANTI join after the rewrite)
+query II
+SELECT g, count(*) AS c FROM t JOIN k ON k.id = t.g WHERE y BETWEEN 2000 AND 2005 AND NOT EXISTS (SELECT 1 FROM d WHERE d.id = t.g AND d.id < 3) GROUP BY g ORDER BY g
+----
+3	8572
+4	8571
+5	8572
+6	8571
+
+statement ok
+SET recycler_enabled = false;
+
+query II
+SELECT g, count(*) AS c FROM t JOIN k ON k.id = t.g WHERE y BETWEEN 2000 AND 2005 AND NOT EXISTS (SELECT 1 FROM d WHERE d.id = t.g AND d.id < 3) GROUP BY g ORDER BY g
+----
+3	8572
+4	8571
+5	8572
+6	8571
+
+statement ok
+RESET recycler_enabled;
+
 statement ok
 COMMIT;
 

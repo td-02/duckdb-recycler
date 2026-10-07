@@ -7,6 +7,7 @@
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
+#include "duckdb/planner/operator/logical_distinct.hpp"
 #include "duckdb/planner/operator/logical_empty_result.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
@@ -107,6 +108,26 @@ idx_t StripRuntimeFilters(const LogicalOperator &subtree, const vector<LogicalOp
 		probe_info.erase(kept, probe_info.end());
 	}
 	return stripped;
+}
+
+bool ConsumesChildrenPositionally(const LogicalOperator &op) {
+	switch (op.type) {
+	case LogicalOperatorType::LOGICAL_UNION:
+	case LogicalOperatorType::LOGICAL_EXCEPT:
+	case LogicalOperatorType::LOGICAL_INTERSECT:
+	case LogicalOperatorType::LOGICAL_RECURSIVE_CTE:
+	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
+	case LogicalOperatorType::LOGICAL_PIVOT:
+	case LogicalOperatorType::LOGICAL_INSERT:
+	case LogicalOperatorType::LOGICAL_CREATE_TABLE:
+	case LogicalOperatorType::LOGICAL_COPY_TO_FILE:
+		return true;
+	case LogicalOperatorType::LOGICAL_DISTINCT:
+		// without targets, DISTINCT is over every column of the child
+		return op.Cast<LogicalDistinct>().distinct_targets.empty();
+	default:
+		return false;
+	}
 }
 
 unique_ptr<LogicalOperator> *CteConsumerSlot(LogicalOperator &op) {
