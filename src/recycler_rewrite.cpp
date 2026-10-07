@@ -39,6 +39,39 @@ bool SubstituteScan(unique_ptr<LogicalOperator> &slot, shared_ptr<CachedEntry> e
 	return true;
 }
 
+bool SubstituteReorderedScan(unique_ptr<LogicalOperator> &slot, shared_ptr<CachedEntry> entry, bool ordered,
+                             const vector<idx_t> &stored, const vector<reference<const TableCatalogEntry>> &tables,
+                             Binder &binder, ColumnBindingReplacer &replacer) {
+	auto &old_op = *slot;
+	auto old_bindings = old_op.GetColumnBindings();
+	if (old_bindings.size() != stored.size() || old_op.types.size() != stored.size()) {
+		return false;
+	}
+	for (idx_t j = 0; j < stored.size(); j++) {
+		if (stored[j] >= entry->types.size() || old_op.types[j] != entry->types[stored[j]]) {
+			return false;
+		}
+	}
+	auto scan_types = entry->types;
+	auto scan = make_uniq<LogicalRecyclerScan>(binder.GenerateTableIndex(), scan_types, entry, ordered, tables);
+	scan->ResolveOperatorTypes();
+	auto scan_bindings = scan->GetColumnBindings();
+	vector<unique_ptr<Expression>> expressions;
+	for (auto index : stored) {
+		expressions.push_back(make_uniq<BoundColumnRefExpression>(scan_types[index], scan_bindings[index]));
+	}
+	auto projection = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(expressions));
+	projection->SetEstimatedCardinality(entry->rows);
+	projection->children.push_back(std::move(scan));
+	projection->ResolveOperatorTypes();
+	auto new_bindings = projection->GetColumnBindings();
+	for (idx_t j = 0; j < old_bindings.size(); j++) {
+		replacer.replacement_bindings.emplace_back(old_bindings[j], new_bindings[j]);
+	}
+	slot = std::move(projection);
+	return true;
+}
+
 void WrapMaterialize(unique_ptr<LogicalOperator> &slot, RecyclerWriteSpec spec, shared_ptr<RecyclerCache> cache,
                      vector<unique_ptr<Expression>> keep_alive) {
 	auto child = std::move(slot);

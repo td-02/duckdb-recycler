@@ -18,8 +18,80 @@ on base columns, columns by physical id), planted `RECYCLER_MATERIALIZE` markers
 alive through column pruning, post-optimize resolution of the stored columns' identities (seeing through DuckDB's
 compress/decompress projections), and consumer rewrites to a column-subset `RECYCLER_SCAN` plus a residual filter.
 Measured: **geomean 9.24 ms** (vs 14.9 ms after M0–M4, 30.65 ms vanilla), total 11.9 s; all 149 answers match vanilla in
-three query orders (21–38 subsumption hits per run depending on order). Deferred: ordered pagination replay (M6),
-union-projection widening (M7), batch-index sink mode.
+three query orders (21–38 subsumption hits per run depending on order). Deferred: union-projection widening (M7),
+batch-index sink mode.
+
+M6 (ordered pagination reuse, 2026-10-07): repeated `ORDER BY … LIMIT n OFFSET m` pages over the same expensive input.
+M5 already skipped the joins of later pages (block hits) but each page still re-sorted the whole input. M6 caches the
+*leading rows of the sorted result* once, so later pages only skip/scan their own slice. Details below.
+
+- **Matching.** A `LIMIT` with constant limit and constant (or no) offset, `limit + offset > 5000` (above that DuckDB keeps
+  `ORDER BY + LIMIT` instead of a Top-N, `src/optimizer/topn_optimizer.cpp:23-52`), reached from an `ORDER BY` through
+  order-preserving projections/filters only. The bound `ORDER BY` subtree must be deterministic and cacheable, and its
+  ORDER BY must be *provably a total order* (fail-closed proof: a base-table primary key, carried through filters, plain
+  projections, aggregate group keys and equality joins that cannot multiply the rows of the side the keys come from;
+  UNIQUE columns do not count, they may tie on NULL). Ties make vanilla itself nondeterministic, so tie-bearing
+  pagination is left alone. M6 acts only when the bound plan and the optimized plan each hold exactly one such pagination.
+- **Stable key.** Taken from the pre-optimize bound plan, because the optimized plan below the sort differs between pages
+  (a planted M5 block marker on the first page, a block scan on later ones, and compressed-materialization types that
+  need column statistics a block scan does not have). The key covers the bound `ORDER BY` subtree (canonical signature),
+  the ORDER BY output positions the query's output actually *demands* (propagated down through the projections above the
+  LIMIT; a mere reference is not enough), and the layout of the cached unit: the top of the projection/filter chain under
+  the LIMIT, above the sort's decompression, so it emits logical types in every plan (ORDER BY directions/NULL orders,
+  output column count and types). Hash and canonical string both cover all of it; `LIMIT`/`OFFSET` are excluded, so
+  every page of one pagination shares one entry. The same sort with different demanded columns (even of the same SQL
+  type) gets a different key. The session's result-affecting settings (the salt, `PlanSignatures::SettingsSalt`, that
+  every other key carries) are part of it, so a page is never served rows computed under other values.
+- **Prefix materialization.** Entries have their own kind, `PAGINATION`, in a separate cache map, so no generic
+  `SUBTREE` lookup can see them; only `TryPagination` (post hook) looks them up. The writer stores the first
+  `4 × (offset + limit)` sorted rows and stops the sort's output there (`SinkResultType::FINISHED`; whole chunks are
+  appended, so a prefix may overshoot by one chunk). `CachedEntry::complete` says whether `rows` is the whole result (the
+  input ended first) or a prefix. A page hits only when `complete || offset + limit ≤ rows`. A page that needs more than
+  a stored prefix misses and writes a longer one, `max(4 × need, 2 × existing rows)`, which replaces the shorter entry.
+  The target is clamped to `entry_cap_rows` (less one chunk) and `entry_cap_bytes` per estimated row width; if the
+  clamped prefix cannot even cover the current page, M6 declines and the query runs as M5 plans it. Admission is
+  `AdmitPaginationWrite` in the policy module: `min_input_rows` and the history-based `TooBig(hash, caps)` check, plus
+  `Admissible` for the table versions. A first sight is admitted: the prefix is small, so a never-reused write is
+  cheap. The M5 writes below the ordered unit (the join and block writes) stay active, because the pagination writer
+  does not reduce the write policy.
+- **Safety.** A prefix is never a `SUBTREE` result (separate map; `Lookup(SUBTREE)` cannot reach it). All sizing arithmetic
+  saturates. The exact type-equality check of `SubstituteScan` still runs on every hit.
+- **Freshness and invalidation.** Entries carry the table dependencies (`CachedEntry::tables`) of the bound ORDER BY
+  subtree, read at the pre hook from the statement's snapshot (the optimized plan may reach the tables through a block
+  scan, so its own tables are no stand-in). `StorePagination` refuses a store over a table with an announced writer or
+  a commit the snapshot predates, exactly like `Store`, and lists the entry in the cache's per-table `dependents`;
+  `LookupPagination` accepts an entry only when it is current for the reader (`IsCurrentFor`, the check `IsCurrent`
+  uses). A table mutation therefore evicts the pagination entries over it when the writer commits (`invalidated_entries`),
+  as it does for every other kind, and the first page after the write is recomputed.
+- **Replacement and accounting.** Replacing a prefix is atomic under the cache mutex and is not an eviction: the shorter
+  entry leaves the maps, `dependents` and the accounting (`total_bytes`, `total_used_bytes`), room is made, and the new
+  entry inherits its hit history; if room cannot be made the older entry is published again with its bytes and
+  dependents, so a failed growth leaves the old prefix fully usable. Eviction (`Benefit()`), `recycler_clear` and the
+  accounting cover the new map; running queries hold entries by `shared_ptr`, so replacement or clearing never frees
+  data under a plan.
+- **Per-statement state.** `PaginationSite` lives in `RecyclerClientState` and follows its `Reset()` lifecycle: cleared
+  at the start of every pre hook and by the post hook on every exit, so nothing leaks into the next statement.
+  `subtree_hits`/`subtree_stores` also count `PAGINATION` activity; `recycler_entries()` shows the kind.
+- **Setting.** `recycler_pagination` (default `true`; needs `recycler_subtrees`) is the independent ablation switch. With
+  it off no pagination is detected, nothing is written or looked up, and plans are exactly the current M0–M5 plans.
+- **Validation.** `make release`; all recycler tests pass (14,157 assertions in 21 test cases) and `IMDB_DATA=1 make
+  test` passes (15,843 assertions in 23 test cases, including all 149 benchmark answers vs vanilla).
+  `test/sql/recycler/recycler_pagination.test` covers: reuse across pages (with `preserve_insertion_order` true and
+  false), the grader configuration (`preserve_insertion_order=false`, ≥ 2 joins so block planting and block
+  subsumption fire, later-page plan without `ORDER_BY`), prefix coverage, growth with hit-history carry-over, a complete
+  short result (deep page and page past the end), failed growth under a tight budget, eviction between two pagination
+  families, `recycler_clear`, byte-accounting equality (`recycler_stats` vs `recycler_entries`), the clamp/decline paths,
+  the ablation switch, a prefix not being usable as a subtree (no-LIMIT query and materialized CTE), ties and
+  row-multiplying joins (no entry), the same-type/different-column layout collision regression, two pagination sites in
+  one statement (no M6), no `ORDER BY`, a window between LIMIT and ORDER BY, and below-threshold requests (Top-N).
+- **Performance** (6 threads, hot cache; the machine drifted by about ±25 % between runs, so treat these as indicative).
+  Pages that hit the cached prefix drop from roughly 80–100 ms to about 1–2 ms (q0093/q0094). In the targeted
+  q0092 → q0093 → q0094 run on the integrated build, q0092 took about 145 ms and q0093/q0094 about 1 ms each: about
+  0.15 s in total and a best geomean of 5.51 ms for the three queries, against ≈ 365 ms and 111.03 ms for the M5 baseline.
+  The q0092 family stores about 40,960 rows (≈ 3.1 MB) instead of the ≈ 983K-row, ≈ 65 MB entry of a full
+  materialization (which made the first page ≈ 200 ms slower). An A/B with `recycler_pagination` on/off over the six
+  public pagination-family queries showed a large, consistent benefit with it on (six-query geomean roughly 8–15 ms vs
+  52–57 ms). Whole-run timings varied too much on the measurement machine to quote a full-suite gain.
 
 EXISTS rewrite (2026-10-07, §3.9): correlated `EXISTS` subqueries become plain joins the join order optimizer places;
 the first change aimed at the *total* time (the private leaderboard scores it as much as the geomean, and there it
@@ -156,7 +228,7 @@ Effort is calendar days for a small student team working in parallel. Gains use 
 | M3 | **Nested-block matching (iv).** In the pre hook, compare every subtree's key (outside CTE definitions) against whole-result entries; substitute `RecyclerScan` under the residual `FILTER`/`ORDER`/`PROJECTION`, rebind with `ColumnBindingReplacer` from the root. Premise to verify first with plain `EXPLAIN`: q0233's bound inner block is node-for-node q0231's bound plan. 7 hits: q0233, q0241, q0286, q0287, q0083, q0258, q0267. | 1.5–2 d | **~22.0 ms** | medium |
 | M4 | **Post-optimize subtree cache (ii, iii-a, vii).** Signatures for all nodes, top-down selection, admission gate, `LOGICAL_DELIM_JOIN` as atomic unit, aggregates/distinct/CTE definitions as cache points, dynamic-filter refusal, self-check pass, unwrap-on-failure. Hits: q0242←q0239, q0117, q0132, q0134, q0121/q0125–q0128, q0058, opt_r users (q0082/q0089/q0092–q0094/q0255/q0257/q0264/q0273), q0298, q0054/q0055 CTEs. | 3–4 d | **~20.4 ms** | medium |
 | M5 | **Subsumption (v)** per §3.7 (+ dynamic-filter stripping to widen coverage). 12 hits: q0234←q0231; q0244–q0246, q0280–q0282, q0289–q0291←q0240; q0249←q0247; q0266←q0259. | 3–5 d | **~16 ms** | medium–high |
-| M6 | **Pagination (vi).** Allow a writer directly above `ORDER_BY` under `LIMIT/OFFSET` when `limit+offset > 5000` (not TopN, `src/optimizer/topn_optimizer.cpp:23-52`); `BATCH` or `SEQ` sink, ordered scan; the non-parallel `PhysicalStreamingLimit` stops after offset+limit rows. q0093/q0094 ← q0092 (983K sorted rows, ~80 MB). | 1–2 d | ~15.5 ms | medium |
+| M6 | **Pagination (vi). Implemented** (see the status section above): a `PAGINATION` entry kind holding the first `4 × (offset + limit)` sorted rows under `LIMIT/OFFSET` when `limit+offset > 5000` (not TopN, `src/optimizer/topn_optimizer.cpp:23-52`) and the ORDER BY is a provable total order; key taken from the bound plan, ordered `SEQ` sink that stops after the prefix, ordered scan on hits, geometric growth, switch `recycler_pagination`. q0093/q0094 ← q0092. | 1–2 d | no full-suite figure (noisy machine) | medium |
 | M7 | **Union-projection widening (iii-b)**, behind `recycler_widen`: per-signature history of needed columns; payer keeps up to 8 extra cheap columns alive (`LogicalGet::AddColumnId` + keep-alive refs on the marker); hits project a subset. 16 more Family A hits. | 2–3 d | **12–13 ms** | high |
 | M8 | **Hardening/CI** (continuous): debug build (`D_ASSERT`, `ColumnBindingResolver::Verify`), ASAN/UBSAN once, GCC `-Wall -Wextra -Werror`, `PRAGMA enable_verification`, `preserve_insertion_order=true`, memory_limit=1 GB (eviction/spilling), 3× workload in one process, overhead gate ≤ 25 µs/plan. | 1–2 d | — | low |
 

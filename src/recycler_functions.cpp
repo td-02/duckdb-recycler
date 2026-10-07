@@ -656,6 +656,10 @@ void LoadRecycler(ExtensionLoader &loader) {
 	    "recycler_subsumption",
 	    "Reuse cached SPJ blocks for narrower predicates and column subsets (predicate subsumption)",
 	    LogicalType::BOOLEAN, Value::BOOLEAN(defaults.subsumption));
+	config.AddExtensionOption("recycler_pagination",
+	                          "Cache the sorted rows below LIMIT/OFFSET so that later pages skip the sort (needs "
+	                          "recycler_subtrees)",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(defaults.pagination));
 	config.AddExtensionOption("recycler_exists_rewrite",
 	                          "Plan correlated EXISTS subqueries as plain semi joins the join order optimizer places",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(defaults.exists_rewrite));

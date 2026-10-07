@@ -24,6 +24,12 @@ bool AdmitSubtreeWrite(ClientContext &context, const RecyclerCache &cache, const
 //! Whether an SPJ block of this shape is worth materializing for later subsumption
 bool AdmitBlockWrite(const RecyclerCache &cache, const RecyclerSettings &settings, const BlockShape &shape);
 
+//! Whether the leading rows of the sorted result below a LIMIT (`info` is the analysis of the cached unit, `hash` the
+//! pagination's key) are worth materializing on this sight: later pages save the sort, not a reduction of the input,
+//! and what is stored is bounded by the prefix, so a first sight is admitted
+bool AdmitPaginationWrite(const RecyclerCache &cache, const RecyclerSettings &settings, const NodeInfo &info,
+                          const SigHash &hash);
+
 //! Whether the whole result of the optimized plan rooted at `root` (keyed by `hash`) may be written
 bool AdmitWholeWrite(ClientContext &context, const RecyclerCache &cache, const RecyclerSettings &settings,
                      LogicalOperator &root, const NodeInfo &root_info, const SigHash &hash);

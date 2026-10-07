@@ -1,0 +1,965 @@
+# name: test/sql/recycler/recycler_pagination.test
+# description: a sorted result below LIMIT/OFFSET is reused for later pages when the ORDER BY is a total order (M6)
+# group: [recycler]
+
+require waddle
+
+statement ok
+SET threads = 4;
+
+statement ok
+SET recycler_min_input_rows = 1000;
+
+statement ok
+CREATE TABLE k(id INTEGER PRIMARY KEY, label VARCHAR);
+
+statement ok
+INSERT INTO k SELECT range, 'k' || range FROM range(7);
+
+statement ok
+CREATE TABLE t(id INTEGER PRIMARY KEY, g INTEGER, h INTEGER, hn INTEGER, name VARCHAR);
+
+statement ok
+INSERT INTO t SELECT range, range % 7, range % 13, CASE WHEN range % 10 = 0 THEN NULL ELSE range % 13 END, 'n' || range FROM range(300000);
+
+# rows of t duplicated by the join: t.id is no longer unique in the join's output
+statement ok
+CREATE TABLE d(g INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO d SELECT range % 7, range FROM range(14);
+
+# Notes on the shapes (all checked with EXPLAIN): these queries plan as LIMIT + ORDER_BY (not TOP_N) because
+# limit + offset > 5000 and > 0.7% of the estimated input. The join keeps DuckDB's row group pruner (which rewrites
+# a LIMIT sitting on a plain scan, and which the signature refuses) out of the picture. Each page is compared with
+# a LIMIT-free oracle (row_number() over the same order) through a shared result label.
+
+# ---------------------------------------------------------------------------
+# 1. same total ORDER BY, three pages: one ordered entry written on the first page, hit by the next two
+# ---------------------------------------------------------------------------
+statement ok
+PRAGMA recycler_clear;
+
+query I nosort p1
+SELECT id FROM (SELECT t.id, row_number() OVER (ORDER BY t.h DESC, t.id) rn FROM t JOIN k ON k.id = t.g WHERE t.g < 5) WHERE rn > 0 AND rn <= 6000 ORDER BY rn
+----
+
+query I nosort p2
+SELECT id FROM (SELECT t.id, row_number() OVER (ORDER BY t.h DESC, t.id) rn FROM t JOIN k ON k.id = t.g WHERE t.g < 5) WHERE rn > 6000 AND rn <= 12000 ORDER BY rn
+----
+
+query I nosort p3
+SELECT id FROM (SELECT t.id, row_number() OVER (ORDER BY t.h DESC, t.id) rn FROM t JOIN k ON k.id = t.g WHERE t.g < 5) WHERE rn > 12000 AND rn <= 18000 ORDER BY rn
+----
+
+query I
+SELECT count(*) FROM recycler_entries() WHERE kind = 'pagination'
+----
+0
+
+query I nosort p1
+SELECT t.id FROM t JOIN k ON k.id = t.g WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 6000 OFFSET 0
+----
+
+query I
+SELECT count(*) FROM recycler_entries() WHERE kind = 'pagination'
+----
+1
+
+query I nosort p2
+SELECT t.id FROM t JOIN k ON k.id = t.g WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 6000 OFFSET 6000
+----
+
+query I nosort p3
+SELECT t.id FROM t JOIN k ON k.id = t.g WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 6000 OFFSET 12000
+----
+
+# the whole sorted input (g < 5: 214286 rows) is the cached unit and both later pages were served from it
+query II
+SELECT rows, hits FROM recycler_entries() WHERE kind = 'pagination'
+----
+24576	2
+
+# a page past the end of the sorted result is empty, not an error
+query I
+SELECT count(*) FROM (SELECT t.id FROM t JOIN k ON k.id = t.g WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 6000 OFFSET 300000)
+----
+0
+
+# ---------------------------------------------------------------------------
+# 1b. same with preserve_insertion_order = false
+# ---------------------------------------------------------------------------
+statement ok
+SET preserve_insertion_order = false;
+
+statement ok
+PRAGMA recycler_clear;
+
+query I nosort p1
+SELECT t.id FROM t JOIN k ON k.id = t.g WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 6000 OFFSET 0
+----
+
+query I nosort p2
+SELECT t.id FROM t JOIN k ON k.id = t.g WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 6000 OFFSET 6000
+----
+
+query I nosort p3
+SELECT t.id FROM t JOIN k ON k.id = t.g WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 6000 OFFSET 12000
+----
+
+query II
+SELECT rows, hits FROM recycler_entries() WHERE kind = 'pagination'
+----
+24576	2
+
+statement ok
+SET preserve_insertion_order = true;
+
+# ---------------------------------------------------------------------------
+# 2. an aggregate below the ORDER BY does not prevent reuse (the group key is the tie breaker)
+# ---------------------------------------------------------------------------
+statement ok
+PRAGMA recycler_clear;
+
+query II nosort a1
+SELECT grp, s FROM (SELECT grp, s, row_number() OVER (ORDER BY s DESC, grp) rn FROM (SELECT id // 3 AS grp, sum(h) AS s FROM t GROUP BY 1)) WHERE rn > 6000 AND rn <= 12000 ORDER BY rn
+----
+
+query II nosort a2
+SELECT grp, s FROM (SELECT grp, s, row_number() OVER (ORDER BY s DESC, grp) rn FROM (SELECT id // 3 AS grp, sum(h) AS s FROM t GROUP BY 1)) WHERE rn > 12000 AND rn <= 18000 ORDER BY rn
+----
+
+query II nosort a1
+SELECT id // 3 AS grp, sum(h) AS s FROM t GROUP BY 1 ORDER BY s DESC, grp LIMIT 6000 OFFSET 6000
+----
+
+query II nosort a2
+SELECT id // 3 AS grp, sum(h) AS s FROM t GROUP BY 1 ORDER BY s DESC, grp LIMIT 6000 OFFSET 12000
+----
+
+query II
+SELECT rows, hits FROM recycler_entries() WHERE kind = 'pagination'
+----
+49152	1
+
+# ---------------------------------------------------------------------------
+# 3. LIMIT/OFFSET without ORDER BY is never pagination reuse
+# ---------------------------------------------------------------------------
+statement ok
+PRAGMA recycler_clear;
+
+query I
+SELECT count(*) FROM (SELECT t.id FROM t JOIN k ON k.id = t.g WHERE t.g < 5 LIMIT 6000 OFFSET 6000)
+----
+6000
+
+query I
+SELECT count(*) FROM (SELECT t.id FROM t JOIN k ON k.id = t.g WHERE t.g < 5 LIMIT 6000 OFFSET 12000)
+----
+6000
+
+query I
+SELECT count(*) FROM recycler_entries() WHERE kind = 'pagination'
+----
+0
+
+# a window between the LIMIT and the ORDER BY breaks the pattern: nothing is cached below the window
+query I nosort w1
+SELECT id FROM (SELECT t.id, row_number() OVER (ORDER BY t.h DESC, t.id) rn FROM t JOIN k ON k.id = t.g WHERE t.g < 5) WHERE rn > 6000 AND rn <= 12000 ORDER BY rn
+----
+
+query I nosort w1
+SELECT id FROM (SELECT t.id, row_number() OVER () AS rn FROM (SELECT t.id FROM t JOIN k ON k.id = t.g WHERE t.g < 5 ORDER BY t.h DESC, t.id) t) LIMIT 6000 OFFSET 6000
+----
+
+query I
+SELECT count(*) FROM recycler_entries() WHERE kind = 'pagination'
+----
+0
+
+# a window below the ORDER BY: the signature does not support windows, so the sort is not cacheable (correct miss)
+query I nosort r1
+SELECT id FROM (SELECT t.id, row_number() OVER (ORDER BY t.id DESC) rn FROM t JOIN k ON k.id = t.g WHERE t.g < 5) WHERE rn > 6000 AND rn <= 12000 ORDER BY rn
+----
+
+query I nosort r1
+SELECT id FROM (SELECT t.id, row_number() OVER (ORDER BY t.id) rk FROM t JOIN k ON k.id = t.g WHERE t.g < 5) ORDER BY rk DESC, id LIMIT 6000 OFFSET 6000
+----
+
+query I
+SELECT count(*) FROM recycler_entries() WHERE kind = 'pagination'
+----
+0
+
+# ---------------------------------------------------------------------------
+# 4. below the threshold DuckDB plans a Top-N: nothing to reuse, answers unchanged
+# ---------------------------------------------------------------------------
+query II
+SELECT count(*), sum(id) FROM (SELECT t.id FROM t JOIN k ON k.id = t.g WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 3000 OFFSET 1000)
+----
+3000	136516500
+
+query II
+SELECT count(*), sum(id) FROM (SELECT t.id FROM t JOIN k ON k.id = t.g WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 3000 OFFSET 2000)
+----
+3000	191116500
+
+query I
+SELECT count(*) FROM recycler_entries() WHERE kind = 'pagination'
+----
+0
+
+# ---------------------------------------------------------------------------
+# 5. different ORDER BY definitions never share an entry
+# ---------------------------------------------------------------------------
+statement ok
+PRAGMA recycler_clear;
+
+query I nosort o1
+SELECT id FROM (SELECT t.id, row_number() OVER (ORDER BY t.h DESC, t.id) rn FROM t JOIN k ON k.id = t.g WHERE t.g < 5) WHERE rn > 6000 AND rn <= 12000 ORDER BY rn
+----
+
+query I nosort o2
+SELECT id FROM (SELECT t.id, row_number() OVER (ORDER BY t.h ASC, t.id) rn FROM t JOIN k ON k.id = t.g WHERE t.g < 5) WHERE rn > 6000 AND rn <= 12000 ORDER BY rn
+----
+
+query I nosort o3
+SELECT id FROM (SELECT t.id, row_number() OVER (ORDER BY t.hn NULLS FIRST, t.id) rn FROM t JOIN k ON k.id = t.g WHERE t.g < 5) WHERE rn > 6000 AND rn <= 12000 ORDER BY rn
+----
+
+query I nosort o4
+SELECT id FROM (SELECT t.id, row_number() OVER (ORDER BY t.hn NULLS LAST, t.id) rn FROM t JOIN k ON k.id = t.g WHERE t.g < 5) WHERE rn > 6000 AND rn <= 12000 ORDER BY rn
+----
+
+query I nosort o5
+SELECT id FROM (SELECT t.id, row_number() OVER (ORDER BY t.h DESC, t.id DESC) rn FROM t JOIN k ON k.id = t.g WHERE t.g < 5) WHERE rn > 6000 AND rn <= 12000 ORDER BY rn
+----
+
+# every ORDER BY is first seen at OFFSET 6000, then asked again at OFFSET 12000 (hit) and again for page 1 with the
+# other direction/null order (must not hit another definition's entry)
+query I nosort o1
+SELECT t.id FROM t JOIN k ON k.id = t.g WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 6000 OFFSET 6000
+----
+
+query I nosort o2
+SELECT t.id FROM t JOIN k ON k.id = t.g WHERE t.g < 5 ORDER BY t.h ASC, t.id LIMIT 6000 OFFSET 6000
+----
+
+query I nosort o3
+SELECT t.id FROM t JOIN k ON k.id = t.g WHERE t.g < 5 ORDER BY t.hn NULLS FIRST, t.id LIMIT 6000 OFFSET 6000
+----
+
+query I nosort o4
+SELECT t.id FROM t JOIN k ON k.id = t.g WHERE t.g < 5 ORDER BY t.hn NULLS LAST, t.id LIMIT 6000 OFFSET 6000
+----
+
+query I nosort o5
+SELECT t.id FROM t JOIN k ON k.id = t.g WHERE t.g < 5 ORDER BY t.h DESC, t.id DESC LIMIT 6000 OFFSET 6000
+----
+
+query II
+SELECT count(*), sum(hits) FROM recycler_entries() WHERE kind = 'pagination'
+----
+5	0
+
+# a further page of the first definition is served from its own entry and still gives its own rows
+query I nosort o1b
+SELECT id FROM (SELECT t.id, row_number() OVER (ORDER BY t.h DESC, t.id) rn FROM t JOIN k ON k.id = t.g WHERE t.g < 5) WHERE rn > 12000 AND rn <= 18000 ORDER BY rn
+----
+
+query I nosort o1b
+SELECT t.id FROM t JOIN k ON k.id = t.g WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 6000 OFFSET 12000
+----
+
+query II
+SELECT count(*), sum(hits) FROM recycler_entries() WHERE kind = 'pagination'
+----
+5	1
+
+# ---------------------------------------------------------------------------
+# 6. ORDER BY with possible ties is not deterministic: never cached as ordered pagination
+# ---------------------------------------------------------------------------
+statement ok
+PRAGMA recycler_clear;
+
+# only tie-independent facts are checked: the count and which h values the pages contain
+query I
+SELECT count(*) FROM (SELECT t.id FROM t JOIN k ON k.id = t.g WHERE t.g < 5 ORDER BY t.h LIMIT 6000 OFFSET 0)
+----
+6000
+
+query I
+SELECT count(*) FROM (SELECT t.id FROM t JOIN k ON k.id = t.g WHERE t.g < 5 ORDER BY t.h LIMIT 6000 OFFSET 6000)
+----
+6000
+
+query I
+SELECT count(*) FROM recycler_entries() WHERE kind = 'pagination'
+----
+0
+
+# the join multiplies the rows of t (every t.g has two partners in d), so t.id alone is not a total order
+query I
+SELECT count(*) FROM (SELECT t.id FROM t JOIN d ON d.g = t.g ORDER BY t.id LIMIT 6000 OFFSET 0)
+----
+6000
+
+query I
+SELECT count(*) FROM (SELECT t.id FROM t JOIN d ON d.g = t.g ORDER BY t.id LIMIT 6000 OFFSET 6000)
+----
+6000
+
+query I
+SELECT count(*) FROM recycler_entries() WHERE kind = 'pagination'
+----
+0
+
+# a single-table scan under ORDER BY ... LIMIT gets DuckDB's row group pruning, which changes what the sort sees:
+# the scan is refused by the signature and the query simply runs as in M5
+query I nosort s1
+SELECT id FROM (SELECT id, row_number() OVER (ORDER BY h DESC, id) rn FROM t WHERE g < 5) WHERE rn > 6000 AND rn <= 12000 ORDER BY rn
+----
+
+query I nosort s1
+SELECT id FROM t WHERE g < 5 ORDER BY h DESC, id LIMIT 6000 OFFSET 6000
+----
+
+query I
+SELECT count(*) FROM recycler_entries() WHERE kind = 'pagination'
+----
+0
+
+# ---------------------------------------------------------------------------
+# 7. the grader configuration: preserve_insertion_order = false and two joins, so the M5 block planter and block
+#    subsumption rewrite the plan below the ORDER BY. The bound plan (not the rewritten one) gives the key, so the
+#    first page's ordered entry is hit by the later pages, which no longer sort or join at all.
+# ---------------------------------------------------------------------------
+statement ok
+SET preserve_insertion_order = false;
+
+statement ok
+CREATE TABLE w(id INTEGER PRIMARY KEY, pad VARCHAR);
+
+statement ok
+INSERT INTO w SELECT range, 'w' || range FROM range(600000);
+
+statement ok
+PRAGMA recycler_clear;
+
+query III nosort g1
+SELECT t.name, k.label, w.pad FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 6000 OFFSET 0
+----
+
+# page 1 wrote one ordered entry and planted/stored the M5 block
+query II
+SELECT rows, hits FROM recycler_entries() WHERE kind = 'pagination'
+----
+24576	0
+
+query I
+SELECT count(*) FROM recycler_entries() WHERE kind = 'block'
+----
+1
+
+query III nosort g2
+SELECT t.name, k.label, w.pad FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 6000 OFFSET 6000
+----
+
+query III nosort g3
+SELECT t.name, k.label, w.pad FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 6000 OFFSET 12000
+----
+
+query II
+SELECT rows, hits FROM recycler_entries() WHERE kind = 'pagination'
+----
+24576	2
+
+# the M5 block path still fires for the later pages (its rewrite happens before the pagination hit replaces the sort)
+query I
+SELECT value >= 2 FROM recycler_stats() WHERE name = 'subsumption_hits'
+----
+true
+
+query III nosort g1
+SELECT name, label, pad FROM (SELECT t.name, k.label, w.pad, row_number() OVER (ORDER BY t.h DESC, t.id) rn FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5) WHERE rn > 0 AND rn <= 6000 ORDER BY rn
+----
+
+query III nosort g2
+SELECT name, label, pad FROM (SELECT t.name, k.label, w.pad, row_number() OVER (ORDER BY t.h DESC, t.id) rn FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5) WHERE rn > 6000 AND rn <= 12000 ORDER BY rn
+----
+
+query III nosort g3
+SELECT name, label, pad FROM (SELECT t.name, k.label, w.pad, row_number() OVER (ORDER BY t.h DESC, t.id) rn FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5) WHERE rn > 12000 AND rn <= 18000 ORDER BY rn
+----
+
+# plan of a later page: no sort and no join left; a page of another ORDER BY (a miss for M6, a block hit for M5) still sorts
+statement ok
+PRAGMA enable_profiling = 'json';
+
+statement ok
+PRAGMA profiling_output = '__TEST_DIR__/recycler_pagination_hit.json';
+
+query III nosort g4
+SELECT t.name, k.label, w.pad FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 6000 OFFSET 18000
+----
+
+statement ok
+PRAGMA profiling_output = '__TEST_DIR__/recycler_pagination_miss.json';
+
+statement ok
+SELECT t.name, k.label, w.pad FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5 ORDER BY t.h ASC, t.id LIMIT 6000 OFFSET 0
+
+statement ok
+PRAGMA disable_profiling;
+
+query III nosort g4
+SELECT name, label, pad FROM (SELECT t.name, k.label, w.pad, row_number() OVER (ORDER BY t.h DESC, t.id) rn FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5) WHERE rn > 18000 AND rn <= 24000 ORDER BY rn
+----
+
+query I
+SELECT contains(content, 'ORDER_BY') OR contains(content, 'HASH_JOIN') FROM read_text('__TEST_DIR__/recycler_pagination_hit.json')
+----
+false
+
+query I
+SELECT contains(content, 'ORDER_BY') FROM read_text('__TEST_DIR__/recycler_pagination_miss.json')
+----
+true
+
+# ---------------------------------------------------------------------------
+# 8. same bound ORDER BY, different outer columns of the SAME SQL type must not share an entry (the entry written for
+#    n1 would otherwise answer a request for n2 with n1's values)
+# ---------------------------------------------------------------------------
+statement ok
+PRAGMA recycler_clear;
+
+query I nosort c1
+SELECT s.n1 FROM (SELECT t.name AS n1, w.pad AS n2, t.id FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 6000 OFFSET 6000) s
+----
+
+query I nosort c2
+SELECT s.n2 FROM (SELECT t.name AS n1, w.pad AS n2, t.id FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 6000 OFFSET 12000) s
+----
+
+query II
+SELECT count(*), sum(hits) FROM recycler_entries() WHERE kind = 'pagination'
+----
+2	0
+
+query I nosort c1
+SELECT s.n1 FROM (SELECT t.name AS n1, w.pad AS n2, row_number() OVER (ORDER BY t.h DESC, t.id) rn FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5) s WHERE rn > 6000 AND rn <= 12000 ORDER BY rn
+----
+
+query I nosort c2
+SELECT s.n2 FROM (SELECT t.name AS n1, w.pad AS n2, row_number() OVER (ORDER BY t.h DESC, t.id) rn FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5) s WHERE rn > 12000 AND rn <= 18000 ORDER BY rn
+----
+
+# ---------------------------------------------------------------------------
+# 9. different outer expressions that need the same sorted columns share the entry
+# ---------------------------------------------------------------------------
+statement ok
+PRAGMA recycler_clear;
+
+query I nosort d1
+SELECT upper(s.n1) FROM (SELECT t.name AS n1, w.pad AS n2, t.id FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 6000 OFFSET 6000) s
+----
+
+query I nosort d2
+SELECT lower(s.n1) FROM (SELECT t.name AS n1, w.pad AS n2, t.id FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 6000 OFFSET 12000) s
+----
+
+query II
+SELECT count(*), sum(hits) FROM recycler_entries() WHERE kind = 'pagination'
+----
+1	1
+
+query I nosort d1
+SELECT upper(s.n1) FROM (SELECT t.name AS n1, w.pad AS n2, row_number() OVER (ORDER BY t.h DESC, t.id) rn FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5) s WHERE rn > 6000 AND rn <= 12000 ORDER BY rn
+----
+
+query I nosort d2
+SELECT lower(s.n1) FROM (SELECT t.name AS n1, w.pad AS n2, row_number() OVER (ORDER BY t.h DESC, t.id) rn FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5) s WHERE rn > 12000 AND rn <= 18000 ORDER BY rn
+----
+
+# ---------------------------------------------------------------------------
+# 10. two pagination sites in one statement: M6 does nothing, answers stay right
+# ---------------------------------------------------------------------------
+statement ok
+PRAGMA recycler_clear;
+
+query I rowsort e1
+SELECT s.n1 FROM (SELECT t.name AS n1, w.pad AS n2, t.id FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 6000 OFFSET 0) s UNION ALL SELECT s.n1 FROM (SELECT t.name AS n1, w.pad AS n2, t.id FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 6000 OFFSET 6000) s
+----
+
+query I
+SELECT count(*) FROM recycler_entries() WHERE kind = 'pagination'
+----
+0
+
+query I rowsort e1
+SELECT s.n1 FROM (SELECT t.name AS n1, w.pad AS n2, row_number() OVER (ORDER BY t.h DESC, t.id) rn FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5) s WHERE rn > 0 AND rn <= 6000 UNION ALL SELECT s.n1 FROM (SELECT t.name AS n1, w.pad AS n2, row_number() OVER (ORDER BY t.h DESC, t.id) rn FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5) s WHERE rn > 6000 AND rn <= 12000
+----
+
+# ---------------------------------------------------------------------------
+# 11. prefix coverage, growth and accounting. A page stores 4x the rows it needs (rounded up to whole chunks), later
+#     pages inside that coverage hit, a page beyond it grows the prefix geometrically and replaces the old entry
+#     (keeping its hit history), and the byte accounting stays exact.
+# ---------------------------------------------------------------------------
+statement ok
+SET preserve_insertion_order = false;
+
+statement ok
+PRAGMA recycler_clear;
+
+query I nosort x1
+SELECT t.id FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 6000 OFFSET 0
+----
+
+# 4 * 6000 = 24000 rows, a whole number of 2048-row chunks: 24576
+query II
+SELECT rows, hits FROM recycler_entries() WHERE kind = 'pagination'
+----
+24576	0
+
+query I nosort x2
+SELECT t.id FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 6000 OFFSET 6000
+----
+
+query I nosort x3
+SELECT t.id FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 6000 OFFSET 12000
+----
+
+query II
+SELECT rows, hits FROM recycler_entries() WHERE kind = 'pagination'
+----
+24576	2
+
+# 36000 rows are needed but only 24576 are cached: miss, the prefix grows to max(4 * 36000, 2 * 24576) rows and
+# replaces the old entry, which hands over its 2 hits
+query I nosort x4
+SELECT t.id FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 6000 OFFSET 30000
+----
+
+query III
+SELECT count(*), bool_and(rows >= 144000 AND rows < 150000), max(hits) FROM recycler_entries() WHERE kind = 'pagination'
+----
+1	true	2
+
+# a page inside the grown coverage hits
+query I nosort x5
+SELECT t.id FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 6000 OFFSET 100000
+----
+
+query II
+SELECT count(*), max(hits) FROM recycler_entries() WHERE kind = 'pagination'
+----
+1	3
+
+query I
+SELECT (SELECT value FROM recycler_stats() WHERE name = 'bytes') = (SELECT sum(bytes) FROM recycler_entries())
+----
+true
+
+query I nosort x1
+SELECT id FROM (SELECT t.id, row_number() OVER (ORDER BY t.h DESC, t.id) rn FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5) WHERE rn > 0 AND rn <= 6000 ORDER BY rn
+----
+
+query I nosort x2
+SELECT id FROM (SELECT t.id, row_number() OVER (ORDER BY t.h DESC, t.id) rn FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5) WHERE rn > 6000 AND rn <= 12000 ORDER BY rn
+----
+
+query I nosort x3
+SELECT id FROM (SELECT t.id, row_number() OVER (ORDER BY t.h DESC, t.id) rn FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5) WHERE rn > 12000 AND rn <= 18000 ORDER BY rn
+----
+
+query I nosort x4
+SELECT id FROM (SELECT t.id, row_number() OVER (ORDER BY t.h DESC, t.id) rn FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5) WHERE rn > 30000 AND rn <= 36000 ORDER BY rn
+----
+
+query I nosort x5
+SELECT id FROM (SELECT t.id, row_number() OVER (ORDER BY t.h DESC, t.id) rn FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5) WHERE rn > 100000 AND rn <= 106000 ORDER BY rn
+----
+
+# ---------------------------------------------------------------------------
+# 12. a result shorter than the prefix target is stored complete: any later page hits, even beyond the end
+# ---------------------------------------------------------------------------
+statement ok
+PRAGMA recycler_clear;
+
+query I nosort y1
+SELECT t.id FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 100000 OFFSET 0
+----
+
+# 214286 rows in total, fewer than the 400000 rows targeted: the whole result
+query II
+SELECT rows, hits FROM recycler_entries() WHERE kind = 'pagination'
+----
+214286	0
+
+query I nosort y2
+SELECT t.id FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 60000 OFFSET 200000
+----
+
+query I nosort y3
+SELECT t.id FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 6000 OFFSET 300000
+----
+
+query II
+SELECT rows, hits FROM recycler_entries() WHERE kind = 'pagination'
+----
+214286	2
+
+query I nosort y1
+SELECT id FROM (SELECT t.id, row_number() OVER (ORDER BY t.h DESC, t.id) rn FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5) WHERE rn > 0 AND rn <= 100000 ORDER BY rn
+----
+
+query I nosort y2
+SELECT id FROM (SELECT t.id, row_number() OVER (ORDER BY t.h DESC, t.id) rn FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5) WHERE rn > 200000 AND rn <= 260000 ORDER BY rn
+----
+
+query I nosort y3
+SELECT id FROM (SELECT t.id, row_number() OVER (ORDER BY t.h DESC, t.id) rn FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5) WHERE rn > 300000 AND rn <= 306000 ORDER BY rn
+----
+
+# ---------------------------------------------------------------------------
+# 13. a prefix is not a subtree: the same sorted result asked for without LIMIT (and as a materialized CTE) is
+#     computed in full and never served from the prefix
+# ---------------------------------------------------------------------------
+statement ok
+PRAGMA recycler_clear;
+
+query I
+SELECT count(*) FROM (SELECT t.id FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 6000 OFFSET 0)
+----
+6000
+
+query I nosort z1
+SELECT t.id FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 6000 OFFSET 0
+----
+
+query II
+SELECT rows, hits FROM recycler_entries() WHERE kind = 'pagination'
+----
+24576	0
+
+query I
+SELECT count(*) FROM (SELECT t.id FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5 ORDER BY t.h DESC, t.id)
+----
+214286
+
+query I
+WITH c AS MATERIALIZED (SELECT t.id FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5 ORDER BY t.h DESC, t.id) SELECT count(*) FROM c
+----
+214286
+
+query II
+SELECT rows, hits FROM recycler_entries() WHERE kind = 'pagination'
+----
+24576	0
+
+# ---------------------------------------------------------------------------
+# 14. budget: a prefix too big for the budget is refused and the older, shorter prefix stays fully usable
+# ---------------------------------------------------------------------------
+statement ok
+SET recycler_subsumption = false;
+
+statement ok
+SET recycler_budget_mb = 4;
+
+statement ok
+PRAGMA recycler_clear;
+
+query III nosort b1
+SELECT t.name, k.label, w.pad FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 6000 OFFSET 0
+----
+
+query II
+SELECT rows, hits FROM recycler_entries() WHERE kind = 'pagination'
+----
+24576	0
+
+# the grown prefix (about 8 MB) cannot be stored in 4 MB: the answer is still right, the old prefix is still there
+query III nosort b2
+SELECT t.name, k.label, w.pad FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 6000 OFFSET 30000
+----
+
+query II
+SELECT rows, hits FROM recycler_entries() WHERE kind = 'pagination'
+----
+24576	0
+
+query I
+SELECT (SELECT value FROM recycler_stats() WHERE name = 'bytes') = (SELECT sum(bytes) FROM recycler_entries())
+----
+true
+
+query III nosort b3
+SELECT t.name, k.label, w.pad FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 6000 OFFSET 6000
+----
+
+query II
+SELECT rows, hits FROM recycler_entries() WHERE kind = 'pagination'
+----
+24576	1
+
+query III nosort b1
+SELECT name, label, pad FROM (SELECT t.name, k.label, w.pad, row_number() OVER (ORDER BY t.h DESC, t.id) rn FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5) WHERE rn > 0 AND rn <= 6000 ORDER BY rn
+----
+
+query III nosort b2
+SELECT name, label, pad FROM (SELECT t.name, k.label, w.pad, row_number() OVER (ORDER BY t.h DESC, t.id) rn FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5) WHERE rn > 30000 AND rn <= 36000 ORDER BY rn
+----
+
+query III nosort b3
+SELECT name, label, pad FROM (SELECT t.name, k.label, w.pad, row_number() OVER (ORDER BY t.h DESC, t.id) rn FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5) WHERE rn > 6000 AND rn <= 12000 ORDER BY rn
+----
+
+statement ok
+SET recycler_budget_mb = 2000;
+
+statement ok
+SET recycler_subsumption = true;
+
+# clear leaves nothing behind, and the next page starts over correctly (it needs 18000 rows: a 72000-row target)
+statement ok
+PRAGMA recycler_clear;
+
+query II
+SELECT count(*), coalesce(sum(bytes), 0) FROM recycler_entries()
+----
+0	0
+
+query I
+SELECT value FROM recycler_stats() WHERE name = 'bytes'
+----
+0
+
+query III nosort b4
+SELECT t.name, k.label, w.pad FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 6000 OFFSET 12000
+----
+
+query II
+SELECT rows, hits FROM recycler_entries() WHERE kind = 'pagination'
+----
+73728	0
+
+query III nosort b4
+SELECT name, label, pad FROM (SELECT t.name, k.label, w.pad, row_number() OVER (ORDER BY t.h DESC, t.id) rn FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5) WHERE rn > 12000 AND rn <= 18000 ORDER BY rn
+----
+
+# ---------------------------------------------------------------------------
+# 15. the ablation switch: recycler_pagination = false leaves M6 out and everything else as it was
+# ---------------------------------------------------------------------------
+statement ok
+SET recycler_pagination = false;
+
+statement ok
+PRAGMA recycler_clear;
+
+query I nosort ab1
+SELECT t.id FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 6000 OFFSET 0
+----
+
+query I nosort ab2
+SELECT t.id FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 6000 OFFSET 6000
+----
+
+query I
+SELECT count(*) FROM recycler_entries() WHERE kind = 'pagination'
+----
+0
+
+query I nosort ab1
+SELECT id FROM (SELECT t.id, row_number() OVER (ORDER BY t.h DESC, t.id) rn FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5) WHERE rn > 0 AND rn <= 6000 ORDER BY rn
+----
+
+query I nosort ab2
+SELECT id FROM (SELECT t.id, row_number() OVER (ORDER BY t.h DESC, t.id) rn FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5) WHERE rn > 6000 AND rn <= 12000 ORDER BY rn
+----
+
+statement ok
+SET recycler_pagination = true;
+
+statement ok
+PRAGMA recycler_clear;
+
+query I nosort ab3
+SELECT t.id FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 6000 OFFSET 12000
+----
+
+query I
+SELECT count(*) FROM recycler_entries() WHERE kind = 'pagination'
+----
+1
+
+query I nosort ab3
+SELECT id FROM (SELECT t.id, row_number() OVER (ORDER BY t.h DESC, t.id) rn FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5) WHERE rn > 12000 AND rn <= 18000 ORDER BY rn
+----
+
+# ---------------------------------------------------------------------------
+# 16. the entry caps clamp the prefix: when the clamped prefix cannot even cover the page M6 declines, writes no
+#     PAGINATION entry, and the query runs (correctly) as it would without M6
+# ---------------------------------------------------------------------------
+# rows: a cap of 10000 rows leaves 10000 - 2048 (one chunk of slack) = 7952 rows, less than the 12000 this page needs
+statement ok
+SET recycler_entry_cap_rows = 10000;
+
+statement ok
+PRAGMA recycler_clear;
+
+query I nosort cl1
+SELECT t.id FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 6000 OFFSET 6000
+----
+
+query I
+SELECT count(*) FROM recycler_entries() WHERE kind = 'pagination'
+----
+0
+
+query I nosort cl1
+SELECT id FROM (SELECT t.id, row_number() OVER (ORDER BY t.h DESC, t.id) rn FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5) WHERE rn > 6000 AND rn <= 12000 ORDER BY rn
+----
+
+statement ok
+SET recycler_entry_cap_rows = 4000000;
+
+# bytes: 1 MB holds fewer three-string rows than the 18000 this page needs
+statement ok
+SET recycler_entry_cap_mb = 1;
+
+statement ok
+PRAGMA recycler_clear;
+
+query III nosort cl2
+SELECT t.name, k.label, w.pad FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 6000 OFFSET 12000
+----
+
+query I
+SELECT count(*) FROM recycler_entries() WHERE kind = 'pagination'
+----
+0
+
+query III nosort cl2
+SELECT name, label, pad FROM (SELECT t.name, k.label, w.pad, row_number() OVER (ORDER BY t.h DESC, t.id) rn FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5) WHERE rn > 12000 AND rn <= 18000 ORDER BY rn
+----
+
+statement ok
+SET recycler_entry_cap_mb = 256;
+
+# with the caps back the same page is cached
+statement ok
+PRAGMA recycler_clear;
+
+query III nosort cl3
+SELECT t.name, k.label, w.pad FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 6000 OFFSET 12000
+----
+
+query I
+SELECT count(*) FROM recycler_entries() WHERE kind = 'pagination'
+----
+1
+
+query III nosort cl3
+SELECT name, label, pad FROM (SELECT t.name, k.label, w.pad, row_number() OVER (ORDER BY t.h DESC, t.id) rn FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5) WHERE rn > 12000 AND rn <= 18000 ORDER BY rn
+----
+
+# ---------------------------------------------------------------------------
+# 17. eviction between two pagination families under a tight budget (2 MB holds one prefix, not two). The family
+#     with the better benefit per byte (same saving, fewer bytes) displaces the other; the displaced one recomputes
+#     correctly and, being worth less, does not displace the survivor back.
+# ---------------------------------------------------------------------------
+statement ok
+SET recycler_whole_result = false;
+
+statement ok
+SET recycler_subsumption = false;
+
+statement ok
+SET recycler_budget_mb = 2;
+
+statement ok
+PRAGMA recycler_clear;
+
+# family 1: four columns (the larger prefix)
+query IIII nosort ev1
+SELECT t.name, k.label, w.pad, t.hn FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 6000 OFFSET 0
+----
+
+query I
+SELECT count(*) FROM recycler_entries() WHERE kind = 'pagination'
+----
+1
+
+# family 2: three columns (a smaller prefix of the same rows): stored, family 1 is evicted to make room
+query III nosort ev2
+SELECT t.name, k.label, w.pad FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 6000 OFFSET 0
+----
+
+query II
+SELECT count(*), max(hits) FROM recycler_entries() WHERE kind = 'pagination'
+----
+1	0
+
+query I
+SELECT (SELECT value FROM recycler_stats() WHERE name = 'bytes') = (SELECT sum(bytes) FROM recycler_entries())
+----
+true
+
+# family 1 again, another page: its entry is gone, so it recomputes; as the less valuable family it is not stored
+# over the survivor
+query IIII nosort ev3
+SELECT t.name, k.label, w.pad, t.hn FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 6000 OFFSET 6000
+----
+
+query II
+SELECT count(*), max(hits) FROM recycler_entries() WHERE kind = 'pagination'
+----
+1	0
+
+query I
+SELECT (SELECT value FROM recycler_stats() WHERE name = 'bytes') = (SELECT sum(bytes) FROM recycler_entries())
+----
+true
+
+# family 2 still has its entry and serves its next page
+query III nosort ev4
+SELECT t.name, k.label, w.pad FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5 ORDER BY t.h DESC, t.id LIMIT 6000 OFFSET 6000
+----
+
+query II
+SELECT count(*), max(hits) FROM recycler_entries() WHERE kind = 'pagination'
+----
+1	1
+
+query I
+SELECT (SELECT value FROM recycler_stats() WHERE name = 'bytes') = (SELECT sum(bytes) FROM recycler_entries())
+----
+true
+
+query IIII nosort ev1
+SELECT name, label, pad, hn FROM (SELECT t.name, k.label, w.pad, t.hn, row_number() OVER (ORDER BY t.h DESC, t.id) rn FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5) WHERE rn > 0 AND rn <= 6000 ORDER BY rn
+----
+
+query III nosort ev2
+SELECT name, label, pad FROM (SELECT t.name, k.label, w.pad, row_number() OVER (ORDER BY t.h DESC, t.id) rn FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5) WHERE rn > 0 AND rn <= 6000 ORDER BY rn
+----
+
+query IIII nosort ev3
+SELECT name, label, pad, hn FROM (SELECT t.name, k.label, w.pad, t.hn, row_number() OVER (ORDER BY t.h DESC, t.id) rn FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5) WHERE rn > 6000 AND rn <= 12000 ORDER BY rn
+----
+
+query III nosort ev4
+SELECT name, label, pad FROM (SELECT t.name, k.label, w.pad, row_number() OVER (ORDER BY t.h DESC, t.id) rn FROM t JOIN k ON k.id = t.g JOIN w ON w.id = t.id WHERE t.g < 5) WHERE rn > 6000 AND rn <= 12000 ORDER BY rn
+----
+
+statement ok
+SET recycler_budget_mb = 2000;
+
+statement ok
+SET recycler_subsumption = true;
+
+statement ok
+SET recycler_whole_result = true;
+
+statement ok
+PRAGMA recycler_clear;
