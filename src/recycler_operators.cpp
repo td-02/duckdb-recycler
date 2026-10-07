@@ -233,6 +233,8 @@ public:
 	shared_ptr<ColumnDataCollection> collection;
 	idx_t rows = 0;
 	bool too_big = false;
+	//! A prefix write stopped its input early: the stored rows are not the whole result
+	bool truncated = false;
 };
 
 class RecyclerMaterializeLocalSinkState : public LocalSinkState {
@@ -244,6 +246,7 @@ public:
 
 	unique_ptr<ColumnDataCollection> collection;
 	ColumnDataAppendState append_state;
+	bool truncated = false;
 };
 
 PhysicalRecyclerMaterialize::PhysicalRecyclerMaterialize(PhysicalPlan &physical_plan, vector<LogicalType> types_p,
@@ -280,6 +283,11 @@ SinkResultType PhysicalRecyclerMaterialize::Sink(ExecutionContext &context, Data
                                                  OperatorSinkInput &input) const {
 	auto &lstate = input.local_state.Cast<RecyclerMaterializeLocalSinkState>();
 	lstate.collection->Append(lstate.append_state, chunk);
+	if (spec.prefix_rows > 0 && lstate.collection->Count() >= spec.prefix_rows) {
+		// the leading rows are all that is kept (and all this query's LIMIT needs): stop the sort's output here
+		lstate.truncated = true;
+		return SinkResultType::FINISHED;
+	}
 	return SinkResultType::NEED_MORE_INPUT;
 }
 
@@ -291,6 +299,7 @@ SinkCombineResultType PhysicalRecyclerMaterialize::Combine(ExecutionContext &con
 		return SinkCombineResultType::FINISHED;
 	}
 	lock_guard<mutex> guard(gstate.glock);
+	gstate.truncated = gstate.truncated || lstate.truncated;
 	gstate.rows += lstate.collection->Count();
 	gstate.collection->Combine(*lstate.collection);
 	if (gstate.rows > spec.cap_rows) {
@@ -317,8 +326,11 @@ SinkFinalizeType PhysicalRecyclerMaterialize::Finalize(Pipeline &pipeline, Event
 	entry->rows = rows;
 	entry->bytes = bytes;
 	entry->ordered = spec.ordered;
+	entry->complete = !gstate.truncated;
 	entry->est_input_rows = spec.est_input_rows;
-	if (spec.kind == RecyclerEntryKind::BLOCK) {
+	if (spec.kind == RecyclerEntryKind::PAGINATION) {
+		cache->StorePagination(std::move(entry), spec.budget_bytes);
+	} else if (spec.kind == RecyclerEntryKind::BLOCK) {
 		entry->columns = spec.columns;
 		entry->constraints = spec.constraints;
 		entry->conjuncts = spec.conjuncts;

@@ -22,7 +22,10 @@ enum class RecyclerEntryKind : uint8_t {
 	//! The output of a subtree of an optimized plan
 	SUBTREE = 1,
 	//! The output of an SPJ block keyed on its shape; reusable by narrower blocks (predicate/column subsumption)
-	BLOCK = 2
+	BLOCK = 2,
+	//! The leading rows of a sorted pagination result (possibly all of them, see CachedEntry::complete). Kept apart
+	//! from SUBTREE so that no generic lookup can mistake a prefix for a complete result
+	PAGINATION = 3
 };
 
 const char *RecyclerEntryKindName(RecyclerEntryKind kind);
@@ -39,6 +42,8 @@ struct CachedEntry {
 	idx_t bytes = 0;
 	//! Rows were written in a defined order and must be replayed in that order
 	bool ordered = false;
+	//! PAGINATION entries only: `rows` is the whole sorted result (true) or only its first `rows` rows (false)
+	bool complete = true;
 	//! Estimated rows scanned to produce the result (benefit proxy)
 	idx_t est_input_rows = 0;
 	std::atomic<idx_t> last_used {0};
@@ -60,6 +65,7 @@ struct RecyclerSettings {
 	bool blocks = true;
 	bool subtrees = true;
 	bool subsumption = true;
+	bool pagination = true;
 	idx_t budget_bytes = 2000ULL * 1024 * 1024;
 	idx_t entry_cap_bytes = 256ULL * 1024 * 1024;
 	idx_t entry_cap_rows = 4000000;
@@ -68,6 +74,8 @@ struct RecyclerSettings {
 	idx_t speculate_bytes = 64ULL * 1024 * 1024;
 };
 
+//! `subtree_hits` and `subtree_stores` also count PAGINATION entries (hits on, and publication or growth of, a sorted
+//! prefix); `recycler_entries()` tells the kinds apart.
 struct RecyclerStats {
 	std::atomic<uint64_t> pre_calls {0};
 	std::atomic<uint64_t> post_calls {0};
@@ -106,6 +114,13 @@ public:
 	                               const std::function<string()> &render_canonical);
 	//! Insert an entry (never overwrites); evicts lower-benefit entries to respect the budget. Returns success.
 	bool Store(shared_ptr<CachedEntry> entry, idx_t budget_bytes);
+	//! Look up a PAGINATION entry covering `needed_rows` leading rows (or the complete result). The hit is only counted
+	//! when it covers; an entry that exists but is too short reports its row count in `existing_rows`.
+	shared_ptr<CachedEntry> LookupPagination(const SigHash &hash, const std::function<string()> &render_canonical,
+	                                         idx_t needed_rows, idx_t &existing_rows);
+	//! Publish a PAGINATION entry, replacing a shorter one for the same key (the replacement keeps the older entry's
+	//! hit history and is not an eviction). On failure the older entry stays in place, fully usable.
+	bool StorePagination(shared_ptr<CachedEntry> entry, idx_t budget_bytes);
 	//! Insert a BLOCK entry under its shape hash (several entries per shape may coexist)
 	bool StoreBlock(shared_ptr<CachedEntry> entry, idx_t budget_bytes);
 	//! All BLOCK entries with this shape hash
@@ -139,6 +154,7 @@ private:
 	mutable std::mutex lock;
 	EntryMap whole;
 	EntryMap subtrees;
+	EntryMap paginations;
 	BlockMap blocks;
 	std::unordered_map<SigHash, idx_t, SigHashHasher> seen;
 	std::unordered_set<SigHash, SigHashHasher> too_big;

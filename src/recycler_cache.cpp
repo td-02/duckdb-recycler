@@ -10,6 +10,8 @@ const char *RecyclerEntryKindName(RecyclerEntryKind kind) {
 		return "subtree";
 	case RecyclerEntryKind::BLOCK:
 		return "block";
+	case RecyclerEntryKind::PAGINATION:
+		return "pagination";
 	default:
 		return "unknown";
 	}
@@ -22,7 +24,14 @@ double CachedEntry::Benefit() const {
 }
 
 RecyclerCache::EntryMap &RecyclerCache::Map(RecyclerEntryKind kind) {
-	return kind == RecyclerEntryKind::WHOLE_RESULT ? whole : subtrees;
+	switch (kind) {
+	case RecyclerEntryKind::WHOLE_RESULT:
+		return whole;
+	case RecyclerEntryKind::PAGINATION:
+		return paginations;
+	default:
+		return subtrees;
+	}
 }
 
 idx_t RecyclerCache::NextSequence() {
@@ -66,7 +75,7 @@ shared_ptr<CachedEntry> RecyclerCache::PickVictim() const {
 			victim = candidate;
 		}
 	};
-	for (auto *map : {&whole, &subtrees}) {
+	for (auto *map : {&whole, &subtrees, &paginations}) {
 		for (auto &entry : *map) {
 			consider(entry.second);
 		}
@@ -142,6 +151,70 @@ bool RecyclerCache::Store(shared_ptr<CachedEntry> entry, idx_t budget_bytes) {
 	return true;
 }
 
+shared_ptr<CachedEntry> RecyclerCache::LookupPagination(const SigHash &hash,
+                                                        const std::function<string()> &render_canonical,
+                                                        idx_t needed_rows, idx_t &existing_rows) {
+	existing_rows = 0;
+	shared_ptr<CachedEntry> candidate;
+	{
+		std::lock_guard<std::mutex> guard(lock);
+		auto entry = paginations.find(hash);
+		if (entry == paginations.end()) {
+			stats.misses++;
+			return nullptr;
+		}
+		candidate = entry->second;
+	}
+	if (render_canonical() != candidate->canonical) {
+		stats.hash_collisions++;
+		stats.misses++;
+		return nullptr;
+	}
+	if (!candidate->complete && candidate->rows < needed_rows) {
+		existing_rows = candidate->rows;
+		stats.misses++;
+		return nullptr;
+	}
+	NoteHit(*candidate);
+	return candidate;
+}
+
+bool RecyclerCache::StorePagination(shared_ptr<CachedEntry> entry, idx_t budget_bytes) {
+	std::lock_guard<std::mutex> guard(lock);
+	auto &map = paginations;
+	auto existing = map.find(entry->hash);
+	shared_ptr<CachedEntry> older;
+	if (existing != map.end()) {
+		older = existing->second;
+		// only a longer prefix (or the completed result) replaces what is there; a concurrent writer may have won
+		bool grows = older->canonical == entry->canonical &&
+		             ((entry->complete && !older->complete) || entry->rows > older->rows);
+		if (!grows) {
+			stats.store_rejected++;
+			return false;
+		}
+		// the family keeps its reuse history, so that growing does not make it a cold eviction candidate
+		entry->hits = older->hits.load();
+		// take the older entry out of the accounting while room is made; it is not an eviction
+		total_bytes -= MinValue<idx_t>(total_bytes, older->bytes);
+		map.erase(existing);
+	}
+	if (!MakeRoom(*entry, budget_bytes)) {
+		if (older) {
+			// nothing changed for readers: the older prefix is back, and so are its bytes
+			total_bytes += older->bytes;
+			map[older->hash] = older;
+		}
+		stats.store_rejected++;
+		return false;
+	}
+	entry->last_used = NextSequence();
+	total_bytes += entry->bytes;
+	map[entry->hash] = entry;
+	stats.subtree_stores++;
+	return true;
+}
+
 bool RecyclerCache::StoreBlock(shared_ptr<CachedEntry> entry, idx_t budget_bytes) {
 	std::lock_guard<std::mutex> guard(lock);
 	auto &list = blocks[entry->hash];
@@ -179,6 +252,7 @@ void RecyclerCache::Clear() {
 	std::lock_guard<std::mutex> guard(lock);
 	whole.clear();
 	subtrees.clear();
+	paginations.clear();
 	blocks.clear();
 	seen.clear();
 	too_big.clear();
@@ -215,7 +289,7 @@ idx_t RecyclerCache::TotalBytes() const {
 
 idx_t RecyclerCache::EntryCount() const {
 	std::lock_guard<std::mutex> guard(lock);
-	idx_t count = whole.size() + subtrees.size();
+	idx_t count = whole.size() + subtrees.size() + paginations.size();
 	for (auto &shape : blocks) {
 		count += shape.second.size();
 	}
@@ -225,7 +299,7 @@ idx_t RecyclerCache::EntryCount() const {
 vector<shared_ptr<CachedEntry>> RecyclerCache::Entries() const {
 	std::lock_guard<std::mutex> guard(lock);
 	vector<shared_ptr<CachedEntry>> result;
-	for (auto *map : {&whole, &subtrees}) {
+	for (auto *map : {&whole, &subtrees, &paginations}) {
 		for (auto &entry : *map) {
 			result.push_back(entry.second);
 		}
