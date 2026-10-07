@@ -26,6 +26,11 @@ void WrapMaterialize(unique_ptr<LogicalOperator> &slot, RecyclerWriteSpec spec, 
 //! result changes. Returns the number of filters removed.
 idx_t StripRuntimeFilters(const LogicalOperator &subtree, const vector<LogicalOperator *> &owners);
 
+//! Operators that consume their child's output by position and rebind it: what they need from the child appears in
+//! no expression of theirs, so a reference collector never sees it, and a rewrite below them must keep the child's
+//! column order
+bool ConsumesChildrenPositionally(const LogicalOperator &op);
+
 //! The consumer side of a CTE, or nullptr when `op` is not a CTE. CTE inlining deep-copies a CTE's definition and
 //! cannot copy our operators, so the pre-optimize walkers rewrite the consumer side only.
 unique_ptr<LogicalOperator> *CteConsumerSlot(LogicalOperator &op);

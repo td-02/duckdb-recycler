@@ -418,6 +418,10 @@ static unique_ptr<GlobalTableFunctionState> RecyclerStatsInit(ClientContext &con
 		add("blocks_planted", s.blocks_planted);
 		add("block_stores", s.block_stores);
 		add("subsumption_hits", s.subsumption_hits);
+		add("exists_rewrites", s.exists_rewrites);
+		add("exists_pushdowns", s.exists_pushdowns);
+		add("exists_refused", s.exists_refused);
+		add("exists_ns", s.exists_ns);
 		add("store_rejected", s.store_rejected);
 		add("too_big", s.too_big);
 		add("evictions", s.evictions);
@@ -652,6 +656,9 @@ void LoadRecycler(ExtensionLoader &loader) {
 	    "recycler_subsumption",
 	    "Reuse cached SPJ blocks for narrower predicates and column subsets (predicate subsumption)",
 	    LogicalType::BOOLEAN, Value::BOOLEAN(defaults.subsumption));
+	config.AddExtensionOption("recycler_exists_rewrite",
+	                          "Plan correlated EXISTS subqueries as plain semi joins the join order optimizer places",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(defaults.exists_rewrite));
 	config.AddExtensionOption("recycler_budget_mb", "Memory budget of the recycler cache in MB", LogicalType::BIGINT,
 	                          Value::BIGINT(int64_t(defaults.budget_bytes / (1024 * 1024))));
 	config.AddExtensionOption("recycler_entry_cap_mb", "Largest cache entry in MB", LogicalType::BIGINT,

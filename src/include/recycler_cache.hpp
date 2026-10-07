@@ -135,6 +135,9 @@ struct RecyclerSettings {
 	bool blocks = true;
 	bool subtrees = true;
 	bool subsumption = true;
+	//! Correlated EXISTS subqueries become plain joins the join order optimizer places (recycler_exists.cpp); a pure
+	//! optimization that neither reads nor writes the cache
+	bool exists_rewrite = true;
 	idx_t budget_bytes = 2000ULL * 1024 * 1024;
 	idx_t entry_cap_bytes = 256ULL * 1024 * 1024;
 	idx_t entry_cap_rows = 4000000;
@@ -184,6 +187,12 @@ struct RecyclerStats {
 	std::atomic<uint64_t> blocks_planted {0};
 	std::atomic<uint64_t> block_stores {0};
 	std::atomic<uint64_t> subsumption_hits {0};
+	//! correlated EXISTS delim joins rewritten into plain joins, those also moved below operators the join order
+	//! optimizer cannot reorder, and the delim joins left alone (recycler_exists.cpp)
+	std::atomic<uint64_t> exists_rewrites {0};
+	std::atomic<uint64_t> exists_pushdowns {0};
+	std::atomic<uint64_t> exists_refused {0};
+	std::atomic<uint64_t> exists_ns {0};
 	std::atomic<uint64_t> clears {0};
 	//! entries evicted because a writer of one of their tables (or of the whole catalog) committed
 	std::atomic<uint64_t> invalidated_entries {0};

@@ -20,6 +20,7 @@
 // this file only orders the steps.
 //===----------------------------------------------------------------------===//
 #include "recycler_state.hpp"
+#include "recycler_exists.hpp"
 #include "recycler_operators.hpp"
 #include "recycler_policy.hpp"
 #include "recycler_rewrite.hpp"
@@ -92,6 +93,7 @@ RecyclerSettings LoadRecyclerSettings(ClientContext &context) {
 	s.blocks = GetBoolSetting(context, "recycler_blocks", s.blocks);
 	s.subtrees = GetBoolSetting(context, "recycler_subtrees", s.subtrees);
 	s.subsumption = GetBoolSetting(context, "recycler_subsumption", s.subsumption);
+	s.exists_rewrite = GetBoolSetting(context, "recycler_exists_rewrite", s.exists_rewrite);
 	// cached results compete with the queries for memory: whatever the setting says, at most a quarter of the limit
 	s.budget_bytes = MinValue<idx_t>(GetByteSetting(context, "recycler_budget_mb", s.budget_bytes),
 	                                 BufferManager::GetBufferManager(context).GetMaxMemory() / 4);
@@ -280,28 +282,6 @@ struct BlockMatcher {
 // Pre-optimize: predicate / column subsumption on SPJ blocks
 //===----------------------------------------------------------------------===//
 using binding_set_t = std::unordered_set<ColumnBinding, ColumnBindingHashFunction, ColumnBindingEquality>;
-
-//! Operators that consume their child's output by position and rebind it: what they need from the child appears in
-//! no expression of theirs, so a reference collector never sees it
-static bool ConsumesChildrenPositionally(const LogicalOperator &op) {
-	switch (op.type) {
-	case LogicalOperatorType::LOGICAL_UNION:
-	case LogicalOperatorType::LOGICAL_EXCEPT:
-	case LogicalOperatorType::LOGICAL_INTERSECT:
-	case LogicalOperatorType::LOGICAL_RECURSIVE_CTE:
-	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
-	case LogicalOperatorType::LOGICAL_PIVOT:
-	case LogicalOperatorType::LOGICAL_INSERT:
-	case LogicalOperatorType::LOGICAL_CREATE_TABLE:
-	case LogicalOperatorType::LOGICAL_COPY_TO_FILE:
-		return true;
-	case LogicalOperatorType::LOGICAL_DISTINCT:
-		// without targets, DISTINCT is over every column of the child
-		return op.Cast<LogicalDistinct>().distinct_targets.empty();
-	default:
-		return false;
-	}
-}
 
 //! Collects every column binding referenced by operators outside of `block`
 class ExternalReferenceCollector : public LogicalOperatorVisitor {
@@ -656,12 +636,10 @@ static void ServeSubsumedBlocks(OptimizerExtensionInput &input, unique_ptr<Logic
 	}
 }
 
-void RecyclerPreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
-	auto state = StateFromInput(input);
-	if (!state) {
-		return;
-	}
-	auto &cache = *state->cache;
+//! The cache's part of the pre hook: announcements, hits and the markers of admissible misses
+static void RecyclePreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan,
+                               RecyclerState &state) {
+	auto &cache = *state.cache;
 	auto &context = input.context;
 	ScopedTimer timer(cache.stats.pre_ns);
 
@@ -708,7 +686,31 @@ void RecyclerPreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOpera
 	if (settings.subsumption && !preserve_order) {
 		// block results are written by a parallel sink, so their row order is arbitrary: only usable when the
 		// session does not promise insertion order
-		ServeSubsumedBlocks(input, plan, *root_slot, *state, client, sig);
+		ServeSubsumedBlocks(input, plan, *root_slot, state, client, sig);
+	}
+}
+
+void RecyclerPreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
+	auto state = StateFromInput(input);
+	if (!state) {
+		return;
+	}
+	RecyclePreOptimize(input, plan, *state);
+	// a SET/RESET/PRAGMA root dropped this connection's cached settings in the gate; the next statement re-reads
+	// them, once this one has run. Reading them here would cache the values from before it
+	if (plan->type == LogicalOperatorType::LOGICAL_SET || plan->type == LogicalOperatorType::LOGICAL_RESET ||
+	    plan->type == LogicalOperatorType::LOGICAL_PRAGMA) {
+		return;
+	}
+	// after every key was taken and every marker planted: the keys of this statement and of the ones it may serve
+	// are those of the plan as bound, and the rewrite below is the same for every statement of a shape, so a payer
+	// and the queries it serves still render alike. Independent of the gate above: a statement the cache declines
+	// (a write, EXPLAIN, a transaction it does not track) still gets the better plan
+	auto &client = RecyclerClientState::Get(input.context);
+	if (client.GetSettings(input.context).exists_rewrite) {
+		auto &stats = state->cache->stats;
+		ScopedTimer timer(stats.exists_ns);
+		RewriteExistsJoins(plan, stats);
 	}
 }
 
