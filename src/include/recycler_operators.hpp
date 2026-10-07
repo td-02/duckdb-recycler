@@ -147,6 +147,7 @@ struct RecyclerWriteSpec {
 	vector<RangeConstraint> constraints;
 	vector<string> conjuncts;
 	std::unordered_map<idx_t, idx_t> table_ids;
+	//! BLOCK writes: see above. PAGINATION writes: the bound ORDER BY output position of every column written
 	vector<ColumnIdentity> columns;
 
 	//! The write of one entry under the session's caps (the kind decides the row cap); BLOCK writes add their shape

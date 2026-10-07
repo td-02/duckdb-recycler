@@ -58,6 +58,9 @@ struct PaginationSite {
 	string order_spec;
 	//! Positions of the bound ORDER BY's output columns that the query's output demands, ascending
 	vector<idx_t> demanded;
+	//! Table index of the bound ORDER BY's input projection, which optimization keeps: the optimized unit's columns are
+	//! followed back to it to learn which bound ORDER BY output each carries (their order in the unit is not fixed)
+	idx_t projection_index = DConstants::INVALID_INDEX;
 	//! The tables of the bound ORDER BY subtree with the state of their catalogs' transactions at the pre hook: the
 	//! entry written for this pagination depends on them, and an entry found for it must be current for them (the
 	//! optimized plan may read them through a block scan, so its own tables are no stand-in)

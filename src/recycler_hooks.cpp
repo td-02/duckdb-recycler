@@ -60,6 +60,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace duckdb {
@@ -642,6 +643,66 @@ static SigHash HashPaginationKey(const string &canonical) {
 	return result;
 }
 
+//! For every output column of the cached unit (the chain under the LIMIT), the position of the bound ORDER BY output it
+//! carries. The unit's own column order is not fixed (a debug build deliberately permutes the columns under a sort), so
+//! each column is followed down through the plan's projections (compress/decompress and whatever else an optimizer
+//! puts there) to the bound ORDER BY's input projection, which keeps its table index. False (fail closed) when a column
+//! cannot be followed there or two columns carry the same position.
+static bool UnitPositions(LogicalOperator &unit, idx_t projection_index, vector<idx_t> &positions) {
+	std::unordered_map<idx_t, LogicalProjection *> projections;
+	for (auto op = &unit;; op = op->children[0].get()) {
+		if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+			auto &projection = op->Cast<LogicalProjection>();
+			projections[projection.table_index] = &projection;
+			if (projection.table_index == projection_index) {
+				break;
+			}
+		} else if (op->type != LogicalOperatorType::LOGICAL_ORDER_BY &&
+		           op->type != LogicalOperatorType::LOGICAL_FILTER) {
+			return false;
+		}
+		if (op->children.size() != 1) {
+			return false;
+		}
+	}
+	positions.clear();
+	for (auto binding : unit.GetColumnBindings()) {
+		for (idx_t steps = 0; binding.table_index != projection_index; steps++) {
+			auto projection = projections.find(binding.table_index);
+			if (steps > 64 || projection == projections.end() ||
+			    binding.column_index >= projection->second->expressions.size() ||
+			    !ResolvePlainColumn(*projection->second->expressions[binding.column_index], binding)) {
+				return false;
+			}
+		}
+		if (std::find(positions.begin(), positions.end(), binding.column_index) != positions.end()) {
+			return false;
+		}
+		positions.push_back(binding.column_index);
+	}
+	return true;
+}
+
+//! For each of `positions` (a consumer's columns), the stored column of `entry` that carries it. False when the entry
+//! does not hold exactly these bound ORDER BY outputs.
+static bool StoredColumns(const CachedEntry &entry, const vector<idx_t> &positions, vector<idx_t> &stored) {
+	if (entry.columns.size() != positions.size()) {
+		return false;
+	}
+	stored.clear();
+	for (auto position : positions) {
+		idx_t index = 0;
+		while (index < entry.columns.size() && entry.columns[index].column != position) {
+			index++;
+		}
+		if (index == entry.columns.size()) {
+			return false;
+		}
+		stored.push_back(index);
+	}
+	return true;
+}
+
 //! Pre hook: find the pagination of the bound plan and take its key and total-order proof from the bound plan,
 //! before any M5 rewrite changes what lies below the ORDER BY. Only a plan with a single pagination is handled; the
 //! client state is only set once every eligibility check has passed.
@@ -654,9 +715,11 @@ static void DetectPagination(RecyclerClientState &client, PlanSignatures &sig, L
 	auto order_slot = MatchPagination(*limit_op, site.limit, site.offset);
 	auto &order = (*order_slot)->Cast<LogicalOrder>();
 	auto &info = sig.Get(order);
-	if (!info.Cacheable() || !info.ordered || !OrderKeysAreUnique(order)) {
+	if (!info.Cacheable() || !info.ordered || !OrderKeysAreUnique(order) ||
+	    order.children[0]->type != LogicalOperatorType::LOGICAL_PROJECTION) {
 		return;
 	}
+	site.projection_index = order.children[0]->Cast<LogicalProjection>().table_index;
 	// the session's result-affecting settings (SettingsSalt) are part of what the sorted rows are
 	site.canonical = sig.Render(order) +
 	                 "\x1f"
@@ -1108,6 +1171,11 @@ struct SubtreeWalker {
 		if (!info.Cacheable() || !info.ordered) {
 			return false;
 		}
+		// which bound ORDER BY output each column of this plan's unit carries; unprovable means no pagination
+		vector<idx_t> positions;
+		if (!UnitPositions(*unit_slot, pagination_site->projection_index, positions)) {
+			return false;
+		}
 		auto canonical = PaginationCanonical(*pagination_site, order, *unit_slot);
 		auto hash = HashPaginationKey(canonical);
 		// rows of the sorted result this page needs
@@ -1115,10 +1183,23 @@ struct SubtreeWalker {
 		                                                                       : limit_rows + offset_rows;
 		idx_t existing_rows = 0;
 		auto entry = cache->LookupPagination(hash, canonical, pagination_site->tables, need, existing_rows);
-		if (entry && SubstituteScan(unit_slot, entry, true, info.tables, binder, replacer)) {
-			cache->stats.subtree_hits++;
-			replaced = true;
-			return true;
+		if (entry) {
+			// the entry stores the columns in the order of the plan that wrote it, this plan's unit may order them
+			// differently
+			vector<idx_t> stored;
+			if (!StoredColumns(*entry, positions, stored)) {
+				return false;
+			}
+			bool in_order = true;
+			for (idx_t j = 0; j < stored.size(); j++) {
+				in_order = in_order && stored[j] == j;
+			}
+			if (in_order ? SubstituteScan(unit_slot, entry, true, info.tables, binder, replacer)
+			             : SubstituteReorderedScan(unit_slot, entry, true, stored, info.tables, binder, replacer)) {
+				cache->stats.subtree_hits++;
+				replaced = true;
+				return true;
+			}
 		}
 		if (policy != WritePolicy::ALL || !AdmitPaginationWrite(*cache, settings, info, hash) ||
 		    !cache->Admissible(info.tables, snapshot)) {
@@ -1135,6 +1216,12 @@ struct SubtreeWalker {
 		auto spec = RecyclerWriteSpec::Make(RecyclerEntryKind::PAGINATION, hash, std::move(canonical), true,
 		                                    info.est_leaf_rows, pagination_site->tables, settings);
 		spec.prefix_rows = prefix;
+		for (auto position : positions) {
+			ColumnIdentity column;
+			column.table = 0;
+			column.column = position;
+			spec.columns.push_back(column);
+		}
 		cache->stats.writes_planned++;
 		WrapMaterialize(unit_slot, std::move(spec), cache);
 		// the pagination writer is transparent to the write policy: the sort is a pipeline breaker between it and

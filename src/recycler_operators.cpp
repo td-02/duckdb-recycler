@@ -432,6 +432,7 @@ SinkFinalizeType PhysicalRecyclerMaterialize::Finalize(Pipeline &pipeline, Event
 	entry->tables = spec.tables;
 	bool stored;
 	if (spec.kind == RecyclerEntryKind::PAGINATION) {
+		entry->columns = spec.columns;
 		stored = cache->StorePagination(entry, spec.budget_bytes);
 	} else if (spec.kind == RecyclerEntryKind::BLOCK) {
 		entry->columns = spec.columns;

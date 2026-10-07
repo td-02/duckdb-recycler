@@ -106,9 +106,11 @@ struct CachedEntry {
 	std::atomic<uint64_t> materialize_ns {0};
 	std::atomic<uint64_t> hit_ns {0};
 
-	//! BLOCK entries only: identity of every stored column (invalid = not a plain base column), the range
-	//! constraints the rows satisfy, and the canonical rendering of every block-root conjunct
+	//! BLOCK entries: identity of every stored column (invalid = not a plain base column). PAGINATION entries: the
+	//! bound ORDER BY output position of every stored column, in `ColumnIdentity::column`
 	vector<ColumnIdentity> columns;
+	//! BLOCK entries only: the range constraints the rows satisfy, and the canonical rendering of every block-root
+	//! conjunct
 	vector<RangeConstraint> constraints;
 	vector<string> conjuncts;
 
