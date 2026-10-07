@@ -541,7 +541,7 @@ static unique_ptr<LogicalOperator> *MatchPagination(LogicalOperator &op, idx_t &
 	limit_rows = limit.limit_val.GetConstantValue();
 	offset_rows = limit.offset_val.Type() == LimitNodeType::CONSTANT_VALUE ? limit.offset_val.GetConstantValue() : 0;
 	auto total = offset_rows > NumericLimits<idx_t>::Maximum() - limit_rows ? NumericLimits<idx_t>::Maximum()
-	                                                                         : limit_rows + offset_rows;
+	                                                                        : limit_rows + offset_rows;
 	if (total <= PAGINATION_MIN_ROWS) {
 		return nullptr;
 	}
@@ -598,15 +598,18 @@ static string UnitLayout(const LogicalOrder &order, const LogicalOperator &unit)
 	return result;
 }
 
-//! The cache key of a pagination: the bound ORDER BY subtree, which of its output columns the query demands, and the layout
-//! the optimized unit actually materializes. Both the hash and the canonical string cover all of it.
+//! The cache key of a pagination: the bound ORDER BY subtree, which of its output columns the query demands, and the
+//! layout the optimized unit actually materializes. Both the hash and the canonical string cover all of it.
 static string PaginationCanonical(const PaginationSite &site, const LogicalOrder &order, const LogicalOperator &unit) {
 	string result = site.canonical;
-	result += "\x1f" "demanded";
+	result += "\x1f"
+	          "demanded";
 	for (auto idx : site.demanded) {
 		result += ":" + std::to_string(idx);
 	}
-	result += "\x1f" "layout" + UnitLayout(order, unit);
+	result += "\x1f"
+	          "layout" +
+	          UnitLayout(order, unit);
 	return result;
 }
 
@@ -655,7 +658,10 @@ static void DetectPagination(RecyclerClientState &client, PlanSignatures &sig, L
 		return;
 	}
 	// the session's result-affecting settings (SettingsSalt) are part of what the sorted rows are
-	site.canonical = sig.Render(order) + "\x1f" "salt" + client.settings_salt;
+	site.canonical = sig.Render(order) +
+	                 "\x1f"
+	                 "salt" +
+	                 client.settings_salt;
 	site.order_spec = OrderSpec(order);
 	site.tables = TableDependencies(info.tables, client.snapshot);
 	// the columns of the sorted result that the query's output actually demands decide what the optimizer keeps. A
