@@ -1779,9 +1779,9 @@ SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM f WHERE f.tid = t.id AND f.k 
 600
 
 query I
-SELECT count(*) FROM t WHERE t.g IN (SELECT f.k FROM f WHERE f.tid = t.id)
+SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM f WHERE f.tid > t.id + 2990 AND f.k = 0)
 ----
-430
+5
 
 query TI
 SELECT s.name, s.value - c.value FROM recycler_stats() s JOIN counters c USING (name) WHERE s.name IN ('exists_rewrites', 'exists_refused') ORDER BY s.name

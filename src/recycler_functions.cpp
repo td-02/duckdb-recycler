@@ -120,6 +120,11 @@ static double CollectProfiledOperators(const ProfilingNode &node, vector<Profile
 }
 
 void RecyclerClientState::QueryEnd(ClientContext &context, optional_ptr<ErrorData> error) {
+	// a SET/RESET/PRAGMA has run (or failed): the next statement reads the settings again
+	if (settings_change_pending) {
+		settings_change_pending = false;
+		settings_loaded = false;
+	}
 	// the post hook resets the state, but never runs when an optimizer between the hooks throws: the snapshot's
 	// catalog-entry references must not outlive the statement either way
 	Reset();
@@ -275,6 +280,11 @@ RebindQueryInfo RecyclerClientState::OnExecutePrepared(ClientContext &context, P
 	auto &root = prepared.physical_plan->Root();
 	AnnounceStatement(context, *GetRecyclerState(context)->cache, PhysicalWriteTarget(root),
 	                  prepared.properties.modified_databases);
+	// a prepared SET/RESET/PRAGMA changes the settings without the pre hook seeing it (RESET is a SET statement)
+	if (prepared.statement_type == StatementType::SET_STATEMENT ||
+	    prepared.statement_type == StatementType::PRAGMA_STATEMENT) {
+		settings_change_pending = true;
+	}
 	return current_rebind;
 }
 

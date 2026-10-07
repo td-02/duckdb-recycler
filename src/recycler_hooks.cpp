@@ -165,6 +165,12 @@ static optional_ptr<TableCatalogEntry> WriteTarget(LogicalOperator &root) {
 
 //! Statements that may change state the cache does not track and that modify no database the cache can stamp
 //! (ATTACH, DETACH, LOAD, ...): drop everything we cached
+//! Statements that change this connection's settings: the cached copy is dropped once they ran (QueryEnd)
+static bool IsSettingsRoot(LogicalOperatorType type) {
+	return type == LogicalOperatorType::LOGICAL_SET || type == LogicalOperatorType::LOGICAL_RESET ||
+	       type == LogicalOperatorType::LOGICAL_PRAGMA;
+}
+
 static bool IsModifyingRoot(LogicalOperatorType type) {
 	switch (type) {
 	case LogicalOperatorType::LOGICAL_ALTER:
@@ -940,9 +946,8 @@ struct SubsumptionPass {
 static unique_ptr<LogicalOperator> *GateStatement(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan,
                                                   RecyclerCache &cache, RecyclerClientState &client) {
 	auto &context = input.context;
-	if (plan->type == LogicalOperatorType::LOGICAL_SET || plan->type == LogicalOperatorType::LOGICAL_RESET ||
-	    plan->type == LogicalOperatorType::LOGICAL_PRAGMA) {
-		client.settings_loaded = false;
+	if (IsSettingsRoot(plan->type)) {
+		client.settings_change_pending = true;
 	}
 	// announced before the write runs, whatever this session's settings say: a reader that starts after the commit
 	// must never find an entry the cache has not yet heard about (the stamp follows at commit). A database the
@@ -1110,12 +1115,6 @@ void RecyclerPreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOpera
 		return;
 	}
 	RecyclePreOptimize(input, plan, *state);
-	// a SET/RESET/PRAGMA root dropped this connection's cached settings in the gate; the next statement re-reads
-	// them, once this one has run. Reading them here would cache the values from before it
-	if (plan->type == LogicalOperatorType::LOGICAL_SET || plan->type == LogicalOperatorType::LOGICAL_RESET ||
-	    plan->type == LogicalOperatorType::LOGICAL_PRAGMA) {
-		return;
-	}
 	// after every key was taken and every marker planted: the keys of this statement and of the ones it may serve
 	// are those of the plan as bound, and the rewrite below is the same for every statement of a shape, so a payer
 	// and the queries it serves still render alike. Independent of the gate above: a statement the cache declines

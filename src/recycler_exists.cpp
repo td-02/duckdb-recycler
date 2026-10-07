@@ -54,7 +54,6 @@
 #include "recycler_operators.hpp"
 #include "recycler_rewrite.hpp"
 
-#include "duckdb/common/optional_idx.hpp"
 #include "duckdb/common/unordered_set.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
@@ -300,75 +299,64 @@ unique_ptr<LogicalOperator> Decorrelate(ExistsShape &shape) {
 	return std::move(result);
 }
 
-//! The child of `op` that keeps every row of its input and produces every table in `needed`, if there is one
-optional_idx PreservedChild(LogicalOperator &op, const unordered_set<idx_t> &needed) {
-	if (AsRecyclerOperator(op) || op.children.empty()) {
-		return optional_idx();
+//! Whether every row of the input of `op` survives, with its columns, in `op`'s output when it comes from child `side`
+bool SidePreserved(LogicalOperator &op, idx_t side) {
+	if (AsRecyclerOperator(op) || side >= op.children.size()) {
+		return false;
 	}
-	// the children through which the rows of the input survive unchanged, in the order they are tried
-	idx_t sides[2];
-	idx_t side_count = 0;
 	switch (op.type) {
 	case LogicalOperatorType::LOGICAL_FILTER:
-		if (!op.Cast<LogicalFilter>().projection_map.empty()) {
-			return optional_idx();
-		}
-		return optional_idx(0);
+		return op.Cast<LogicalFilter>().projection_map.empty();
 	case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
-		sides[side_count++] = 0;
-		sides[side_count++] = 1;
-		break;
+		return op.children.size() == 2;
 	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
 	case LogicalOperatorType::LOGICAL_ANY_JOIN:
 	case LogicalOperatorType::LOGICAL_DELIM_JOIN: {
 		auto &join = op.Cast<LogicalJoin>();
 		bool delim = op.type == LogicalOperatorType::LOGICAL_DELIM_JOIN;
-		if (join.HasProjectionMap() || (delim && op.Cast<LogicalComparisonJoin>().delim_flipped)) {
-			return optional_idx();
+		if (op.children.size() != 2 || join.HasProjectionMap() ||
+		    (delim && op.Cast<LogicalComparisonJoin>().delim_flipped)) {
+			return false;
 		}
 		switch (join.join_type) {
 		case JoinType::INNER:
-			sides[side_count++] = 0;
-			if (!delim) {
-				// the delim side of a delim join depends on the other side's rows
-				sides[side_count++] = 1;
-			}
-			break;
+			// the delim side of a delim join depends on the other side's rows
+			return side == 0 || !delim;
 		case JoinType::LEFT:
 		case JoinType::SEMI:
 		case JoinType::ANTI:
 		case JoinType::MARK:
 		case JoinType::SINGLE:
-			sides[side_count++] = 0;
-			break;
+			return side == 0;
 		case JoinType::RIGHT:
 		case JoinType::RIGHT_SEMI:
 		case JoinType::RIGHT_ANTI:
-			sides[side_count++] = 1;
-			break;
+			return side == 1;
 		default:
-			return optional_idx();
+			return false;
 		}
-		break;
 	}
 	default:
-		return optional_idx();
+		return false;
 	}
-	if (op.children.size() != 2) {
-		return optional_idx();
-	}
-	for (idx_t s = 0; s < side_count; s++) {
-		unordered_set<idx_t> tables;
-		LogicalJoin::GetTableReferences(*op.children[sides[s]], tables);
-		bool all = true;
-		for (auto table : needed) {
-			all &= tables.count(table) > 0;
-		}
-		if (all) {
-			return optional_idx(sides[s]);
+}
+
+//! Appends to `path` the child indexes from `op` down to the operator whose table index is `table_index`; false when
+//! no operator below produces it (one walk of the subtree)
+bool PathToProducer(LogicalOperator &op, idx_t table_index, vector<idx_t> &path) {
+	for (auto idx : op.GetTableIndex()) {
+		if (idx == table_index) {
+			return true;
 		}
 	}
-	return optional_idx();
+	for (idx_t i = 0; i < op.children.size(); i++) {
+		path.push_back(i);
+		if (PathToProducer(*op.children[i], table_index, path)) {
+			return true;
+		}
+		path.pop_back();
+	}
+	return false;
 }
 
 //! Moves the join in `slot` below every operator of its left input that preserves its rows and produces the columns
@@ -382,14 +370,27 @@ idx_t PushDown(unique_ptr<LogicalOperator> &slot) {
 	if (needed.empty()) {
 		return 0;
 	}
+	// the columns the join reads flow up from their producers, so the join may follow the path shared by every
+	// producer as long as each operator on it passes the rows of that child through
+	vector<vector<idx_t>> paths;
+	for (auto table : needed) {
+		vector<idx_t> path;
+		if (!PathToProducer(*join.children[0], table, path)) {
+			return 0;
+		}
+		paths.push_back(std::move(path));
+	}
 	auto target = &join.children[0];
 	idx_t crossed = 0;
 	while (true) {
-		auto side = PreservedChild(**target, needed);
-		if (!side.IsValid()) {
+		bool agree = true;
+		for (auto &path : paths) {
+			agree &= crossed < path.size() && path[crossed] == paths[0][crossed];
+		}
+		if (!agree || !SidePreserved(**target, paths[0][crossed])) {
 			break;
 		}
-		target = &(*target)->children[side.GetIndex()];
+		target = &(*target)->children[paths[0][crossed]];
 		crossed++;
 	}
 	if (crossed == 0) {
@@ -419,8 +420,9 @@ struct ExistsRewriter {
 			return;
 		}
 		auto &join = slot->Cast<LogicalComparisonJoin>();
-		if (join.join_type != JoinType::MARK) {
-			// scalar and lateral subqueries are not candidates
+		if (join.join_type != JoinType::MARK || join.conditions.size() != join.duplicate_eliminated_columns.size()) {
+			// scalar and lateral subqueries, and IN / ANY (which carry the compared expression as one more
+			// condition), are not candidates
 			return;
 		}
 		auto shape = MatchShape(join);

@@ -160,7 +160,14 @@ def types_of(sql, statements_before=(), statements_after=()):
     letters = []
     for line in out.strip().splitlines():
         cols = line.split("\t")
-        letters.append("R" if cols[1].startswith("DECIMAL") else TYPE_LETTER[cols[1]])
+        if cols[1].startswith("DECIMAL"):
+            letters.append("R")
+        elif cols[1] in TYPE_LETTER:
+            letters.append(TYPE_LETTER[cols[1]])
+        else:
+            # the runner compares any other type as text
+            print(f"warning: column {cols[0]} of type {cols[1]} compared as text: {sql}", file=sys.stderr)
+            letters.append("T")
     return "".join(letters)
 
 
@@ -220,7 +227,8 @@ SET recycler_enabled = false;
             out.append(block(label, before, sql, after, types, result))
     # the tail's own values, from the baseline as well
     count_exists = "SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM f WHERE f.tid = t.id AND f.k = 1)"
-    count_in = "SELECT count(*) FROM t WHERE t.g IN (SELECT f.k FROM f WHERE f.tid = t.id)"
+    # an EXISTS the rule declines (inequality correlation); correlated IN / ANY are never candidates and not counted
+    count_in = "SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM f WHERE f.tid > t.id + 2990 AND f.k = 0)"
     wide = ("SELECT g, count(*) AS c FROM t JOIN d ON t.g % 5 = d.id JOIN s ON s.id = t.g WHERE y IS NOT NULL AND "
             "EXISTS (SELECT 1 FROM f WHERE f.tid = t.id AND f.k = 1) GROUP BY g ORDER BY g")
     narrow = ("SELECT g, count(*) AS c FROM t JOIN d ON t.g % 5 = d.id JOIN s ON s.id = t.g WHERE y BETWEEN 2000 AND "

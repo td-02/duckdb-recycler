@@ -75,11 +75,14 @@ struct RecyclerClientState : public ClientContextState {
 
 	//! The pre hook decided this statement takes part in recycling
 	bool active = false;
-	//! Settings are re-read only after a SET/RESET/PRAGMA statement ran on this connection (the pre hook sees the
-	//! statement before it executes and drops the cached copy). A SET GLOBAL on another connection therefore takes
-	//! effect here only after this connection's next SET/RESET/PRAGMA; so does a memory_limit set there (a global
-	//! option), which the budget follows.
+	//! Settings are re-read only after a SET/RESET/PRAGMA statement ran on this connection: the pre hook (or
+	//! OnExecutePrepared, for a prepared one) marks the statement, QueryEnd drops the cached copy once it has run, and
+	//! the next statement loads it again. Until then every reader sees the values from before the statement, which
+	//! are the ones in force while it runs. A SET GLOBAL on another connection therefore takes effect here only after
+	//! this connection's next SET/RESET/PRAGMA; so does a memory_limit set there (a global option), which the budget
+	//! follows.
 	bool settings_loaded = false;
+	bool settings_change_pending = false;
 	RecyclerSettings settings;
 	//! The result-affecting session settings as the pre hook read them (PlanSignatures::SettingsSalt); the post hook
 	//! keys the same statement under the same values
