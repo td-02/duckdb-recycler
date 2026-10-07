@@ -87,6 +87,12 @@ bool AdmitBlockWrite(const RecyclerCache &cache, const RecyclerSettings &setting
 	       !cache.TooBig(shape.hash, settings.CapRows(RecyclerEntryKind::BLOCK), settings.entry_cap_bytes);
 }
 
+bool AdmitPaginationWrite(const RecyclerCache &cache, const RecyclerSettings &settings, const NodeInfo &info,
+                          const SigHash &hash) {
+	return info.est_leaf_rows >= settings.min_input_rows &&
+	       !cache.TooBig(hash, settings.CapRows(RecyclerEntryKind::PAGINATION), settings.entry_cap_bytes);
+}
+
 bool AdmitWholeWrite(ClientContext &context, const RecyclerCache &cache, const RecyclerSettings &settings,
                      LogicalOperator &root, const NodeInfo &root_info, const SigHash &hash) {
 	if (cache.TooBig(hash, settings.CapRows(RecyclerEntryKind::WHOLE_RESULT), settings.entry_cap_bytes)) {

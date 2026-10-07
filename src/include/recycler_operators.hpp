@@ -132,6 +132,9 @@ struct RecyclerWriteSpec {
 	string canonical;
 	//! Write single-threaded in arrival order and replay in that order
 	bool ordered = false;
+	//! Keep only the leading rows (0 = all): the sink stops its pipeline once this many rows are stored and the entry
+	//! is published as an incomplete prefix. Only meaningful for ordered writes (PAGINATION).
+	idx_t prefix_rows = 0;
 	idx_t est_input_rows = 0;
 	//! CachedEntry::tables of the entry to write
 	vector<TableDependency> tables;
@@ -144,6 +147,7 @@ struct RecyclerWriteSpec {
 	vector<RangeConstraint> constraints;
 	vector<string> conjuncts;
 	std::unordered_map<idx_t, idx_t> table_ids;
+	//! BLOCK writes: see above. PAGINATION writes: the bound ORDER BY output position of every column written
 	vector<ColumnIdentity> columns;
 
 	//! The write of one entry under the session's caps (the kind decides the row cap); BLOCK writes add their shape

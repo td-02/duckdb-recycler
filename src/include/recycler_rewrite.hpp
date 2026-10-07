@@ -15,6 +15,13 @@ bool SubstituteScan(unique_ptr<LogicalOperator> &slot, shared_ptr<CachedEntry> e
                     const vector<reference<const TableCatalogEntry>> &tables, Binder &binder,
                     ColumnBindingReplacer &replacer);
 
+//! SubstituteScan for an entry whose columns are the operator's, stored in another order: `stored[j]` is the stored
+//! column that is output column j of the operator. The scan emits the stored columns as they are, and a projection
+//! above it restores the operator's order. False when the types do not match.
+bool SubstituteReorderedScan(unique_ptr<LogicalOperator> &slot, shared_ptr<CachedEntry> entry, bool ordered,
+                             const vector<idx_t> &stored, const vector<reference<const TableCatalogEntry>> &tables,
+                             Binder &binder, ColumnBindingReplacer &replacer);
+
 //! Wrap the operator in `slot` in a RecyclerMaterialize that writes `spec`. `keep_alive` are column references the
 //! wrapper carries so that column pruning keeps those columns in the wrapped subtree's output even when nothing
 //! above the wrapper needs them.
