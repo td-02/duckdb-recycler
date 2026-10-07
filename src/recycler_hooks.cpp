@@ -35,18 +35,25 @@
 #include "duckdb/main/query_profiler.hpp"
 #include "duckdb/optimizer/column_binding_replacer.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/parser/constraints/unique_constraint.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/column_binding_map.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/logical_operator_visitor.hpp"
+#include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_distinct.hpp"
 #include "duckdb/planner/operator/logical_explain.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
+#include "duckdb/planner/operator/logical_limit.hpp"
 #include "duckdb/planner/operator/logical_merge_into.hpp"
+#include "duckdb/planner/operator/logical_order.hpp"
+#include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
@@ -92,6 +99,7 @@ RecyclerSettings LoadRecyclerSettings(ClientContext &context) {
 	s.blocks = GetBoolSetting(context, "recycler_blocks", s.blocks);
 	s.subtrees = GetBoolSetting(context, "recycler_subtrees", s.subtrees);
 	s.subsumption = GetBoolSetting(context, "recycler_subsumption", s.subsumption);
+	s.pagination = GetBoolSetting(context, "recycler_pagination", s.pagination);
 	// cached results compete with the queries for memory: whatever the setting says, at most a quarter of the limit
 	s.budget_bytes = MinValue<idx_t>(GetByteSetting(context, "recycler_budget_mb", s.budget_bytes),
 	                                 BufferManager::GetBufferManager(context).GetMaxMemory() / 4);
@@ -347,6 +355,340 @@ static void CollectBindings(const Expression &expr, vector<ColumnBinding> &out) 
 		out.push_back(expr.Cast<BoundColumnRefExpression>().binding);
 	}
 	ExpressionIterator::EnumerateChildren(expr, [&](const Expression &child) { CollectBindings(child, out); });
+}
+
+//===----------------------------------------------------------------------===//
+// Pagination: a sorted prefix may only be replayed for later pages when the ORDER BY is a total order
+//===----------------------------------------------------------------------===//
+//! LIMIT + OFFSET above which DuckDB keeps ORDER BY + LIMIT instead of a Top-N (topn_optimizer.cpp): only then does
+//! sorting the whole input pay for later pages
+static constexpr idx_t PAGINATION_MIN_ROWS = 5000;
+//! A pagination stores this many times the rows the current page needs, so that the following pages hit
+static constexpr idx_t PAGINATION_PREFIX_FACTOR = 4;
+
+static idx_t SaturatingMultiply(idx_t value, idx_t factor) {
+	return value > NumericLimits<idx_t>::Maximum() / factor ? NumericLimits<idx_t>::Maximum() : value * factor;
+}
+
+//! The plain column behind an expression, seeing through DuckDB's lossless compress/decompress wrappers
+static bool ResolvePlainColumn(const Expression &expr, ColumnBinding &result, idx_t depth = 0) {
+	if (depth > 8) {
+		return false;
+	}
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+		result = expr.Cast<BoundColumnRefExpression>().binding;
+		return true;
+	}
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+		auto &func = expr.Cast<BoundFunctionExpression>();
+		if (!func.children.empty() && (StringUtil::StartsWith(func.function.name, "__internal_compress_") ||
+		                               StringUtil::StartsWith(func.function.name, "__internal_decompress_"))) {
+			return ResolvePlainColumn(*func.children[0], result, depth + 1);
+		}
+	}
+	return false;
+}
+
+//! Whether no two output rows of `op` agree on all of `keys` (output bindings of `op`). A sound but deliberately
+//! small proof: primary keys of base tables, carried through filters, projections of plain columns, aggregate group
+//! keys and joins that cannot multiply the rows of the side the keys come from. Anything else is "not proven".
+static bool UniqueOn(LogicalOperator &op, const binding_set_t &keys, idx_t depth) {
+	if (keys.empty() || depth > 64) {
+		return false;
+	}
+	switch (op.type) {
+	case LogicalOperatorType::LOGICAL_GET: {
+		auto &get = op.Cast<LogicalGet>();
+		auto table = get.GetTable();
+		if (!table || !get.children.empty()) {
+			return false;
+		}
+		auto &column_ids = get.GetColumnIds();
+		std::unordered_set<idx_t> present;
+		for (auto &key : keys) {
+			if (key.table_index == get.table_index && key.column_index < column_ids.size() &&
+			    !column_ids[key.column_index].HasChildren()) {
+				present.insert(column_ids[key.column_index].GetPrimaryIndex());
+			}
+		}
+		// primary keys only: UNIQUE columns may hold several NULLs, which would tie
+		for (auto &constraint : table->GetConstraints()) {
+			if (constraint->type != ConstraintType::UNIQUE) {
+				continue;
+			}
+			auto &unique = constraint->Cast<UniqueConstraint>();
+			if (!unique.IsPrimaryKey()) {
+				continue;
+			}
+			auto indexes = unique.GetLogicalIndexes(table->GetColumns());
+			bool all_present = !indexes.empty();
+			for (auto &index : indexes) {
+				all_present = all_present && present.count(index.index) > 0;
+			}
+			if (all_present) {
+				return true;
+			}
+		}
+		return false;
+	}
+	case LogicalOperatorType::LOGICAL_FILTER:
+		return op.children.size() == 1 && UniqueOn(*op.children[0], keys, depth + 1);
+	case LogicalOperatorType::LOGICAL_PROJECTION: {
+		auto &proj = op.Cast<LogicalProjection>();
+		if (op.children.size() != 1) {
+			return false;
+		}
+		binding_set_t mapped;
+		for (auto &key : keys) {
+			ColumnBinding column;
+			if (key.table_index == proj.table_index && key.column_index < proj.expressions.size() &&
+			    ResolvePlainColumn(*proj.expressions[key.column_index], column)) {
+				mapped.insert(column);
+			}
+		}
+		return UniqueOn(*op.children[0], mapped, depth + 1);
+	}
+	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
+		auto &agg = op.Cast<LogicalAggregate>();
+		if (agg.groups.empty() || agg.grouping_sets.size() > 1 ||
+		    (agg.grouping_sets.size() == 1 && agg.grouping_sets[0].size() != agg.groups.size())) {
+			return false;
+		}
+		for (idx_t i = 0; i < agg.groups.size(); i++) {
+			if (keys.find(ColumnBinding(agg.group_index, i)) == keys.end()) {
+				return false;
+			}
+		}
+		return true;
+	}
+	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN: {
+		auto &join = op.Cast<LogicalComparisonJoin>();
+		if (op.children.size() != 2 || (join.join_type != JoinType::INNER && join.join_type != JoinType::LEFT)) {
+			return false;
+		}
+		auto &left = *op.children[0];
+		auto &right = *op.children[1];
+		binding_set_t left_outputs, right_outputs;
+		for (auto &binding : left.GetColumnBindings()) {
+			left_outputs.insert(binding);
+		}
+		for (auto &binding : right.GetColumnBindings()) {
+			right_outputs.insert(binding);
+		}
+		binding_set_t left_keys, right_keys, left_join_columns, right_join_columns;
+		for (auto &key : keys) {
+			if (left_outputs.count(key)) {
+				left_keys.insert(key);
+			} else if (right_outputs.count(key)) {
+				right_keys.insert(key);
+			}
+		}
+		// equality conditions on plain columns: if one side is unique on them, each row of the other side finds at
+		// most one partner (more conditions only remove partners)
+		for (auto &cond : join.conditions) {
+			if (cond.comparison != ExpressionType::COMPARE_EQUAL &&
+			    cond.comparison != ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+				continue;
+			}
+			ColumnBinding column;
+			if (ResolvePlainColumn(*cond.left, column)) {
+				left_join_columns.insert(column);
+			}
+			if (ResolvePlainColumn(*cond.right, column)) {
+				right_join_columns.insert(column);
+			}
+		}
+		// the output holds each left row at most once when the right side is unique on the join columns (a LEFT
+		// join keeps unmatched left rows once), so uniqueness of the left keys carries over; INNER joins are symmetric
+		if (UniqueOn(left, left_keys, depth + 1) && UniqueOn(right, right_join_columns, depth + 1)) {
+			return true;
+		}
+		return join.join_type == JoinType::INNER && UniqueOn(right, right_keys, depth + 1) &&
+		       UniqueOn(left, left_join_columns, depth + 1);
+	}
+	default:
+		return false;
+	}
+}
+
+//! The ORDER BY is a total order on its input: ties (whose order is unspecified, and differs between vanilla runs)
+//! cannot occur, so a cached sorted result is the same answer every later page would compute
+static bool OrderKeysAreUnique(LogicalOrder &order) {
+	if (order.children.size() != 1) {
+		return false;
+	}
+	binding_set_t keys;
+	for (auto &node : order.orders) {
+		ColumnBinding column;
+		if (ResolvePlainColumn(*node.expression, column)) {
+			keys.insert(column);
+		}
+	}
+	return UniqueOn(*order.children[0], keys, 0);
+}
+
+//! `LIMIT n OFFSET m` with constants, n + m above the Top-N threshold, over an ORDER BY reached through
+//! order-preserving projections/filters. Returns the slot of the ORDER_BY, or nullptr.
+static unique_ptr<LogicalOperator> *MatchPagination(LogicalOperator &op, idx_t &limit_rows, idx_t &offset_rows) {
+	if (op.type != LogicalOperatorType::LOGICAL_LIMIT || op.children.size() != 1) {
+		return nullptr;
+	}
+	auto &limit = op.Cast<LogicalLimit>();
+	if (limit.limit_val.Type() != LimitNodeType::CONSTANT_VALUE ||
+	    (limit.offset_val.Type() != LimitNodeType::UNSET && limit.offset_val.Type() != LimitNodeType::CONSTANT_VALUE)) {
+		return nullptr;
+	}
+	limit_rows = limit.limit_val.GetConstantValue();
+	offset_rows = limit.offset_val.Type() == LimitNodeType::CONSTANT_VALUE ? limit.offset_val.GetConstantValue() : 0;
+	auto total = offset_rows > NumericLimits<idx_t>::Maximum() - limit_rows ? NumericLimits<idx_t>::Maximum()
+	                                                                         : limit_rows + offset_rows;
+	if (total <= PAGINATION_MIN_ROWS) {
+		return nullptr;
+	}
+	auto order_slot = &op.children[0];
+	while ((*order_slot)->type == LogicalOperatorType::LOGICAL_PROJECTION ||
+	       (*order_slot)->type == LogicalOperatorType::LOGICAL_FILTER) {
+		if ((*order_slot)->children.size() != 1) {
+			return nullptr;
+		}
+		order_slot = &(*order_slot)->children[0];
+	}
+	if ((*order_slot)->type != LogicalOperatorType::LOGICAL_ORDER_BY) {
+		return nullptr;
+	}
+	return order_slot;
+}
+
+//! Number of pagination sites below `op`; `first` receives the first LIMIT found
+static idx_t CountPaginationSites(LogicalOperator &op, LogicalOperator **first) {
+	idx_t count = 0;
+	idx_t limit_rows, offset_rows;
+	if (MatchPagination(op, limit_rows, offset_rows)) {
+		if (first && !*first) {
+			*first = &op;
+		}
+		count++;
+	}
+	for (auto &child : op.children) {
+		count += CountPaginationSites(*child, first);
+	}
+	return count;
+}
+
+//! Direction and NULL order of every ORDER BY key
+static string OrderSpec(const LogicalOrder &order) {
+	string result;
+	for (auto &node : order.orders) {
+		result += char('0' + static_cast<uint8_t>(node.type));
+		result += char('0' + static_cast<uint8_t>(node.null_order));
+	}
+	return result;
+}
+
+//! What the cached unit (the top of the order-preserving chain under the LIMIT, above any compressed-materialization
+//! decompression) emits: ORDER BY key count/directions/NULL orders and the logical output types/column count. The
+//! ORDER_BY's own types are deliberately not part of it: they depend on column statistics, which a plan reading a
+//! cached block does not have.
+static string UnitLayout(const LogicalOrder &order, const LogicalOperator &unit) {
+	string result = OrderSpec(order);
+	result += "|n:" + std::to_string(unit.types.size());
+	for (auto &type : unit.types) {
+		result += "|t:" + type.ToString();
+	}
+	return result;
+}
+
+//! The cache key of a pagination: the bound ORDER BY subtree, which of its output columns the query demands, and the layout
+//! the optimized unit actually materializes. Both the hash and the canonical string cover all of it.
+static string PaginationCanonical(const PaginationSite &site, const LogicalOrder &order, const LogicalOperator &unit) {
+	string result = site.canonical;
+	result += "\x1f" "demanded";
+	for (auto idx : site.demanded) {
+		result += ":" + std::to_string(idx);
+	}
+	result += "\x1f" "layout" + UnitLayout(order, unit);
+	return result;
+}
+
+//! Rows of the sorted result to store for a page that needs `need` leading rows: a multiple of `need`, at least twice
+//! an existing shorter prefix (geometric growth), clamped to `cap_rows` (less one chunk, because the sink appends
+//! whole chunks) and to what `cap_bytes` holds at `row_width` bytes per row. A result below `need` means the prefix
+//! cannot even cover the page.
+static idx_t PrefixRows(idx_t need, idx_t existing_rows, idx_t cap_rows, idx_t cap_bytes, idx_t row_width) {
+	auto prefix = SaturatingMultiply(need, PAGINATION_PREFIX_FACTOR);
+	if (existing_rows > 0) {
+		prefix = MaxValue(prefix, SaturatingMultiply(existing_rows, 2));
+	}
+	auto rows_cap = cap_rows > STANDARD_VECTOR_SIZE ? cap_rows - STANDARD_VECTOR_SIZE : 0;
+	auto bytes_cap = cap_bytes / MaxValue<idx_t>(row_width, 1);
+	return MinValue(prefix, MinValue(rows_cap, bytes_cap));
+}
+
+static SigHash HashPaginationKey(const string &canonical) {
+	uint64_t h1 = 0xCBF29CE484222325ULL;
+	uint64_t h2 = 0x84222325CBF29CE4ULL;
+	for (unsigned char byte : canonical) {
+		h1 ^= byte;
+		h1 *= 0x100000001B3ULL;
+		h2 = (h2 ^ byte) * 0x9E3779B97F4A7C15ULL;
+		h2 ^= (h2 >> 29);
+	}
+	SigHash result;
+	result.h1 = h1;
+	result.h2 = h2;
+	return result;
+}
+
+//! Pre hook: find the pagination of the bound plan and take its key and total-order proof from the bound plan,
+//! before any M5 rewrite changes what lies below the ORDER BY. Only a plan with a single pagination is handled; the
+//! client state is only set once every eligibility check has passed.
+static void DetectPagination(RecyclerClientState &client, PlanSignatures &sig, LogicalOperator &root) {
+	LogicalOperator *limit_op = nullptr;
+	if (CountPaginationSites(root, &limit_op) != 1) {
+		return;
+	}
+	PaginationSite site;
+	auto order_slot = MatchPagination(*limit_op, site.limit, site.offset);
+	auto &order = (*order_slot)->Cast<LogicalOrder>();
+	auto &info = sig.Get(order);
+	if (!info.Cacheable() || !info.ordered || !OrderKeysAreUnique(order)) {
+		return;
+	}
+	// the session's result-affecting settings (SettingsSalt) are part of what the sorted rows are
+	site.canonical = sig.Render(order) + "\x1f" "salt" + client.settings_salt;
+	site.order_spec = OrderSpec(order);
+	site.tables = TableDependencies(info.tables, client.snapshot);
+	// the columns of the sorted result that the query's output actually demands decide what the optimizer keeps. A
+	// mere reference is not enough (a subquery's projection mentions every column), so demand is propagated from
+	// the query's output down through the projections above the LIMIT; any other operator there is not handled.
+	binding_set_t demanded;
+	for (auto &binding : root.GetColumnBindings()) {
+		demanded.insert(binding);
+	}
+	for (auto *node = &root; node != limit_op;) {
+		if (node->type != LogicalOperatorType::LOGICAL_PROJECTION || node->children.size() != 1) {
+			return;
+		}
+		auto &proj = node->Cast<LogicalProjection>();
+		binding_set_t next;
+		for (idx_t i = 0; i < proj.expressions.size(); i++) {
+			if (demanded.find(ColumnBinding(proj.table_index, i)) != demanded.end()) {
+				vector<ColumnBinding> refs;
+				CollectBindings(*proj.expressions[i], refs);
+				next.insert(refs.begin(), refs.end());
+			}
+		}
+		demanded = std::move(next);
+		node = node->children[0].get();
+	}
+	auto bindings = order.GetColumnBindings();
+	for (idx_t i = 0; i < bindings.size(); i++) {
+		if (demanded.find(bindings[i]) != demanded.end()) {
+			site.demanded.push_back(i);
+		}
+	}
+	site.eligible = true;
+	client.pagination_site = std::move(site);
 }
 
 struct SubsumptionPass {
@@ -696,6 +1038,9 @@ void RecyclerPreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOpera
 		cache.stats.refused[static_cast<idx_t>(reason)]++;
 	}
 	client.snapshot = TakeTableSnapshot(context, root_info.tables);
+	if (settings.subtrees && settings.pagination) {
+		DetectPagination(client, sig, root);
+	}
 
 	if (settings.whole_result && root_info.Cacheable()) {
 		if (ServeOrPlanWholeResult(input, *root_slot, cache, client, sig, preserve_order)) {
@@ -734,11 +1079,71 @@ struct SubtreeWalker {
 	const TableSnapshot &snapshot;
 	ColumnBindingReplacer replacer;
 	bool replaced = false;
+	//! The pagination recorded by the pre hook; set only when the bound and the optimized plan each hold exactly one
+	const PaginationSite *pagination_site = nullptr;
+
+	//! The sorted rows below the LIMIT of the pagination site are the same for every page, so they are the cache
+	//! unit and every page only skips/scans its own slice. The key comes from the bound plan (see PaginationSite); the
+	//! optimized ORDER_BY must still be this site. Returns true when the subtree below the LIMIT has been handled.
+	bool TryPagination(unique_ptr<LogicalOperator> &slot, WritePolicy policy, bool under_delim_lhs) {
+		idx_t limit_rows, offset_rows;
+		auto order_slot = pagination_site ? MatchPagination(*slot, limit_rows, offset_rows) : nullptr;
+		if (!order_slot || limit_rows != pagination_site->limit || offset_rows != pagination_site->offset) {
+			return false;
+		}
+		auto &order = (*order_slot)->Cast<LogicalOrder>();
+		if (OrderSpec(order) != pagination_site->order_spec) {
+			return false;
+		}
+		// the unit is the whole order-preserving chain under the LIMIT: above the sort's decompression it emits
+		// logical types in every plan, so the entry written by one page can be replayed by the next
+		auto &unit_slot = (*slot).children[0];
+		auto &info = sig.Get(*unit_slot);
+		if (!info.Cacheable() || !info.ordered) {
+			return false;
+		}
+		auto canonical = PaginationCanonical(*pagination_site, order, *unit_slot);
+		auto hash = HashPaginationKey(canonical);
+		// rows of the sorted result this page needs
+		auto need = offset_rows > NumericLimits<idx_t>::Maximum() - limit_rows ? NumericLimits<idx_t>::Maximum()
+		                                                                       : limit_rows + offset_rows;
+		idx_t existing_rows = 0;
+		auto entry = cache->LookupPagination(hash, canonical, pagination_site->tables, need, existing_rows);
+		if (entry && SubstituteScan(unit_slot, entry, true, info.tables, binder, replacer)) {
+			cache->stats.subtree_hits++;
+			replaced = true;
+			return true;
+		}
+		if (policy != WritePolicy::ALL || !AdmitPaginationWrite(*cache, settings, info, hash) ||
+		    !cache->Admissible(info.tables, snapshot)) {
+			return false;
+		}
+		// the prefix to store (see PrefixRows); below a delim join's LHS the row cap is the smaller one used there
+		auto cap_rows = under_delim_lhs ? MinValue<idx_t>(settings.entry_cap_rows, 200000) : settings.entry_cap_rows;
+		auto prefix = PrefixRows(need, existing_rows, cap_rows, settings.entry_cap_bytes,
+		                         RecyclerEstimateRowWidth(unit_slot->types));
+		if (prefix < need) {
+			// the prefix could not even cover this page: leave the query as M5 plans it
+			return false;
+		}
+		auto spec = RecyclerWriteSpec::Make(RecyclerEntryKind::PAGINATION, hash, std::move(canonical), true,
+		                                    info.est_leaf_rows, pagination_site->tables, settings);
+		spec.prefix_rows = prefix;
+		cache->stats.writes_planned++;
+		WrapMaterialize(unit_slot, std::move(spec), cache);
+		// the pagination writer is transparent to the write policy: the sort is a pipeline breaker between it and
+		// whatever is written below, so the subtree writes of the unpaginated plan (the joins feeding the sort) stay
+		WalkChildren(*unit_slot->children[0], policy, under_delim_lhs);
+		return true;
+	}
 
 	void Walk(unique_ptr<LogicalOperator> &slot, bool is_root, WritePolicy policy, bool under_delim_lhs,
 	          bool force_candidate) {
 		auto &op = *slot;
 		if (AsRecyclerOperator(op)) {
+			return;
+		}
+		if (op.type == LogicalOperatorType::LOGICAL_LIMIT && TryPagination(slot, policy, under_delim_lhs)) {
 			return;
 		}
 		auto &info = sig.Get(op);
@@ -803,6 +1208,10 @@ static void RewriteSubtrees(OptimizerExtensionInput &input, unique_ptr<LogicalOp
                             unique_ptr<LogicalOperator> &root_slot, RecyclerState &state,
                             const RecyclerClientState &client, PlanSignatures &sig) {
 	SubtreeWalker walker(input.context, input.optimizer.binder, state.cache, client.settings, sig, client.snapshot);
+	// the pagination of the bound plan is only used when the optimized plan still holds exactly that one
+	if (client.pagination_site.eligible && CountPaginationSites(*root_slot, nullptr) == 1) {
+		walker.pagination_site = &client.pagination_site;
+	}
 	walker.Walk(root_slot, true, WritePolicy::ALL, false, false);
 	if (walker.replaced) {
 		walker.replacer.VisitOperator(*plan);

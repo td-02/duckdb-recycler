@@ -28,7 +28,10 @@ enum class RecyclerEntryKind : uint8_t {
 	//! The output of a subtree of an optimized plan
 	SUBTREE = 1,
 	//! The output of an SPJ block keyed on its shape; reusable by narrower blocks (predicate/column subsumption)
-	BLOCK = 2
+	BLOCK = 2,
+	//! The leading rows of a sorted pagination result (possibly all of them, see CachedEntry::complete). Kept apart
+	//! from SUBTREE so that no generic lookup can mistake a prefix for a complete result
+	PAGINATION = 3
 };
 
 const char *RecyclerEntryKindName(RecyclerEntryKind kind);
@@ -80,6 +83,8 @@ struct CachedEntry {
 	idx_t bytes = 0;
 	//! Rows were written in a defined order and must be replayed in that order
 	bool ordered = false;
+	//! PAGINATION entries only: `rows` is the whole sorted result (true) or only its first `rows` rows (false)
+	bool complete = true;
 	//! Estimated rows scanned to produce the result (benefit proxy)
 	idx_t est_input_rows = 0;
 	//! The tables the result reads, in NodeInfo::tables order: a canonical match pairs them by position with the
@@ -135,6 +140,7 @@ struct RecyclerSettings {
 	bool blocks = true;
 	bool subtrees = true;
 	bool subsumption = true;
+	bool pagination = true;
 	idx_t budget_bytes = 2000ULL * 1024 * 1024;
 	idx_t entry_cap_bytes = 256ULL * 1024 * 1024;
 	idx_t entry_cap_rows = 4000000;
@@ -165,6 +171,8 @@ struct SignatureHistory {
 	uint64_t hit_ns = 0;
 };
 
+//! `subtree_hits` and `subtree_stores` also count PAGINATION entries (hits on, and publication or growth of, a sorted
+//! prefix); `recycler_entries()` tells the kinds apart.
 struct RecyclerStats {
 	std::atomic<uint64_t> pre_calls {0};
 	std::atomic<uint64_t> post_calls {0};
@@ -223,6 +231,16 @@ public:
 	//! Insert an entry (never overwrites); evicts lower-benefit entries to respect the budget. Refused when one of
 	//! its tables has a writer or a commit the entry's snapshot predates. Returns success.
 	bool Store(shared_ptr<CachedEntry> entry, idx_t budget_bytes);
+	//! Look up the PAGINATION entry of `canonical` covering `needed_rows` leading rows (or the whole result), for a
+	//! reader whose tables are in the state `reader` (paired with the entry's by position, as for IsCurrent). A hit is
+	//! counted only when the entry covers; one that is current but too short reports its row count in `existing_rows`.
+	shared_ptr<CachedEntry> LookupPagination(const SigHash &hash, const string &canonical,
+	                                         const vector<TableDependency> &reader, idx_t needed_rows,
+	                                         idx_t &existing_rows);
+	//! Publish a PAGINATION entry like Store (refused under the same table versions), replacing a shorter one of the
+	//! same key: the replacement keeps the older entry's hit history and is not an eviction. On failure the older
+	//! entry stays in place, fully usable.
+	bool StorePagination(shared_ptr<CachedEntry> entry, idx_t budget_bytes);
 	//! Insert a BLOCK entry under its shape hash (several entries per shape may coexist)
 	bool StoreBlock(shared_ptr<CachedEntry> entry, idx_t budget_bytes);
 	//! All BLOCK entries with this shape hash; the caller confirms a match and then asks IsCurrent
@@ -290,6 +308,11 @@ private:
 	bool MakeRoom(const CachedEntry &entry, idx_t budget_bytes);
 	//! Adds a stored entry to `dependents` (caller holds the lock)
 	void AddDependents(const CachedEntry &entry);
+	//! Puts an entry of a map kind (not BLOCK) into its map, the accounting and `dependents` (caller holds the lock)
+	void Publish(const shared_ptr<CachedEntry> &entry);
+	//! IsCurrent for a reader whose dependencies are `reader_at(0..reader_count)`, paired with the entry's by position
+	template <class READER_AT>
+	bool IsCurrentFor(const CachedEntry &entry, idx_t reader_count, READER_AT &&reader_at);
 	//! Removes the entry from the maps, `dependents` and the accounting; the maps may hold the last reference to it
 	void Erase(const CachedEntry &entry);
 	//! The history of `hash`, created and moved to the front of the LRU order (caller holds the lock)
@@ -317,6 +340,7 @@ private:
 	mutable std::mutex lock;
 	EntryMap whole;
 	EntryMap subtrees;
+	EntryMap paginations;
 	BlockMap blocks;
 	std::unordered_map<SigHash, HistoryNode, SigHashHasher> history;
 	//! Most recently noted first

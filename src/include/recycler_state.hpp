@@ -44,6 +44,26 @@ struct TouchedEntry {
 	shared_ptr<CachedEntry> entry;
 };
 
+//! The pagination (LIMIT/OFFSET over an ORDER BY) of the bound plan, as the pre-optimize hook saw it. Its key is taken
+//! from the bound plan because the optimized plan below the sort differs between the pages of one pagination (block
+//! markers, block scans), while the bound plan does not.
+struct PaginationSite {
+	//! The bound ORDER BY subtree is deterministic and cacheable, and its ORDER BY is provably a total order
+	bool eligible = false;
+	//! Full canonical rendering of the bound ORDER BY subtree (LIMIT/OFFSET excluded) and the session's salt
+	string canonical;
+	idx_t limit = 0;
+	idx_t offset = 0;
+	//! Direction and NULL order of every ORDER BY key
+	string order_spec;
+	//! Positions of the bound ORDER BY's output columns that the query's output demands, ascending
+	vector<idx_t> demanded;
+	//! The tables of the bound ORDER BY subtree with the state of their catalogs' transactions at the pre hook: the
+	//! entry written for this pagination depends on them, and an entry found for it must be current for them (the
+	//! optimized plan may read them through a block scan, so its own tables are no stand-in)
+	vector<TableDependency> tables;
+};
+
 //! Per-connection state carrying information from the pre-optimize hook to the post-optimize hook and from the
 //! recycler operators to QueryEnd. The hooks, physical planning and QueryEnd of a connection run one statement at
 //! a time.
@@ -71,6 +91,8 @@ struct RecyclerClientState : public ClientContextState {
 	string whole_canonical;
 	idx_t whole_est_input_rows = 0;
 	vector<TableDependency> whole_tables;
+	//! Set by the pre hook when the bound plan holds exactly one eligible pagination (M6)
+	PaginationSite pagination_site;
 
 	//! The writes of the open transaction, each announced once (RecyclerCache::AnnounceWriter) before the first
 	//! statement to name it runs, and settled by the transaction callbacks
@@ -97,6 +119,7 @@ struct RecyclerClientState : public ClientContextState {
 		whole_canonical.clear();
 		whole_est_input_rows = 0;
 		whole_tables.clear();
+		pagination_site = PaginationSite();
 	}
 	idx_t NextOperatorId() {
 		return ++operator_ids;

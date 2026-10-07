@@ -173,6 +173,13 @@ optimizer extension with two hooks (`src/recycler_hooks.cpp`):
   predicates (e.g. `production_year IS NOT NULL` stored, `BETWEEN 1998 AND 2003` served). Active only when
   `preserve_insertion_order` is false; `SET recycler_subsumption = false` disables it.
 
+* **Ordered pagination** (M6). Repeated `ORDER BY ... LIMIT n OFFSET m` pages over the same input are served from the
+  leading rows of the sorted result, cached once (a `PAGINATION` entry holding `4 * (offset + limit)` rows, grown
+  geometrically when a later page needs more) instead of sorting again for every page. It applies only when
+  `offset + limit > 5000` and the ORDER BY is provably a total order (a primary key, group key or non-multiplying
+  join key among its sort keys); the key comes from the bound plan, so it also holds when M5 rewrote the plan below the
+  sort. `SET recycler_pagination = false` disables it (default `true`; it needs `recycler_subtrees`).
+
 Correctness rules: results are keyed on the exact bound/optimized structure including types; subtrees with
 volatile functions, parameters, table functions, temporary tables (private to their connection), tables of
 non-DuckDB catalogs (attached SQLite/Postgres/... databases change outside DuckDB's transactions), LIMIT
@@ -197,6 +204,7 @@ connection evaluates when it reloads its settings (after a SET, RESET or PRAGMA 
 reports as `budget_bytes`.
 
 Settings: `recycler_enabled`, `recycler_whole_result`, `recycler_blocks`, `recycler_subtrees`, `recycler_subsumption`,
+`recycler_pagination` (default true; ordered pagination prefix reuse, requires `recycler_subtrees`),
 `recycler_budget_mb`, `recycler_entry_cap_mb`, `recycler_entry_cap_rows`, `recycler_min_input_rows`,
 `recycler_speculate_mb`, `recycler_compact_rows`. Introspection: `SELECT * FROM recycler_stats()`,
 `SELECT * FROM recycler_entries()`, `SELECT * FROM recycler_history()` (what is known about a signature whether or

@@ -63,6 +63,8 @@ const char *RecyclerEntryKindName(RecyclerEntryKind kind) {
 		return "subtree";
 	case RecyclerEntryKind::BLOCK:
 		return "block";
+	case RecyclerEntryKind::PAGINATION:
+		return "pagination";
 	default:
 		return "unknown";
 	}
@@ -75,7 +77,14 @@ double CachedEntry::Benefit() const {
 }
 
 RecyclerCache::EntryMap &RecyclerCache::Map(RecyclerEntryKind kind) {
-	return kind == RecyclerEntryKind::WHOLE_RESULT ? whole : subtrees;
+	switch (kind) {
+	case RecyclerEntryKind::WHOLE_RESULT:
+		return whole;
+	case RecyclerEntryKind::PAGINATION:
+		return paginations;
+	default:
+		return subtrees;
+	}
 }
 
 idx_t RecyclerCache::NextSequence() {
@@ -123,7 +132,7 @@ shared_ptr<CachedEntry> RecyclerCache::PickVictim() const {
 			victim = candidate;
 		}
 	};
-	for (auto *map : {&whole, &subtrees}) {
+	for (auto *map : {&whole, &subtrees, &paginations}) {
 		for (auto &entry : *map) {
 			consider(entry.second);
 		}
@@ -143,6 +152,13 @@ void RecyclerCache::AddDependents(const CachedEntry &entry) {
 		D_ASSERT(listed.find(&entry) == listed.end());
 		listed.insert(&entry);
 	}
+}
+
+void RecyclerCache::Publish(const shared_ptr<CachedEntry> &entry) {
+	total_bytes += entry->bytes;
+	total_used_bytes += entry->used_bytes;
+	Map(entry->kind)[entry->hash] = entry;
+	AddDependents(*entry);
 }
 
 void RecyclerCache::Erase(const CachedEntry &entry) {
@@ -243,18 +259,18 @@ bool RecyclerCache::Fresh(const vector<TableDependency> &dependencies) const {
 	return true;
 }
 
-bool RecyclerCache::IsCurrent(const CachedEntry &entry, const vector<reference<const TableCatalogEntry>> &tables,
-                              const TableSnapshot &snapshot) {
+template <class READER_AT>
+bool RecyclerCache::IsCurrentFor(const CachedEntry &entry, idx_t reader_count, READER_AT &&reader_at) {
 	// a confirmed match pairs the entry's tables with the reader's by position
-	D_ASSERT(entry.tables.size() == tables.size());
-	if (entry.tables.size() != tables.size()) {
+	D_ASSERT(entry.tables.size() == reader_count);
+	if (entry.tables.size() != reader_count) {
 		// the invariant rests on the rendering being entry-identifying: a miss, never a read past the vector
 		return false;
 	}
 	std::lock_guard<std::mutex> guard(lock);
-	for (idx_t i = 0; i < tables.size(); i++) {
+	for (idx_t i = 0; i < reader_count; i++) {
 		auto &stored = entry.tables[i];
-		auto &reader = snapshot.at(tables[i]);
+		const TableDependency &reader = reader_at(i);
 		// the canonical rendering names the catalog, not the attached database: one detached and attached again
 		// under the same name renders alike
 		D_ASSERT(stored.catalog != reader.catalog || stored.table == reader.table);
@@ -265,6 +281,12 @@ bool RecyclerCache::IsCurrent(const CachedEntry &entry, const vector<reference<c
 		}
 	}
 	return true;
+}
+
+bool RecyclerCache::IsCurrent(const CachedEntry &entry, const vector<reference<const TableCatalogEntry>> &tables,
+                              const TableSnapshot &snapshot) {
+	return IsCurrentFor(entry, tables.size(),
+	                    [&](idx_t i) -> const TableDependency & { return snapshot.at(tables[i]); });
 }
 
 bool RecyclerCache::Admissible(const vector<reference<const TableCatalogEntry>> &tables,
@@ -370,15 +392,85 @@ bool RecyclerCache::Store(shared_ptr<CachedEntry> entry, idx_t budget_bytes) {
 	}
 	entry->stored_at = NextSequence();
 	entry->last_used = entry->stored_at;
-	total_bytes += entry->bytes;
-	total_used_bytes += entry->used_bytes;
-	map[entry->hash] = entry;
-	AddDependents(*entry);
+	Publish(entry);
 	if (entry->kind == RecyclerEntryKind::WHOLE_RESULT) {
 		stats.whole_stores++;
 	} else {
 		stats.subtree_stores++;
 	}
+	return true;
+}
+
+shared_ptr<CachedEntry> RecyclerCache::LookupPagination(const SigHash &hash, const string &canonical,
+                                                        const vector<TableDependency> &reader, idx_t needed_rows,
+                                                        idx_t &existing_rows) {
+	existing_rows = 0;
+	shared_ptr<CachedEntry> candidate;
+	{
+		std::lock_guard<std::mutex> guard(lock);
+		auto entry = paginations.find(hash);
+		if (entry == paginations.end()) {
+			stats.misses++;
+			return nullptr;
+		}
+		candidate = entry->second;
+	}
+	if (canonical != candidate->canonical) {
+		stats.hash_collisions++;
+		stats.misses++;
+		return nullptr;
+	}
+	if (!IsCurrentFor(*candidate, reader.size(), [&](idx_t i) -> const TableDependency & { return reader[i]; })) {
+		stats.misses++;
+		return nullptr;
+	}
+	if (!candidate->complete && candidate->rows < needed_rows) {
+		existing_rows = candidate->rows;
+		stats.misses++;
+		return nullptr;
+	}
+	NoteHit(*candidate);
+	return candidate;
+}
+
+bool RecyclerCache::StorePagination(shared_ptr<CachedEntry> entry, idx_t budget_bytes) {
+	std::lock_guard<std::mutex> guard(lock);
+	auto existing = paginations.find(entry->hash);
+	shared_ptr<CachedEntry> older;
+	if (existing != paginations.end()) {
+		older = existing->second;
+		// only a longer prefix (or the completed result) replaces what is there; a concurrent writer may have won
+		bool grows = older->canonical == entry->canonical &&
+		             ((entry->complete && !older->complete) || entry->rows > older->rows);
+		if (!grows) {
+			stats.store_rejected++;
+			return false;
+		}
+	}
+	if (!Fresh(entry->tables)) {
+		stats.blocked_by_version++;
+		stats.store_rejected++;
+		return false;
+	}
+	if (older) {
+		// the family keeps its reuse history, so that growing does not make it a cold eviction candidate
+		entry->hits = older->hits.load();
+		// the older entry leaves the maps, the accounting and `dependents` while room is made; replacing it is not an
+		// eviction, and `older` keeps it alive for running plans and for the restore below
+		Erase(*older);
+	}
+	if (!MakeRoom(*entry, budget_bytes)) {
+		if (older) {
+			// nothing changed for readers: the older prefix is back, with its bytes and dependents
+			Publish(older);
+		}
+		stats.store_rejected++;
+		return false;
+	}
+	entry->stored_at = NextSequence();
+	entry->last_used = entry->stored_at;
+	Publish(entry);
+	stats.subtree_stores++;
 	return true;
 }
 
@@ -427,6 +519,7 @@ void RecyclerCache::Clear() {
 	std::lock_guard<std::mutex> guard(lock);
 	whole.clear();
 	subtrees.clear();
+	paginations.clear();
 	blocks.clear();
 	history.clear();
 	history_order.clear();
@@ -524,7 +617,7 @@ idx_t RecyclerCache::UsedBytes() const {
 
 idx_t RecyclerCache::EntryCount() const {
 	std::lock_guard<std::mutex> guard(lock);
-	idx_t count = whole.size() + subtrees.size();
+	idx_t count = whole.size() + subtrees.size() + paginations.size();
 	for (auto &shape : blocks) {
 		count += shape.second.size();
 	}
@@ -543,7 +636,7 @@ idx_t RecyclerCache::VersionCount() const {
 vector<shared_ptr<CachedEntry>> RecyclerCache::Entries() const {
 	std::lock_guard<std::mutex> guard(lock);
 	vector<shared_ptr<CachedEntry>> result;
-	for (auto *map : {&whole, &subtrees}) {
+	for (auto *map : {&whole, &subtrees, &paginations}) {
 		for (auto &entry : *map) {
 			result.push_back(entry.second);
 		}

@@ -132,6 +132,9 @@ struct RecyclerWriteSpec {
 	string canonical;
 	//! Write single-threaded in arrival order and replay in that order
 	bool ordered = false;
+	//! Keep only the leading rows (0 = all): the sink stops its pipeline once this many rows are stored and the entry
+	//! is published as an incomplete prefix. Only meaningful for ordered writes (PAGINATION).
+	idx_t prefix_rows = 0;
 	idx_t est_input_rows = 0;
 	//! CachedEntry::tables of the entry to write
 	vector<TableDependency> tables;
