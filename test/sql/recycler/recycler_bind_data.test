@@ -1,0 +1,165 @@
+# name: test/sql/recycler/recycler_bind_data.test
+# description: arguments the binder moves into a function's bind data (quantiles, separators, lambda bodies) are part
+#              of the key, and a lambda body's volatile functions are refused
+# group: [recycler]
+
+require waddle
+
+statement ok
+SET threads = 1;
+
+# lower the admission floor so that the small synthetic table takes part
+statement ok
+SET recycler_min_input_rows = 1000;
+
+statement ok
+CREATE TABLE t AS
+SELECT (range % 1000)::DOUBLE AS x, range % 5 AS g, (range % 10)::VARCHAR AS s, [range % 10, range % 10 + 1] AS l
+FROM range(300000);
+
+# ---------------------------------------------------------------------------
+# quantile_cont: the quantile lives in the bind data, not in the children
+# ---------------------------------------------------------------------------
+loop i 0 3
+
+query I
+SELECT quantile_cont(x, 0.5) FROM t
+----
+499.5
+
+endloop
+
+query I
+SELECT round(quantile_cont(x, 0.9), 1) FROM t
+----
+899.1
+
+query II
+SELECT g, quantile_disc(x, 0.25) FROM t GROUP BY g ORDER BY g
+----
+0	245.0
+1	246.0
+2	247.0
+3	248.0
+4	249.0
+
+query II
+SELECT g, quantile_disc(x, 0.75) FROM t GROUP BY g ORDER BY g
+----
+0	745.0
+1	746.0
+2	747.0
+3	748.0
+4	749.0
+
+# ---------------------------------------------------------------------------
+# string_agg: the separator lives in the bind data
+# ---------------------------------------------------------------------------
+loop i 0 3
+
+query I
+SELECT string_agg(DISTINCT s, ',' ORDER BY s) FROM t
+----
+0,1,2,3,4,5,6,7,8,9
+
+endloop
+
+query I
+SELECT string_agg(DISTINCT s, '|' ORDER BY s) FROM t
+----
+0|1|2|3|4|5|6|7|8|9
+
+# ---------------------------------------------------------------------------
+# lambdas: the body lives in the bind data
+# ---------------------------------------------------------------------------
+loop i 0 3
+
+query I
+SELECT sum(list_sum(list_transform(l, lambda v: v + 1))) FROM t
+----
+3600000
+
+endloop
+
+query I
+SELECT sum(list_sum(list_transform(l, lambda v: v * 2))) FROM t
+----
+6000000
+
+query I
+SELECT sum(len(list_filter(l, lambda v: v > 4))) FROM t
+----
+330000
+
+query I
+SELECT sum(len(list_filter(l, lambda v: v > 8))) FROM t
+----
+90000
+
+# a lambda nested in a lambda
+query I
+SELECT sum(list_sum(list_transform([l], lambda w: list_sum(list_transform(w, lambda v: v + 1))))) FROM t
+----
+3600000
+
+query I
+SELECT sum(list_sum(list_transform([l], lambda w: list_sum(list_transform(w, lambda v: v + 2))))) FROM t
+----
+4200000
+
+# the repeated queries above were served: the tests compare against cached answers
+query I
+SELECT value >= 3 FROM recycler_stats() WHERE name = 'subtree_hits'
+----
+true
+
+# ---------------------------------------------------------------------------
+# a volatile function inside a lambda body is refused, although the lambda function itself is consistent
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE refused_before AS SELECT value FROM recycler_stats() WHERE name = 'refused_volatile_function';
+
+statement ok
+SELECT sum(list_sum(list_transform(l, lambda v: v + random()))) FROM t;
+
+query I
+SELECT (SELECT value FROM recycler_stats() WHERE name = 'refused_volatile_function') > (SELECT value FROM refused_before)
+----
+true
+
+# ---------------------------------------------------------------------------
+# bind data without serialization (a compiled regular expression) is derived from the arguments the key renders: the
+# statements are cached, and two patterns do not collide
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TABLE hits_before AS SELECT value FROM recycler_stats() WHERE name = 'subtree_hits';
+
+loop i 0 3
+
+query I
+SELECT count(*) FROM t WHERE s SIMILAR TO '[0-4]'
+----
+150000
+
+endloop
+
+query I
+SELECT count(*) FROM t WHERE s SIMILAR TO '[0-1]'
+----
+60000
+
+query I
+SELECT count(*) FROM t WHERE regexp_matches(s, '^[5-9]$')
+----
+150000
+
+query I
+SELECT (SELECT value FROM recycler_stats() WHERE name = 'subtree_hits') > (SELECT value FROM hits_before)
+----
+true
+
+# bind data the key can render is never refused here
+query I
+SELECT value FROM recycler_stats() WHERE name = 'refused_bind_data'
+----
+0
