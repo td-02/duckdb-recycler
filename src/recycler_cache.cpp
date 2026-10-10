@@ -82,8 +82,11 @@ RecyclerCache::EntryMap &RecyclerCache::Map(RecyclerEntryKind kind) {
 		return whole;
 	case RecyclerEntryKind::PAGINATION:
 		return paginations;
-	default:
+	case RecyclerEntryKind::SUBTREE:
 		return subtrees;
+	default:
+		// BLOCK entries live in per-shape lists (`blocks`), never in a map
+		throw InternalException("RecyclerCache::Map called for a BLOCK entry");
 	}
 }
 
@@ -157,11 +160,17 @@ void RecyclerCache::AddDependents(const CachedEntry &entry) {
 void RecyclerCache::Publish(const shared_ptr<CachedEntry> &entry) {
 	total_bytes += entry->bytes;
 	total_used_bytes += entry->used_bytes;
-	Map(entry->kind)[entry->hash] = entry;
+	if (entry->kind == RecyclerEntryKind::BLOCK) {
+		blocks[entry->hash].push_back(entry);
+	} else {
+		Map(entry->kind)[entry->hash] = entry;
+	}
 	AddDependents(*entry);
+	entry->published = true;
 }
 
 void RecyclerCache::Erase(const CachedEntry &entry) {
+	entry.published = false;
 	for (auto &dependency : entry.tables) {
 		auto catalog = dependents.find(dependency.catalog);
 		D_ASSERT(catalog != dependents.end());
@@ -268,6 +277,10 @@ bool RecyclerCache::IsCurrentFor(const CachedEntry &entry, idx_t reader_count, R
 		return false;
 	}
 	std::lock_guard<std::mutex> guard(lock);
+	if (!entry.published) {
+		stats.erased_before_use++;
+		return false;
+	}
 	for (idx_t i = 0; i < reader_count; i++) {
 		auto &stored = entry.tables[i];
 		const TableDependency &reader = reader_at(i);
@@ -498,10 +511,7 @@ bool RecyclerCache::StoreBlock(shared_ptr<CachedEntry> entry, idx_t budget_bytes
 	}
 	entry->stored_at = NextSequence();
 	entry->last_used = entry->stored_at;
-	total_bytes += entry->bytes;
-	total_used_bytes += entry->used_bytes;
-	AddDependents(*entry);
-	blocks[entry->hash].push_back(entry);
+	Publish(entry);
 	stats.block_stores++;
 	return true;
 }

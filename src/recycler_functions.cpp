@@ -439,6 +439,7 @@ static unique_ptr<GlobalTableFunctionState> RecyclerStatsInit(ClientContext &con
 		add("clears", s.clears);
 		add("invalidated_entries", s.invalidated_entries);
 		add("blocked_by_version", s.blocked_by_version);
+		add("erased_before_use", s.erased_before_use);
 		add("announced_table_writes", s.announced_table_writes);
 		add("pre_ns", s.pre_ns);
 		add("post_ns", s.post_ns);
