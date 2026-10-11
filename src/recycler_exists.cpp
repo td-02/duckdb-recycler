@@ -32,7 +32,9 @@
 // mark is TRUE or FALSE, never NULL, which is what lets filter pushdown make an ANTI join of NOT EXISTS
 // (pushdown_mark_join.cpp). Both sides of a correlation are bare columns: an expression on the inner side would be
 // evaluated for every inner row by the new projection, where the planner's plan evaluates it only against the outer
-// values that exist, so an expression that fails on some row (a cast) would fail a query the planner answers.
+// values that exist, so an expression that fails on some row (a cast) would fail a query the planner answers. For the
+// same reason every other expression of the subquery (its WHERE conjuncts, its joins and its FROM part) must be one
+// that cannot fail (MayThrow), and the select list, which a MARK join never outputs, becomes NULL constants.
 // Comparisons other than these two, correlation outside the WHERE clause (in a join condition, an aggregate, a nested
 // subquery), delim joins of other kinds, and a subquery holding one of the recycler's own operators are left as they
 // are: a block marker inside the subquery would end up directly below the new filter, and the join order optimizer
@@ -76,7 +78,12 @@
 #include "recycler_rewrite.hpp"
 
 #include "duckdb/common/unordered_set.hpp"
+#include "duckdb/planner/expression/bound_between_expression.hpp"
+#include "duckdb/planner/expression/bound_case_expression.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
@@ -122,6 +129,92 @@ optional_ptr<const BoundColumnRefExpression> AsColumn(const Expression &expr) {
 	return ref.depth == 0 ? &ref : nullptr;
 }
 
+//! Whether a cast from `source` to `target` succeeds for every value: to VARCHAR, between integer types whose target
+//! holds every source value, and from an integer or FLOAT to DOUBLE
+bool CastCannotFail(const LogicalType &source, const LogicalType &target) {
+	if (source == target || target.id() == LogicalTypeId::VARCHAR) {
+		return true;
+	}
+	if (source.IsIntegral() && target.IsIntegral()) {
+		auto source_size = GetTypeIdSize(source.InternalType());
+		auto target_size = GetTypeIdSize(target.InternalType());
+		if (source.IsUnsigned() == target.IsUnsigned()) {
+			return target_size >= source_size;
+		}
+		// an unsigned value fits a strictly wider signed type; a signed one never fits an unsigned type
+		return source.IsUnsigned() && target_size > source_size;
+	}
+	return target.id() == LogicalTypeId::DOUBLE && (source.IsIntegral() || source.id() == LogicalTypeId::FLOAT);
+}
+
+//! Whether evaluating `expr` can raise an error on some row
+//!
+//! The planner's plan evaluates the subquery's expressions after the join with the outer values, or in a scan that
+//! the join's runtime filter has already narrowed to them; the rewritten plan evaluates them on every row of the
+//! subquery's tables. A rewritten EXISTS whose subquery holds an expression that fails on a row no outer value
+//! matches (`CAST(v AS INT)` over a row holding 'abc') would fail a query the planner answers, so MatchShape refuses
+//! it. Only expressions known never to fail pass: column references, constants, comparisons, AND / OR / NOT,
+//! IS [NOT] NULL, IN, COALESCE, BETWEEN, CASE, LIKE and its variants, casts that cannot fail and casts of a constant
+//! that succeed. Arithmetic (which can overflow) and every other function count as failing.
+bool MayThrow(const Expression &expr) {
+	switch (expr.GetExpressionClass()) {
+	case ExpressionClass::BOUND_COLUMN_REF:
+	case ExpressionClass::BOUND_CONSTANT:
+	case ExpressionClass::BOUND_COMPARISON:
+	case ExpressionClass::BOUND_CONJUNCTION:
+	case ExpressionClass::BOUND_BETWEEN:
+	case ExpressionClass::BOUND_CASE:
+		break;
+	case ExpressionClass::BOUND_OPERATOR:
+		switch (expr.GetExpressionType()) {
+		case ExpressionType::OPERATOR_NOT:
+		case ExpressionType::OPERATOR_IS_NULL:
+		case ExpressionType::OPERATOR_IS_NOT_NULL:
+		case ExpressionType::COMPARE_IN:
+		case ExpressionType::COMPARE_NOT_IN:
+		case ExpressionType::OPERATOR_COALESCE:
+			break;
+		default:
+			return true;
+		}
+		break;
+	case ExpressionClass::BOUND_CAST: {
+		auto &cast = expr.Cast<BoundCastExpression>();
+		if (cast.try_cast || CastCannotFail(cast.child->return_type, cast.return_type)) {
+			break;
+		}
+		if (cast.child->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+			return true;
+		}
+		// a constant the binder casts to the type it is compared with (`int_column = '3'`)
+		Value result;
+		string error;
+		if (!cast.child->Cast<BoundConstantExpression>().value.DefaultTryCastAs(cast.return_type, result, &error,
+		                                                                        true)) {
+			return true;
+		}
+		break;
+	}
+	case ExpressionClass::BOUND_FUNCTION: {
+		auto &name = expr.Cast<BoundFunctionExpression>().function.name;
+		if (name != "~~" && name != "!~~" && name != "~~*" && name != "!~~*" && name != "prefix" && name != "suffix" &&
+		    name != "contains") {
+			return true;
+		}
+		break;
+	}
+	default:
+		return true;
+	}
+	bool child_may_throw = false;
+	ExpressionIterator::EnumerateChildren(expr, [&](const Expression &child) {
+		if (!child_may_throw && MayThrow(child)) {
+			child_may_throw = true;
+		}
+	});
+	return child_may_throw;
+}
+
 //! What a subtree refers to and contains, for the checks on the subquery's own plan
 //!
 //! MatchShape runs it over the subquery's FROM part (the `inner` side of the cross product with the DELIM_GET) to
@@ -138,6 +231,8 @@ struct SubtreeScan {
 	//! The subtree holds one of the recycler's operators (a block marker or a cached-result scan planted by the pre
 	//! hook); moving a filter onto it is unsafe, see the file comment
 	bool recycler = false;
+	//! Some expression may fail on a row the planner's plan never evaluates it on (MayThrow)
+	bool may_throw = false;
 
 	//! Visits `op` and everything below it, filling the fields above
 	void Walk(LogicalOperator &op) {
@@ -151,6 +246,9 @@ struct SubtreeScan {
 		LogicalOperatorVisitor::EnumerateExpressions(op, [&](unique_ptr<Expression> *expr) {
 			if (!CollectReferences(**expr, referenced)) {
 				correlated = true;
+			}
+			if (MayThrow(**expr)) {
+				may_throw = true;
 			}
 		});
 		for (auto &child : op.children) {
@@ -262,7 +360,8 @@ ExistsShape MatchShape(LogicalComparisonJoin &join) {
 		}
 	}
 	// the rest of the select list must not look at the outer row (`EXISTS (SELECT t.id FROM ...)`): the select list of
-	// an EXISTS is never read, but it is kept in the new projection, which no longer has the outer row to read from
+	// an EXISTS is never read and Decorrelate replaces it, but a select list over the outer row is a shape the
+	// planner built for something other than a plain EXISTS
 	for (idx_t k = 0; k < prefix; k++) {
 		unordered_set<idx_t> refs;
 		if (!CollectReferences(*projection.expressions[k], refs) || refs.count(delim_index)) {
@@ -280,6 +379,10 @@ ExistsShape MatchShape(LogicalComparisonJoin &join) {
 			return shape;
 		}
 		if (!refs.count(delim_index)) {
+			// it stays a filter on the subquery, which now runs on every row of the subquery's tables
+			if (MayThrow(conjunct)) {
+				return shape;
+			}
 			shape.plain_conjuncts.push_back(j);
 			continue;
 		}
@@ -316,7 +419,7 @@ ExistsShape MatchShape(LogicalComparisonJoin &join) {
 	auto &inner = *cross.children[1 - delim_side];
 	SubtreeScan scan;
 	scan.Walk(inner);
-	if (scan.correlated || scan.delim || scan.recycler || scan.referenced.count(delim_index)) {
+	if (scan.correlated || scan.delim || scan.recycler || scan.may_throw || scan.referenced.count(delim_index)) {
 		return shape;
 	}
 	shape.ok = true;
@@ -331,21 +434,23 @@ ExistsShape MatchShape(LogicalComparisonJoin &join) {
 //! Builds the plain MARK join of a matched shape, consuming the old operators
 //!
 //! The result is COMPARISON_JOIN(MARK)[c_j IS NOT DISTINCT FROM p_j] with the old outer FROM on the left and
-//! PROJECTION[select list, p_j] -> FILTER[plain conjuncts, k_j IS NOT NULL] -> inner on the right. The expressions
-//! and operators are moved out of the old plan, not copied; the old delim join, projection, filter, cross product and
-//! DELIM_GET are destroyed when the caller overwrites its slot with the result. The new join keeps the old join's
-//! mark_index and the new projection the old projection's table_index, so every operator above that reads the mark
-//! column (the WHERE filter) or a subquery column still finds it under the same binding.
+//! PROJECTION[NULL for each select-list column, p_j] -> FILTER[plain conjuncts, k_j IS NOT NULL] -> inner on the
+//! right. The expressions and operators are moved out of the old plan, not copied; the old delim join, projection,
+//! filter, cross product and DELIM_GET are destroyed when the caller overwrites its slot with the result. The new join
+//! keeps the old join's mark_index and the new projection the old projection's table_index, so every operator above
+//! that reads the mark column (the WHERE filter) or a subquery column still finds it under the same binding.
 unique_ptr<LogicalOperator> Decorrelate(ExistsShape &shape) {
 	auto &join = *shape.join;
 	auto &projection = *shape.projection;
 	auto &filter = *shape.filter;
 	auto prefix = projection.expressions.size() - join.duplicate_eliminated_columns.size();
 
-	// the subquery's own select list, without the trailing delim columns (the new projection appends p_j instead)
+	// the subquery's own select list, without the trailing delim columns (the new projection appends p_j instead). A
+	// MARK join outputs none of its right side's columns, so nothing reads the select list: it becomes NULLs of the
+	// same types, which keeps every column at its index and evaluates nothing that could fail on a row
 	vector<unique_ptr<Expression>> select_list;
 	for (idx_t k = 0; k < prefix; k++) {
-		select_list.push_back(std::move(projection.expressions[k]));
+		select_list.push_back(make_uniq<BoundConstantExpression>(Value(projection.expressions[k]->return_type)));
 	}
 	// the subquery's WHERE conjuncts that do not look at the outer row stay a filter on the subquery
 	vector<unique_ptr<Expression>> conjuncts;

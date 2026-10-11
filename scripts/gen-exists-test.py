@@ -21,6 +21,10 @@ FROM range(9000);
 CREATE TABLE p AS SELECT range AS id, range % 3000 AS tid, range % 9 AS v FROM range(4000);
 CREATE TABLE d AS SELECT range AS id, 'role' || range AS role FROM range(5);
 CREATE TABLE s AS SELECT range AS id, CAST(range % 7 AS VARCHAR) AS gs FROM range(100);
+CREATE TABLE e AS
+SELECT range AS id, CASE WHEN range < 100 THEN range % 5 ELSE 100000 + range END AS tid,
+       CASE WHEN range < 100 THEN CAST(range AS VARCHAR) ELSE 'x' || range END AS v
+FROM range(20000);
 """
 
 # (label, sql) - every query has a deterministic result (ORDER BY or a single row)
@@ -119,6 +123,10 @@ QUERIES = [
      "SELECT g, count(*) AS c FROM t WHERE NOT EXISTS (SELECT 1 FROM f JOIN d ON d.id = f.k WHERE f.tid = t.id AND d.role = 'role1') GROUP BY g ORDER BY g"),
     ("EXISTS with a LIMIT on the outer query",
      "SELECT id, g FROM t WHERE EXISTS (SELECT 1 FROM f WHERE f.tid = t.id AND f.k = 1) ORDER BY id LIMIT 7 OFFSET 3"),
+    # e.v holds numbers on the rows an outer key of d matches and 'x...' on the others (the cases that cast it are in
+    # the tail, where only the plan is checked)
+    ("EXISTS whose WHERE has only conditions that cannot fail",
+     "SELECT count(*) FROM d WHERE EXISTS (SELECT 1 FROM e WHERE e.tid = d.id AND e.v LIKE '1%' AND e.v IN ('10', '11', 'x') AND e.v IS NOT NULL AND e.id BETWEEN 0 AND 50 AND e.id <> '7')"),
 ]
 
 # statements that change data: run on a fresh copy each time, the check is the query after them
@@ -235,13 +243,27 @@ SET recycler_enabled = false;
               "2009 AND EXISTS (SELECT 1 FROM f WHERE f.tid = t.id AND f.k = 1) GROUP BY g ORDER BY g")
     p2 = "CREATE TABLE p2 AS SELECT range AS id, range % 3000 AS tid, range % 9 AS v FROM range(4000)"
     marker_payer = ("SELECT count(*) FROM t WHERE random() < 2 AND EXISTS (SELECT 1 FROM f JOIN p2 ON p2.tid = f.tid "
-                    "JOIN d ON d.id = f.k AND d.id + p2.v > 3 AND p2.v = 1 WHERE f.tid = t.id AND f.k = 3)")
+                    "JOIN d ON d.id = f.k AND (d.id > 2 OR p2.v > 2) AND p2.v = 1 WHERE f.tid = t.id AND f.k = 3)")
     marker_hitter = ("SELECT count(*) FROM t WHERE random() < 2 AND EXISTS (SELECT 1 FROM f JOIN p2 ON p2.tid = f.tid "
-                     "JOIN d ON d.id = f.k AND d.id + p2.v > 3 AND p2.v = 1 WHERE f.tid = t.id)")
+                     "JOIN d ON d.id = f.k AND (d.id > 2 OR p2.v > 2) AND p2.v = 1 WHERE f.tid = t.id)")
     marker_hitter_not = ("SELECT count(*) FROM t WHERE random() < 2 AND NOT EXISTS (SELECT 1 FROM f JOIN p2 ON "
-                         "p2.tid = f.tid JOIN d ON d.id = f.k AND d.id + p2.v > 3 AND p2.v = 1 WHERE f.tid = t.id)")
+                         "p2.tid = f.tid JOIN d ON d.id = f.k AND (d.id > 2 OR p2.v > 2) AND p2.v = 1 WHERE f.tid = t.id)")
     tail = {name: result_of([], sql, []) for name, sql in
             [("count_exists", count_exists), ("count_in", count_in), ("wide", wide), ("narrow", narrow)]}
+    # the select list of an EXISTS is never output; without the passes that drop it, the planner's plan evaluates it
+    # only on the rows the outer keys match
+    select_cast = "SELECT count(*) FROM d WHERE EXISTS (SELECT CAST(e.v AS INT) FROM e WHERE e.tid = d.id)"
+    # subquery expressions that fail on the rows no outer key matches
+    cast_cases = [
+        "SELECT count(*) FROM d WHERE EXISTS (SELECT 1 FROM e WHERE e.tid = d.id AND CAST(e.v AS INT) > 10)",
+        "SELECT count(*) FROM d WHERE NOT EXISTS (SELECT 1 FROM e WHERE e.tid = d.id AND CAST(e.v AS INT) > 96)",
+        "SELECT count(*) FROM d WHERE EXISTS (SELECT 1 FROM e JOIN d d2 ON d2.id = e.tid AND CAST(e.v AS INT) > 10 "
+        "WHERE e.tid = d.id)",
+    ]
+    cast_explains = "\n".join(f"query II\nEXPLAIN {sql}\n----\nphysical_plan\t<REGEX>:.*DELIM_JOIN.*\n"
+                               for sql in cast_cases)
+    tail["select_cast"] = result_of(["SET disabled_optimizers = 'extension,filter_pushdown,unused_columns'"],
+                                    select_cast, [])
     for name, sql in [("marker_payer", marker_payer), ("marker_hitter", marker_hitter),
                       ("marker_hitter_not", marker_hitter_not)]:
         tail[name] = result_of([p2], sql, ["DROP TABLE p2"])
@@ -294,6 +316,41 @@ SELECT s.name, s.value - c.value FROM recycler_stats() s JOIN counters c USING (
 ----
 exists_refused	1
 exists_rewrites	1
+
+# a select list that would fail on rows no outer key matches: the rewrite replaces it by NULLs (a MARK join outputs
+# none of its right side), so the query is rewritten and answers, also with the passes that would drop it disabled
+statement ok
+SET disabled_optimizers = 'filter_pushdown,unused_columns';
+
+statement ok
+CREATE TABLE counters_select AS SELECT name, value FROM recycler_stats() WHERE name = 'exists_rewrites';
+
+query I
+%(select_cast_sql)s
+----
+%(select_cast)s
+
+query I
+SELECT s.value - c.value FROM recycler_stats() s JOIN counters_select c USING (name)
+----
+1
+
+statement ok
+SET disabled_optimizers = '';
+
+# a subquery expression that can fail (here on the rows of e no outer key matches) refuses the rewrite: the rewritten
+# plan would evaluate it on every row of e. The planner's plan keeps its delim join; whether that plan answers depends
+# on whether its runtime filter narrows the scan of e before the cast runs, which changes with the build and the join
+# order, so only the plans and the counters are checked
+statement ok
+CREATE TABLE counters_cast AS SELECT name, value FROM recycler_stats() WHERE name IN ('exists_rewrites', 'exists_refused');
+
+%(cast_explains)s
+query TI
+SELECT s.name, s.value - c.value FROM recycler_stats() s JOIN counters_cast c USING (name) ORDER BY s.name
+----
+exists_refused	3
+exists_rewrites	0
 
 # ---------------------------------------------------------------------------
 # with the cache on, a rewritten block is still stored and still serves a narrower query
@@ -356,6 +413,8 @@ query I
                .replace("%(marker_hitter_not)s", tail["marker_hitter_not"])
                .replace("%(count_exists_sql)s", count_exists).replace("%(count_exists)s", tail["count_exists"])
                .replace("%(count_in_sql)s", count_in).replace("%(count_in)s", tail["count_in"])
+               .replace("%(cast_explains)s", cast_explains)
+               .replace("%(select_cast_sql)s", select_cast).replace("%(select_cast)s", tail["select_cast"])
                .replace("%(wide_sql)s", wide).replace("%(wide)s", tail["wide"])
                .replace("%(narrow_sql)s", narrow).replace("%(narrow)s", tail["narrow"]))
     OUT.write_text("\n".join(out))
