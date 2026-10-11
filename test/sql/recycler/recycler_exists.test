@@ -35,6 +35,12 @@ CREATE TABLE d AS SELECT range AS id, 'role' || range AS role FROM range(5);
 statement ok
 CREATE TABLE s AS SELECT range AS id, CAST(range % 7 AS VARCHAR) AS gs FROM range(100);
 
+statement ok
+CREATE TABLE e AS
+SELECT range AS id, CASE WHEN range < 100 THEN range % 5 ELSE 100000 + range END AS tid,
+       CASE WHEN range < 100 THEN CAST(range AS VARCHAR) ELSE 'x' || range END AS v
+FROM range(20000);
+
 
 # ---------------------------------------------------------------------------
 # with the rewrite on
@@ -552,6 +558,30 @@ SELECT id, g FROM t WHERE EXISTS (SELECT 1 FROM f WHERE f.tid = t.id AND f.k = 1
 36	1
 41	6
 46	4
+
+# EXISTS whose WHERE casts a column that fails on rows no outer key matches
+query I
+SELECT count(*) FROM d WHERE EXISTS (SELECT 1 FROM e WHERE e.tid = d.id AND CAST(e.v AS INT) > 10)
+----
+5
+
+# NOT EXISTS whose WHERE casts a column that fails on rows no outer key matches
+query I
+SELECT count(*) FROM d WHERE NOT EXISTS (SELECT 1 FROM e WHERE e.tid = d.id AND CAST(e.v AS INT) > 96)
+----
+2
+
+# EXISTS whose join condition casts a column that fails on rows no outer key matches
+query I
+SELECT count(*) FROM d WHERE EXISTS (SELECT 1 FROM e JOIN d d2 ON d2.id = e.tid AND CAST(e.v AS INT) > 10 WHERE e.tid = d.id)
+----
+5
+
+# EXISTS whose WHERE has only conditions that cannot fail
+query I
+SELECT count(*) FROM d WHERE EXISTS (SELECT 1 FROM e WHERE e.tid = d.id AND e.v LIKE '1%' AND e.v IN ('10', '11', 'x') AND e.v IS NOT NULL AND e.id BETWEEN 0 AND 50 AND e.id <> '7')
+----
+2
 
 # DELETE with EXISTS
 statement ok
@@ -1119,6 +1149,30 @@ SELECT id, g FROM t WHERE EXISTS (SELECT 1 FROM f WHERE f.tid = t.id AND f.k = 1
 36	1
 41	6
 46	4
+
+# EXISTS whose WHERE casts a column that fails on rows no outer key matches
+query I
+SELECT count(*) FROM d WHERE EXISTS (SELECT 1 FROM e WHERE e.tid = d.id AND CAST(e.v AS INT) > 10)
+----
+5
+
+# NOT EXISTS whose WHERE casts a column that fails on rows no outer key matches
+query I
+SELECT count(*) FROM d WHERE NOT EXISTS (SELECT 1 FROM e WHERE e.tid = d.id AND CAST(e.v AS INT) > 96)
+----
+2
+
+# EXISTS whose join condition casts a column that fails on rows no outer key matches
+query I
+SELECT count(*) FROM d WHERE EXISTS (SELECT 1 FROM e JOIN d d2 ON d2.id = e.tid AND CAST(e.v AS INT) > 10 WHERE e.tid = d.id)
+----
+5
+
+# EXISTS whose WHERE has only conditions that cannot fail
+query I
+SELECT count(*) FROM d WHERE EXISTS (SELECT 1 FROM e WHERE e.tid = d.id AND e.v LIKE '1%' AND e.v IN ('10', '11', 'x') AND e.v IS NOT NULL AND e.id BETWEEN 0 AND 50 AND e.id <> '7')
+----
+2
 
 # DELETE with EXISTS
 statement ok
@@ -1690,6 +1744,30 @@ SELECT id, g FROM t WHERE EXISTS (SELECT 1 FROM f WHERE f.tid = t.id AND f.k = 1
 41	6
 46	4
 
+# EXISTS whose WHERE casts a column that fails on rows no outer key matches
+query I
+SELECT count(*) FROM d WHERE EXISTS (SELECT 1 FROM e WHERE e.tid = d.id AND CAST(e.v AS INT) > 10)
+----
+5
+
+# NOT EXISTS whose WHERE casts a column that fails on rows no outer key matches
+query I
+SELECT count(*) FROM d WHERE NOT EXISTS (SELECT 1 FROM e WHERE e.tid = d.id AND CAST(e.v AS INT) > 96)
+----
+2
+
+# EXISTS whose join condition casts a column that fails on rows no outer key matches
+query I
+SELECT count(*) FROM d WHERE EXISTS (SELECT 1 FROM e JOIN d d2 ON d2.id = e.tid AND CAST(e.v AS INT) > 10 WHERE e.tid = d.id)
+----
+5
+
+# EXISTS whose WHERE has only conditions that cannot fail
+query I
+SELECT count(*) FROM d WHERE EXISTS (SELECT 1 FROM e WHERE e.tid = d.id AND e.v LIKE '1%' AND e.v IN ('10', '11', 'x') AND e.v IS NOT NULL AND e.id BETWEEN 0 AND 50 AND e.id <> '7')
+----
+2
+
 # DELETE with EXISTS
 statement ok
 CREATE TABLE t2 AS SELECT * FROM t
@@ -1789,6 +1867,27 @@ SELECT s.name, s.value - c.value FROM recycler_stats() s JOIN counters c USING (
 exists_refused	1
 exists_rewrites	1
 
+# a select list that would fail on rows no outer key matches: the rewrite replaces it by NULLs (a MARK join outputs
+# none of its right side), so the query is rewritten and answers, also with the passes that would drop it disabled
+statement ok
+SET disabled_optimizers = 'filter_pushdown,unused_columns';
+
+statement ok
+CREATE TABLE counters_select AS SELECT name, value FROM recycler_stats() WHERE name = 'exists_rewrites';
+
+query I
+SELECT count(*) FROM d WHERE EXISTS (SELECT CAST(e.v AS INT) FROM e WHERE e.tid = d.id)
+----
+5
+
+query I
+SELECT s.value - c.value FROM recycler_stats() s JOIN counters_select c USING (name)
+----
+1
+
+statement ok
+SET disabled_optimizers = '';
+
 # ---------------------------------------------------------------------------
 # with the cache on, a rewritten block is still stored and still serves a narrower query
 # ---------------------------------------------------------------------------
@@ -1843,16 +1942,16 @@ statement ok
 CREATE TABLE p2 AS SELECT range AS id, range % 3000 AS tid, range % 9 AS v FROM range(4000);
 
 query I
-SELECT count(*) FROM t WHERE random() < 2 AND EXISTS (SELECT 1 FROM f JOIN p2 ON p2.tid = f.tid JOIN d ON d.id = f.k AND d.id + p2.v > 3 AND p2.v = 1 WHERE f.tid = t.id AND f.k = 3)
+SELECT count(*) FROM t WHERE random() < 2 AND EXISTS (SELECT 1 FROM f JOIN p2 ON p2.tid = f.tid JOIN d ON d.id = f.k AND (d.id > 2 OR p2.v > 2) AND p2.v = 1 WHERE f.tid = t.id AND f.k = 3)
 ----
 89
 
 query I
-SELECT count(*) FROM t WHERE random() < 2 AND EXISTS (SELECT 1 FROM f JOIN p2 ON p2.tid = f.tid JOIN d ON d.id = f.k AND d.id + p2.v > 3 AND p2.v = 1 WHERE f.tid = t.id)
+SELECT count(*) FROM t WHERE random() < 2 AND EXISTS (SELECT 1 FROM f JOIN p2 ON p2.tid = f.tid JOIN d ON d.id = f.k AND (d.id > 2 OR p2.v > 2) AND p2.v = 1 WHERE f.tid = t.id)
 ----
 178
 
 query I
-SELECT count(*) FROM t WHERE random() < 2 AND NOT EXISTS (SELECT 1 FROM f JOIN p2 ON p2.tid = f.tid JOIN d ON d.id = f.k AND d.id + p2.v > 3 AND p2.v = 1 WHERE f.tid = t.id)
+SELECT count(*) FROM t WHERE random() < 2 AND NOT EXISTS (SELECT 1 FROM f JOIN p2 ON p2.tid = f.tid JOIN d ON d.id = f.k AND (d.id > 2 OR p2.v > 2) AND p2.v = 1 WHERE f.tid = t.id)
 ----
 2822
