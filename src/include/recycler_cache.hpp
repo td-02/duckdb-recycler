@@ -96,7 +96,7 @@ struct CachedEntry {
 	idx_t sink_calls = 0;
 	//! Cache sequence at which the entry was stored
 	idx_t stored_at = 0;
-	//! The entry is in the cache: the cache's bookkeeping, written by Publish and Erase under the cache lock. A
+	//! The entry is in the cache: the cache's bookkeeping, written by Publish, Erase and Clear under the cache lock. A
 	//! reader confirms a match outside the lock, and a commit that evicts the entry in between may also forget the
 	//! version that would have refused it, so IsCurrent refuses an entry that is no longer published.
 	mutable bool published = false;
@@ -213,7 +213,7 @@ struct RecyclerStats {
 	//! lookups, admissions and stores refused by the table versions: an uncommitted writer, a commit the snapshot
 	//! predates, or a catalog the reader does not share
 	std::atomic<uint64_t> blocked_by_version {0};
-	//! Matches whose entry was evicted or invalidated between the lookup and the freshness check
+	//! Matches whose entry was evicted, invalidated or cleared between the lookup and the freshness check
 	std::atomic<uint64_t> erased_before_use {0};
 	//! write statements whose target table the pre hook named (INSERT, UPDATE, DELETE, MERGE), also when their
 	//! transaction had already announced that table

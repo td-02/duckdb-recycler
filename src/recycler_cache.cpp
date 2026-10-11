@@ -527,6 +527,17 @@ vector<shared_ptr<CachedEntry>> RecyclerCache::LookupBlocks(const SigHash &hash)
 
 void RecyclerCache::Clear() {
 	std::lock_guard<std::mutex> guard(lock);
+	// a reader may hold an entry it is still confirming: it must not be served once the cache dropped it (IsCurrentFor)
+	for (auto map : {&whole, &subtrees, &paginations}) {
+		for (auto &entry : *map) {
+			entry.second->published = false;
+		}
+	}
+	for (auto &shape : blocks) {
+		for (auto &entry : shape.second) {
+			entry->published = false;
+		}
+	}
 	whole.clear();
 	subtrees.clear();
 	paginations.clear();
