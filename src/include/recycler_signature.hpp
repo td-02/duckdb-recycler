@@ -75,6 +75,7 @@ enum class RefusalReason : uint8_t {
 	TEMPORARY_TABLE,
 	FOREIGN_CATALOG,
 	SESSION_BOUND_FUNCTION,
+	BIND_DATA,
 	COUNT
 };
 

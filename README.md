@@ -196,7 +196,10 @@ an ORDER BY clause is resolved by the binder, so both already change the plan) a
 never served an entry computed under other values. Functions DuckDB declares consistent although their result depends on the session or the transaction
 are refused: `current_setting()`, whose bind data holds the value of whichever setting it names, `age()` with one
 argument, which measures from the transaction's start date, and ICU's `current_localtimestamp()` and
-`current_localtime()`, which hold the transaction's start. Cached collections are buffer-managed, except that an
+`current_localtime()`, which hold the transaction's start. Arguments the binder moves out of a function's children into
+its bind data (the quantile of `quantile_cont`, the separator of `string_agg`, the body of a lambda) are part of the
+key through the bind data's serialization (bind data without one, such as a regular expression's, is derived from the
+rendered arguments); a lambda whose body calls a volatile function is refused. Cached collections are buffer-managed, except that an
 entry of at most `recycler_compact_rows` rows (8,192) is copied into memory allocated with its data when that takes
 less than its buffer blocks (at least one 256 KiB block per writer thread, however few the rows); the cache is
 bounded with benefit-density eviction by the smaller of `recycler_budget_mb` and a quarter of `memory_limit`, which a

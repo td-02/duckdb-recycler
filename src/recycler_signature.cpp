@@ -8,12 +8,15 @@
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/enums/order_type.hpp"
+#include "duckdb/common/serializer/binary_serializer.hpp"
+#include "duckdb/common/serializer/memory_stream.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/types/column/column_data_scan_states.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/operator/join/join_filter_pushdown.hpp"
 #include "duckdb/function/function.hpp"
+#include "duckdb/function/lambda_functions.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
@@ -167,6 +170,8 @@ const char *RefusalReasonName(RefusalReason reason) {
 		return "foreign_catalog";
 	case RefusalReason::SESSION_BOUND_FUNCTION:
 		return "session_bound_function";
+	case RefusalReason::BIND_DATA:
+		return "bind_data";
 	default:
 		return "unknown";
 	}
@@ -219,32 +224,82 @@ static bool IsSessionBound(const BoundFunctionExpression &func) {
 	return name == "current_setting" || name == "current_localtimestamp" || name == "current_localtime";
 }
 
-//! Refuse a function whose result is not a function of its rendered arguments alone, whatever its children
+//! Refuse a function whose result is not a function of its rendered arguments alone, whatever its children. The
+//! binder moves a lambda's body out of the children into the bind data, and the stability of the lambda function
+//! does not reflect that body, so the body is checked here too.
 static void RefuseFunction(const BoundFunctionExpression &func, NodeInfo &info) {
 	if (func.function.GetStability() != FunctionStability::CONSISTENT) {
 		Refuse(info, RefusalReason::VOLATILE_FUNCTION);
 	} else if (IsSessionBound(func)) {
 		Refuse(info, RefusalReason::SESSION_BOUND_FUNCTION);
 	}
+	if (!func.function.HasBindLambdaCallback() || !func.bind_info) {
+		return;
+	}
+	auto lambda = dynamic_cast<const ListLambdaBindData *>(func.bind_info.get());
+	if (!lambda) {
+		Refuse(info, RefusalReason::BIND_DATA);
+		return;
+	}
+	if (lambda->lambda_expr) {
+		ExpressionIterator::VisitExpression<BoundFunctionExpression>(
+		    *lambda->lambda_expr, [&](const BoundFunctionExpression &inner) { RefuseFunction(inner, info); });
+	}
 }
 
-//! A table filter is rendered as text only: a dynamic filter marks the scan as runtime filtered, and the functions
-//! of an expression filter (a predicate on one column pushed into the scan) are refused as RenderExpression refuses
-//! them anywhere else
-static void AnalyzeTableFilter(const TableFilter &filter, NodeInfo &info) {
+//! The binder moves some arguments out of a function's children into its bind data (the quantile of
+//! quantile_cont, the separator of string_agg, the body of a lambda), and the textual form of the expression shows
+//! the children only, so bind data is keyed by its serialization. In DuckDB v1.5.5 every binder that removes an
+//! argument from the children serializes its bind data (quantile, approx_quantile, reservoir_quantile, string_agg,
+//! bitstring_agg, list_aggregate, date_part and ICU's date parts, the lambda functions): bind data without
+//! serialization (regular expressions, LIKE, strftime, list_sort, decimal avg) is derived from the rendered children,
+//! the return type and the salted settings, and keeps the textual form as before. A callback that throws is refused.
+template <class FUNCTION>
+static void RenderBindData(const Expression &expr, const FUNCTION &function, optional_ptr<FunctionData> bind_info,
+                           PlanSignatures::Sink &sink, NodeInfo &info) {
+	sink.Bool(bind_info != nullptr);
+	if (!bind_info) {
+		return;
+	}
+	sink.Bool(function.HasSerializationCallbacks());
+	if (!function.HasSerializationCallbacks()) {
+		sink.Str(expr.ToString());
+		return;
+	}
+	MemoryStream stream;
+	try {
+		BinarySerializer serializer(stream);
+		serializer.Begin();
+		function.GetSerializeCallback()(serializer, bind_info, function);
+		serializer.End();
+	} catch (const Exception &) {
+		// a callback that cannot serialize this bind data throws (NotImplementedException, SerializationException)
+		Refuse(info, RefusalReason::BIND_DATA);
+		return;
+	}
+	sink.U64(stream.GetPosition());
+	sink.Write(stream.GetData(), stream.GetPosition());
+}
+
+//! A table filter is rendered as text: a dynamic filter marks the scan as runtime filtered, and the functions of an
+//! expression filter (a predicate on one column pushed into the scan) are refused, and their bind data rendered, as
+//! RenderExpression does anywhere else
+static void AnalyzeTableFilter(const TableFilter &filter, PlanSignatures::Sink &sink, NodeInfo &info) {
 	switch (filter.filter_type) {
 	case TableFilterType::DYNAMIC_FILTER:
 		info.runtime_filtered = true;
 		break;
 	case TableFilterType::EXPRESSION_FILTER:
 		ExpressionIterator::VisitExpression<BoundFunctionExpression>(
-		    *filter.Cast<ExpressionFilter>().expr,
-		    [&](const BoundFunctionExpression &func) { RefuseFunction(func, info); });
+		    *filter.Cast<ExpressionFilter>().expr, [&](const BoundFunctionExpression &func) {
+			    RefuseFunction(func, info);
+			    RenderBindData(func, func.function, func.bind_info, sink, info);
+		    });
 		break;
 	case TableFilterType::OPTIONAL_FILTER: {
 		auto &opt = filter.Cast<OptionalFilter>();
 		if (opt.child_filter) {
-			AnalyzeTableFilter(*opt.child_filter, info);
+			AnalyzeTableFilter(*opt.child_filter, sink, info);
 		}
 		break;
 	}
@@ -252,14 +307,14 @@ static void AnalyzeTableFilter(const TableFilter &filter, NodeInfo &info) {
 	case TableFilterType::CONJUNCTION_OR: {
 		auto &conj = static_cast<const ConjunctionFilter &>(filter);
 		for (auto &child : conj.child_filters) {
-			AnalyzeTableFilter(*child, info);
+			AnalyzeTableFilter(*child, sink, info);
 		}
 		break;
 	}
 	case TableFilterType::STRUCT_EXTRACT: {
 		auto &sf = filter.Cast<StructFilter>();
 		if (sf.child_filter) {
-			AnalyzeTableFilter(*sf.child_filter, info);
+			AnalyzeTableFilter(*sf.child_filter, sink, info);
 		}
 		break;
 	}
@@ -493,11 +548,7 @@ void PlanSignatures::RenderExpression(const Expression &expr, const Frame &frame
 		for (auto &child : func.children) {
 			RenderExpression(*child, frame, sink, info);
 		}
-		if (func.bind_info) {
-			// bind data can carry semantics that are not visible in the children (e.g. struct field names);
-			// the textual form is only used to make the key stricter, never looser
-			sink.Str(expr.ToString());
-		}
+		RenderBindData(func, func.function, func.bind_info, sink, info);
 		break;
 	}
 	case ExpressionClass::BOUND_AGGREGATE: {
@@ -524,9 +575,7 @@ void PlanSignatures::RenderExpression(const Expression &expr, const Frame &frame
 				RenderExpression(*order.expression, frame, sink, info);
 			}
 		}
-		if (aggr.bind_info) {
-			sink.Str(expr.ToString());
-		}
+		RenderBindData(aggr, aggr.function, aggr.bind_info, sink, info);
 		break;
 	}
 	case ExpressionClass::BOUND_CAST: {
@@ -675,7 +724,7 @@ void PlanSignatures::RenderNode(const LogicalOperator &op, const Frame &frame, S
 			sink.U64(entry.first);
 			sink.U8(static_cast<uint8_t>(entry.second->filter_type));
 			sink.Str(entry.second->ToString("c"));
-			AnalyzeTableFilter(*entry.second, info);
+			AnalyzeTableFilter(*entry.second, sink, info);
 		}
 		if (get.dynamic_filters) {
 			auto owners = dynamic_owners.find(get.dynamic_filters.get());
