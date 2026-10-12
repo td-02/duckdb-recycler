@@ -320,8 +320,11 @@ private:
 	using EntryMap = std::unordered_map<SigHash, shared_ptr<CachedEntry>, SigHashHasher>;
 	using BlockMap = std::unordered_map<SigHash, vector<shared_ptr<CachedEntry>>, SigHashHasher>;
 	EntryMap &Map(RecyclerEntryKind kind);
-	shared_ptr<CachedEntry> PickVictim() const;
-	//! Evict until `entry` fits the budget; false when the cache holds more valuable results (caller holds the lock)
+	//! Calls `callback` with every stored entry, of every kind (caller holds the lock)
+	template <class CALLBACK>
+	void ForEachEntry(CALLBACK &&callback) const;
+	//! Evict the least valuable entries until `entry` fits the budget; false, with nothing evicted, when that would
+	//! need an entry worth more per byte than `entry` (caller holds the lock)
 	bool MakeRoom(const CachedEntry &entry, idx_t budget_bytes);
 	//! Adds a stored entry to `dependents` (caller holds the lock)
 	void AddDependents(const CachedEntry &entry);

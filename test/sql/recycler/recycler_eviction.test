@@ -1,0 +1,109 @@
+# name: test/sql/recycler/recycler_eviction.test
+# description: a store that cannot be made room for evicts nothing; one that can evicts the cheapest entries first
+# group: [recycler]
+
+require waddle
+
+# One thread: a parallel sink allocates a 256 KB block per writer thread, so with several threads an entry's size,
+# and with it every eviction below, depends on scheduling. Whole results only, so that the entries below are the only
+# ones competing for the 1 MB budget.
+statement ok
+SET threads = 1;
+
+statement ok
+SET recycler_min_input_rows = 1;
+
+statement ok
+SET recycler_budget_mb = 1;
+
+statement ok
+SET recycler_subtrees = false;
+
+statement ok
+CREATE TABLE small AS SELECT range AS id FROM range(11000);
+
+statement ok
+CREATE TABLE big AS SELECT range AS id, range % 100000 AS g FROM range(400000);
+
+# vanilla's answer for B, compared with the served one at the end
+statement ok
+SET disabled_optimizers = 'extension';
+
+query II nosort b
+SELECT g % 20000 AS k, count(*) FROM big GROUP BY k ORDER BY k
+----
+
+statement ok
+SET disabled_optimizers = '';
+
+# A (one block) saves little: it reads 11000 rows to return 10000
+statement ok
+SELECT id % 10000 AS k, count(*) FROM small GROUP BY k ORDER BY k;
+
+# B (two blocks) saves much and is hit three times
+query II nosort b
+SELECT g % 20000 AS k, count(*) FROM big GROUP BY k ORDER BY k
+----
+
+query II nosort b
+SELECT g % 20000 AS k, count(*) FROM big GROUP BY k ORDER BY k
+----
+
+query II nosort b
+SELECT g % 20000 AS k, count(*) FROM big GROUP BY k ORDER BY k
+----
+
+query II nosort b
+SELECT g % 20000 AS k, count(*) FROM big GROUP BY k ORDER BY k
+----
+
+query III
+SELECT rows, bytes, hits FROM recycler_entries() ORDER BY rows
+----
+10000	262136	0
+20000	524272	3
+
+# C is worth more per byte than A and less than B, and fits only if both leave: it is refused, and A stays (making
+# room used to evict A before finding that B would have to go too)
+statement ok
+SELECT g % 40000 AS k, count(*) FROM big GROUP BY k ORDER BY k;
+
+query II
+SELECT rows, hits FROM recycler_entries() ORDER BY rows
+----
+10000	0
+20000	3
+
+query II
+SELECT name, value FROM recycler_stats() WHERE name IN ('evictions', 'store_rejected', 'whole_stores') ORDER BY name
+----
+evictions	0
+store_rejected	1
+whole_stores	2
+
+# D is worth more per byte than A and needs only A's room: A is evicted and D stored
+statement ok
+SELECT g % 20001 AS k, count(*) FROM big GROUP BY k ORDER BY k;
+
+query II
+SELECT rows, hits FROM recycler_entries() ORDER BY rows
+----
+20000	3
+20001	0
+
+query II
+SELECT name, value FROM recycler_stats() WHERE name IN ('evictions', 'store_rejected', 'whole_stores') ORDER BY name
+----
+evictions	1
+store_rejected	1
+whole_stores	3
+
+# B is still served, with vanilla's answer
+query II nosort b
+SELECT g % 20000 AS k, count(*) FROM big GROUP BY k ORDER BY k
+----
+
+query I
+SELECT hits FROM recycler_entries() WHERE rows = 20000
+----
+4

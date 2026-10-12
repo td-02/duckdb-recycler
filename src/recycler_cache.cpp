@@ -127,25 +127,18 @@ void RecyclerCache::NoteHit(CachedEntry &entry) {
 	entry.last_used = NextSequence();
 }
 
-shared_ptr<CachedEntry> RecyclerCache::PickVictim() const {
-	shared_ptr<CachedEntry> victim;
-	auto consider = [&](const shared_ptr<CachedEntry> &candidate) {
-		if (!victim || candidate->Benefit() < victim->Benefit() ||
-		    (candidate->Benefit() == victim->Benefit() && candidate->last_used < victim->last_used)) {
-			victim = candidate;
-		}
-	};
+template <class CALLBACK>
+void RecyclerCache::ForEachEntry(CALLBACK &&callback) const {
 	for (auto *map : {&whole, &subtrees, &paginations}) {
 		for (auto &entry : *map) {
-			consider(entry.second);
+			callback(entry.second);
 		}
 	}
 	for (auto &shape : blocks) {
 		for (auto &entry : shape.second) {
-			consider(entry);
+			callback(entry);
 		}
 	}
-	return victim;
 }
 
 void RecyclerCache::AddDependents(const CachedEntry &entry) {
@@ -210,16 +203,38 @@ bool RecyclerCache::MakeRoom(const CachedEntry &entry, idx_t budget_bytes) {
 	if (entry.bytes > budget_bytes) {
 		return false;
 	}
-	while (total_bytes + entry.bytes > budget_bytes) {
-		auto victim = PickVictim();
-		if (!victim) {
-			break;
-		}
-		if (victim->Benefit() > entry.Benefit()) {
-			// the cache is full of more valuable results
+	if (total_bytes + entry.bytes <= budget_bytes) {
+		return true;
+	}
+	// every victim is chosen before any is evicted, so that a store refused for want of room leaves the cache as it
+	// was. Victims go cheapest first: the lowest benefit per byte, the least recently used among equals.
+	struct Candidate {
+		double benefit;
+		idx_t last_used;
+		shared_ptr<CachedEntry> entry;
+	};
+	vector<Candidate> candidates;
+	ForEachEntry([&](const shared_ptr<CachedEntry> &candidate) {
+		candidates.push_back(Candidate {candidate->Benefit(), candidate->last_used.load(), candidate});
+	});
+	std::sort(candidates.begin(), candidates.end(), [](const Candidate &a, const Candidate &b) {
+		return a.benefit < b.benefit || (a.benefit == b.benefit && a.last_used < b.last_used);
+	});
+	auto benefit = entry.Benefit();
+	auto needed = total_bytes + entry.bytes - budget_bytes;
+	idx_t freed = 0;
+	idx_t victims = 0;
+	for (; victims < candidates.size() && freed < needed; victims++) {
+		if (candidates[victims].benefit > benefit) {
+			// the room is held by more valuable results
 			return false;
 		}
-		Erase(*victim);
+		freed += candidates[victims].entry->bytes;
+	}
+	// the accounting is the sum of the entries' bytes, and the entry fits an empty cache
+	D_ASSERT(freed >= needed);
+	for (idx_t i = 0; i < victims; i++) {
+		Erase(*candidates[i].entry);
 		stats.evictions++;
 	}
 	return true;
@@ -513,16 +528,7 @@ vector<shared_ptr<CachedEntry>> RecyclerCache::LookupBlocks(const SigHash &hash)
 void RecyclerCache::Clear() {
 	std::lock_guard<std::mutex> guard(lock);
 	// a reader may hold an entry it is still confirming: it must not be served once the cache dropped it (IsCurrentFor)
-	for (auto map : {&whole, &subtrees, &paginations}) {
-		for (auto &entry : *map) {
-			entry.second->published = false;
-		}
-	}
-	for (auto &shape : blocks) {
-		for (auto &entry : shape.second) {
-			entry->published = false;
-		}
-	}
+	ForEachEntry([](const shared_ptr<CachedEntry> &entry) { entry->published = false; });
 	whole.clear();
 	subtrees.clear();
 	paginations.clear();
