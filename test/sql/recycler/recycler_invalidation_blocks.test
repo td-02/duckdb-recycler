@@ -1,7 +1,8 @@
 # name: test/sql/recycler/recycler_invalidation_blocks.test
 # description: subsumption blocks follow the table versions like every other entry: a block is not served while
 # another connection writes one of its tables, no block is planted then, a commit to any of its tables evicts it, and
-# a block store the budget refuses after evicting the other blocks of its shape leaves a consistent cache
+# a block store the budget refuses evicts nothing, while the cheaper block of its shape still makes room for the
+# statement's other results
 # group: [recycler]
 
 require waddle
@@ -150,8 +151,8 @@ SELECT value FROM recycler_stats() WHERE name = 'subsumption_hits'
 2
 
 # ---------------------------------------------------------------------------
-# (d) under a tight budget, a block store first evicts the cheaper block of its own shape and is then refused by
-# the more valuable entries: the refusal reads nothing of the evicted shape
+# (d) under a tight budget, a block store that would need the more valuable entries' room as well as the cheaper
+# block of its own shape is refused and evicts nothing; the statement's own small results then evict that block
 # ---------------------------------------------------------------------------
 statement ok con1
 PRAGMA recycler_clear;
@@ -217,7 +218,9 @@ statement ok con1
 SET recycler_budget_mb = 1;
 
 # the block over y in 2016..2019 (768 KiB) has the shape of the stored one and does not fit next to the compacted
-# small results (0.5 MiB): its store evicts the stored block and is refused by the next victim
+# small results (0.5 MiB) even once the stored block is gone: its store is refused (MakeRoom evicts nothing when it
+# cannot make room). The statement's whole result and subtree, worth more per byte than the stored block and fitting
+# once it is gone, evict it.
 query II con1
 SELECT g, count(*) AS c FROM t JOIN d ON t.g = d.id JOIN k ON k.id = t.g WHERE y BETWEEN 2016 AND 2019 AND d.id < 3 GROUP BY g ORDER BY g
 ----
