@@ -327,6 +327,10 @@ private:
 	void AddDependents(const CachedEntry &entry);
 	//! Puts an entry into its map (BLOCK: its shape's list), the accounting and `dependents` (caller holds the lock)
 	void Publish(const shared_ptr<CachedEntry> &entry);
+	//! What every store does once its kind's own checks passed (caller holds the lock): refused under a newer table
+	//! version, then room is made, the entry stamped, published and counted. `replaced`, an entry of the same key the
+	//! new one supersedes, leaves the cache while room is made and is restored when there is none.
+	bool Insert(const shared_ptr<CachedEntry> &entry, idx_t budget_bytes, const shared_ptr<CachedEntry> &replaced);
 	//! IsCurrent for a reader whose dependencies are `reader_at(0..reader_count)`, paired with the entry's by position
 	template <class READER_AT>
 	bool IsCurrentFor(const CachedEntry &entry, idx_t reader_count, READER_AT &&reader_at);
