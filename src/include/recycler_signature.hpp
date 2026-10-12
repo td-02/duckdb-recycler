@@ -35,9 +35,14 @@ namespace duckdb {
 
 class ClientContext;
 class Expression;
+class LogicalAggregate;
+class LogicalColumnDataGet;
 class LogicalComparisonJoin;
+class LogicalFilter;
 class LogicalGet;
+class LogicalLimit;
 class TableCatalogEntry;
+struct BoundOrderByNode;
 
 //! 128-bit compositional hash of a subtree
 struct SigHash {
@@ -207,7 +212,22 @@ private:
 	void RenderExpression(const Expression &expr, const Frame &frame, Sink &sink, NodeInfo &info) const;
 	void RenderBinding(ColumnBinding binding, const Frame &frame, Sink &sink, NodeInfo &info) const;
 	void RenderOwnIndex(idx_t table_index, const Frame &frame, Sink &sink) const;
+	//! The length of `expressions`, then each of them
+	void RenderExpressions(const vector<unique_ptr<Expression>> &expressions, const Frame &frame, Sink &sink,
+	                       NodeInfo &info) const;
+	//! Whether `expr` is set, then it when it is
+	void RenderOptionalExpression(const unique_ptr<Expression> &expr, const Frame &frame, Sink &sink,
+	                              NodeInfo &info) const;
+	//! The length of `orders`, then the direction, NULL order and expression of each
+	void RenderOrders(const vector<BoundOrderByNode> &orders, const Frame &frame, Sink &sink, NodeInfo &info) const;
+	//! The operator-specific part of RenderNode for the operators with more than a few fields
 	void RenderJoin(const LogicalComparisonJoin &join, const Frame &frame, Sink &sink, NodeInfo &info) const;
+	void RenderGet(const LogicalGet &get, const Frame &frame, Sink &sink, NodeInfo &info) const;
+	void RenderAggregate(const LogicalAggregate &aggr, const Frame &frame, Sink &sink, NodeInfo &info) const;
+	void RenderFilter(const LogicalFilter &filter, const Frame &frame, Sink &sink, NodeInfo &info) const;
+	void RenderLimit(const LogicalLimit &limit, Sink &sink, NodeInfo &info) const;
+	void RenderColumnDataGet(const LogicalColumnDataGet &get, const Frame &frame, Sink &sink, NodeInfo &info) const;
+	void RenderRecyclerOperator(const LogicalOperator &op, const Frame &frame, Sink &sink, NodeInfo &info) const;
 	void CollectDynamicOwners(LogicalOperator &op);
 	//! Identity of a binding that refers to a scan of the analyzed (sub)tree
 	ColumnIdentity IdentityOf(ColumnBinding binding) const;
