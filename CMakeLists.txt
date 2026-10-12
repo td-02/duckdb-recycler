@@ -15,8 +15,12 @@ set(EXTENSION_SOURCES
     src/recycler_policy.cpp        # serving and admission decisions
     src/recycler_rewrite.cpp       # plan rewrites: scan substitution, materialize wrapping, block finalization
     src/recycler_exists.cpp        # correlated EXISTS subqueries as plain joins the join order optimizer places
-    src/recycler_hooks.cpp         # pre-/post-optimizer passes: matching, admission, rewrites
-    src/recycler_functions.cpp     # settings, recycler_stats()/recycler_entries(), PRAGMA recycler_clear
+    src/recycler_hooks.cpp         # pre-/post-optimizer hooks: statement classification, whole results, ordering
+    src/recycler_settings.cpp      # the connection's copy of the recycler's settings
+    src/recycler_subsumption.cpp   # predicate / column subsumption on SPJ blocks
+    src/recycler_pagination.cpp    # LIMIT/OFFSET pages over one sorted result
+    src/recycler_subtrees.cpp      # the post hook's subtree cache
+    src/recycler_functions.cpp     # setting registration, recycler_stats()/recycler_entries(), PRAGMA recycler_clear
 )
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})

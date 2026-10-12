@@ -4,10 +4,19 @@
 //===----------------------------------------------------------------------===//
 #include "recycler_operators.hpp"
 
+#include "duckdb/planner/column_binding_map.hpp"
+
+#include <unordered_set>
+
 namespace duckdb {
 
 class Binder;
 class ColumnBindingReplacer;
+
+using binding_set_t = std::unordered_set<ColumnBinding, ColumnBindingHashFunction, ColumnBindingEquality>;
+
+//! Appends every column binding `expr` references
+void CollectBindings(const Expression &expr, vector<ColumnBinding> &out);
 
 //! Replace the operator in `slot`, which scans `tables`, by a scan over `entry`, recording the binding
 //! replacements. False when the entry's columns do not match the operator's output.

@@ -6,6 +6,7 @@
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_distinct.hpp"
 #include "duckdb/planner/operator/logical_empty_result.hpp"
@@ -16,6 +17,13 @@
 #include <unordered_map>
 
 namespace duckdb {
+
+void CollectBindings(const Expression &expr, vector<ColumnBinding> &out) {
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+		out.push_back(expr.Cast<BoundColumnRefExpression>().binding);
+	}
+	ExpressionIterator::EnumerateChildren(expr, [&](const Expression &child) { CollectBindings(child, out); });
+}
 
 bool SubstituteScan(unique_ptr<LogicalOperator> &slot, shared_ptr<CachedEntry> entry, bool ordered,
                     const vector<reference<const TableCatalogEntry>> &tables, Binder &binder,
