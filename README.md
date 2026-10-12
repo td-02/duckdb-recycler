@@ -149,7 +149,8 @@ Something went wrong while the script tried to push the changes to the repositor
 ## The query recycler (this repository's extension)
 
 The extension keeps the template's `waddle` scalar function and adds a query recycler that runs as an
-optimizer extension with two hooks (`src/recycler_hooks.cpp`):
+optimizer extension with two hooks (`src/recycler_hooks.cpp`, which classifies the statement and orders the
+passes in `src/recycler_subsumption.cpp`, `src/recycler_pagination.cpp` and `src/recycler_subtrees.cpp`):
 
 * **Pre-optimize** (bound plan, before any built-in optimizer). The plan gets a canonical structural
   signature (`src/recycler_signature.cpp`: table indexes renumbered in pre-order, every operator and

@@ -43,7 +43,7 @@ M5 already skipped the joins of later pages (block hits) but each page still re-
   type) gets a different key. The session's result-affecting settings (the salt, `PlanSignatures::SettingsSalt`, that
   every other key carries) are part of it, so a page is never served rows computed under other values.
 - **Prefix materialization.** Entries have their own kind, `PAGINATION`, in a separate cache map, so no generic
-  `SUBTREE` lookup can see them; only `TryPagination` (post hook) looks them up. The writer stores the first
+  `SUBTREE` lookup can see them; only `RewritePagination` (post hook) looks them up. The writer stores the first
   `4 × (offset + limit)` sorted rows and stops the sort's output there (`SinkResultType::FINISHED`; whole chunks are
   appended, so a prefix may overshoot by one chunk). `CachedEntry::complete` says whether `rows` is the whole result (the
   input ended first) or a prefix. A page hits only when `complete || offset + limit ≤ rows`. A page that needs more than
@@ -144,7 +144,11 @@ Worth keeping: the registration skeleton, the `LogicalExtensionOperator::CreateP
 | `recycler_rewrite.{hpp,cpp}` | hit substitution (`ColumnBindingReplacer`), residual filter/projection compensation, post-rewrite self-check |
 | `logical_recycler_materialize.*` / `physical_recycler_materialize.*` | miss-path writer: sink+source, parallel / sequential / batch-index modes |
 | `logical_recycler_scan.*` / `physical_recycler_scan.*` | hit-path scan over a cached collection, `EXTENSION` type, ordered/unordered |
-| `recycler_hooks.cpp` | `pre_optimize_function` and `optimize_function` |
+| `recycler_hooks.cpp` | `pre_optimize_function` and `optimize_function`: statement classification, whole-result serve/write, nested blocks, the order of the passes |
+| `recycler_settings.cpp` | the connection's copy of the recycler settings (`LoadRecyclerSettings`) |
+| `recycler_subsumption.{hpp,cpp}` | pre hook: SPJ blocks served from wider cached blocks, block markers on admissible misses |
+| `recycler_pagination.{hpp,cpp}` | pagination: total-order proof and key on the bound plan, prefix serve/write in the post hook |
+| `recycler_subtrees.{hpp,cpp}` | post hook: subtree hits and materializations, one per root-to-leaf path |
 | `recycler_exists.{hpp,cpp}` | correlated `EXISTS` subqueries as plain joins the join order optimizer places (§3.9); runs at the end of the pre hook, independent of the cache |
 | delete | `recycler_extension.cpp/.hpp` (second entry point), `join_utils.*`, `logical_cache_writer.*`, `physical_cache_writer.*` |
 
