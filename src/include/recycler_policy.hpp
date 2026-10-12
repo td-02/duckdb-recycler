@@ -10,6 +10,9 @@ namespace duckdb {
 class ClientContext;
 
 //! Operators whose output the subtree cache considers (joins and aggregates: the expensive, recurring units)
+//! The row cap of an entry: below a delim join's LHS, whose input is the join's whole outer side, a smaller one
+idx_t EntryCapRows(const RecyclerSettings &settings, bool under_delim_lhs);
+
 bool IsSubtreeCandidateType(LogicalOperatorType type);
 bool IsAggregation(LogicalOperatorType type);
 

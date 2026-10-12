@@ -5,6 +5,7 @@
 // the post hook's subtree walker keys, serves and writes the sorted prefix with the helpers below.
 //===----------------------------------------------------------------------===//
 #include "recycler_pagination.hpp"
+#include "recycler_policy.hpp"
 #include "recycler_rewrite.hpp"
 
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -28,19 +29,28 @@ namespace duckdb {
 //===----------------------------------------------------------------------===//
 // Pagination: a sorted prefix may only be replayed for later pages when the ORDER BY is a total order
 //===----------------------------------------------------------------------===//
-//! LIMIT + OFFSET above which DuckDB keeps ORDER BY + LIMIT instead of a Top-N (topn_optimizer.cpp): only then does
-//! sorting the whole input pay for later pages
+//! LIMIT + OFFSET above which DuckDB may keep ORDER BY + LIMIT instead of a Top-N (topn_optimizer.cpp, which also
+//! requires the limit to exceed 0.7% of the input's estimated cardinality): only then does sorting the whole input pay
+//! for later pages. A plan whose optimizer chose a Top-N anyway has no ORDER_BY under its LIMIT and is not matched.
 static constexpr idx_t PAGINATION_MIN_ROWS = 5000;
 //! A pagination stores this many times the rows the current page needs, so that the following pages hit
 static constexpr idx_t PAGINATION_PREFIX_FACTOR = 4;
+//! Bounds of the walks below (fail closed beyond them): compress/decompress wrappers around one column, and
+//! operators followed down the plan
+static constexpr idx_t MAX_WRAPPER_DEPTH = 8;
+static constexpr idx_t MAX_PLAN_DEPTH = 64;
 
 static idx_t SaturatingMultiply(idx_t value, idx_t factor) {
 	return value > NumericLimits<idx_t>::Maximum() / factor ? NumericLimits<idx_t>::Maximum() : value * factor;
 }
 
+static idx_t SaturatingAdd(idx_t a, idx_t b) {
+	return a > NumericLimits<idx_t>::Maximum() - b ? NumericLimits<idx_t>::Maximum() : a + b;
+}
+
 //! The plain column behind an expression, seeing through DuckDB's lossless compress/decompress wrappers
 static bool ResolvePlainColumn(const Expression &expr, ColumnBinding &result, idx_t depth = 0) {
-	if (depth > 8) {
+	if (depth > MAX_WRAPPER_DEPTH) {
 		return false;
 	}
 	if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
@@ -61,7 +71,7 @@ static bool ResolvePlainColumn(const Expression &expr, ColumnBinding &result, id
 //! small proof: primary keys of base tables, carried through filters, projections of plain columns, aggregate group
 //! keys and joins that cannot multiply the rows of the side the keys come from. Anything else is "not proven".
 static bool UniqueOn(LogicalOperator &op, const binding_set_t &keys, idx_t depth) {
-	if (keys.empty() || depth > 64) {
+	if (keys.empty() || depth > MAX_PLAN_DEPTH) {
 		return false;
 	}
 	switch (op.type) {
@@ -197,7 +207,7 @@ static bool OrderKeysAreUnique(LogicalOrder &order) {
 
 //! `LIMIT n OFFSET m` with constants, n + m above the Top-N threshold, over an ORDER BY reached through
 //! order-preserving projections/filters. Returns the slot of the ORDER_BY, or nullptr.
-unique_ptr<LogicalOperator> *MatchPagination(LogicalOperator &op, idx_t &limit_rows, idx_t &offset_rows) {
+static unique_ptr<LogicalOperator> *MatchPagination(LogicalOperator &op, idx_t &limit_rows, idx_t &offset_rows) {
 	if (op.type != LogicalOperatorType::LOGICAL_LIMIT || op.children.size() != 1) {
 		return nullptr;
 	}
@@ -208,9 +218,7 @@ unique_ptr<LogicalOperator> *MatchPagination(LogicalOperator &op, idx_t &limit_r
 	}
 	limit_rows = limit.limit_val.GetConstantValue();
 	offset_rows = limit.offset_val.Type() == LimitNodeType::CONSTANT_VALUE ? limit.offset_val.GetConstantValue() : 0;
-	auto total = offset_rows > NumericLimits<idx_t>::Maximum() - limit_rows ? NumericLimits<idx_t>::Maximum()
-	                                                                        : limit_rows + offset_rows;
-	if (total <= PAGINATION_MIN_ROWS) {
+	if (SaturatingAdd(limit_rows, offset_rows) <= PAGINATION_MIN_ROWS) {
 		return nullptr;
 	}
 	auto order_slot = &op.children[0];
@@ -244,7 +252,7 @@ idx_t CountPaginationSites(LogicalOperator &op, LogicalOperator **first) {
 }
 
 //! Direction and NULL order of every ORDER BY key
-string OrderSpec(const LogicalOrder &order) {
+static string OrderSpec(const LogicalOrder &order) {
 	string result;
 	for (auto &node : order.orders) {
 		result += char('0' + static_cast<uint8_t>(node.type));
@@ -268,7 +276,7 @@ static string UnitLayout(const LogicalOrder &order, const LogicalOperator &unit)
 
 //! The cache key of a pagination: the bound ORDER BY subtree, which of its output columns the query demands, and the
 //! layout the optimized unit actually materializes. Both the hash and the canonical string cover all of it.
-string PaginationCanonical(const PaginationSite &site, const LogicalOrder &order, const LogicalOperator &unit) {
+static string PaginationCanonical(const PaginationSite &site, const LogicalOrder &order, const LogicalOperator &unit) {
 	string result = site.canonical;
 	result += "\x1f"
 	          "demanded";
@@ -285,7 +293,7 @@ string PaginationCanonical(const PaginationSite &site, const LogicalOrder &order
 //! an existing shorter prefix (geometric growth), clamped to `cap_rows` (less one chunk, because the sink appends
 //! whole chunks) and to what `cap_bytes` holds at `row_width` bytes per row. A result below `need` means the prefix
 //! cannot even cover the page.
-idx_t PrefixRows(idx_t need, idx_t existing_rows, idx_t cap_rows, idx_t cap_bytes, idx_t row_width) {
+static idx_t PrefixRows(idx_t need, idx_t existing_rows, idx_t cap_rows, idx_t cap_bytes, idx_t row_width) {
 	auto prefix = SaturatingMultiply(need, PAGINATION_PREFIX_FACTOR);
 	if (existing_rows > 0) {
 		prefix = MaxValue(prefix, SaturatingMultiply(existing_rows, 2));
@@ -295,7 +303,7 @@ idx_t PrefixRows(idx_t need, idx_t existing_rows, idx_t cap_rows, idx_t cap_byte
 	return MinValue(prefix, MinValue(rows_cap, bytes_cap));
 }
 
-SigHash HashPaginationKey(const string &canonical) {
+static SigHash HashPaginationKey(const string &canonical) {
 	uint64_t h1 = 0xCBF29CE484222325ULL;
 	uint64_t h2 = 0x84222325CBF29CE4ULL;
 	for (unsigned char byte : canonical) {
@@ -315,7 +323,7 @@ SigHash HashPaginationKey(const string &canonical) {
 //! each column is followed down through the plan's projections (compress/decompress and whatever else an optimizer
 //! puts there) to the bound ORDER BY's input projection, which keeps its table index. False (fail closed) when a column
 //! cannot be followed there or two columns carry the same position.
-bool UnitPositions(LogicalOperator &unit, idx_t projection_index, vector<idx_t> &positions) {
+static bool UnitPositions(LogicalOperator &unit, idx_t projection_index, vector<idx_t> &positions) {
 	std::unordered_map<idx_t, LogicalProjection *> projections;
 	for (auto op = &unit;; op = op->children[0].get()) {
 		if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
@@ -336,7 +344,7 @@ bool UnitPositions(LogicalOperator &unit, idx_t projection_index, vector<idx_t> 
 	for (auto binding : unit.GetColumnBindings()) {
 		for (idx_t steps = 0; binding.table_index != projection_index; steps++) {
 			auto projection = projections.find(binding.table_index);
-			if (steps > 64 || projection == projections.end() ||
+			if (steps > MAX_PLAN_DEPTH || projection == projections.end() ||
 			    binding.column_index >= projection->second->expressions.size() ||
 			    !ResolvePlainColumn(*projection->second->expressions[binding.column_index], binding)) {
 				return false;
@@ -352,7 +360,7 @@ bool UnitPositions(LogicalOperator &unit, idx_t projection_index, vector<idx_t> 
 
 //! For each of `positions` (a consumer's columns), the stored column of `entry` that carries it. False when the entry
 //! does not hold exactly these bound ORDER BY outputs.
-bool StoredColumns(const CachedEntry &entry, const vector<idx_t> &positions, vector<idx_t> &stored) {
+static bool StoredColumns(const CachedEntry &entry, const vector<idx_t> &positions, vector<idx_t> &stored) {
 	if (entry.columns.size() != positions.size()) {
 		return false;
 	}
@@ -425,6 +433,78 @@ void DetectPagination(RecyclerClientState &client, PlanSignatures &sig, LogicalO
 	}
 	site.eligible = true;
 	client.pagination_site = std::move(site);
+}
+
+PaginationRewrite RewritePagination(PlanPass &pass, unique_ptr<LogicalOperator> &slot, const PaginationSite &site,
+                                    bool may_write, bool under_delim_lhs) {
+	idx_t limit_rows, offset_rows;
+	auto order_slot = MatchPagination(*slot, limit_rows, offset_rows);
+	if (!order_slot || limit_rows != site.limit || offset_rows != site.offset) {
+		return PaginationRewrite::NONE;
+	}
+	auto &order = (*order_slot)->Cast<LogicalOrder>();
+	if (OrderSpec(order) != site.order_spec) {
+		return PaginationRewrite::NONE;
+	}
+	// the unit is the whole order-preserving chain under the LIMIT: above the sort's decompression it emits logical
+	// types in every plan, so the entry written by one page can be replayed by the next
+	auto &unit_slot = slot->children[0];
+	auto &info = pass.sig.Get(*unit_slot);
+	if (!info.Cacheable() || !info.ordered) {
+		return PaginationRewrite::NONE;
+	}
+	// which bound ORDER BY output each column of this plan's unit carries; unprovable means no pagination
+	vector<idx_t> positions;
+	if (!UnitPositions(*unit_slot, site.projection_index, positions)) {
+		return PaginationRewrite::NONE;
+	}
+	auto canonical = PaginationCanonical(site, order, *unit_slot);
+	auto hash = HashPaginationKey(canonical);
+	// rows of the sorted result this page needs
+	auto need = SaturatingAdd(limit_rows, offset_rows);
+	idx_t existing_rows = 0;
+	auto entry = pass.cache->LookupPagination(hash, canonical, site.tables, need, existing_rows);
+	if (entry) {
+		// the entry stores the columns in the order of the plan that wrote it, this plan's unit may order them
+		// differently
+		vector<idx_t> stored;
+		if (!StoredColumns(*entry, positions, stored)) {
+			return PaginationRewrite::NONE;
+		}
+		bool in_order = true;
+		for (idx_t j = 0; j < stored.size(); j++) {
+			in_order = in_order && stored[j] == j;
+		}
+		if (in_order
+		        ? SubstituteScan(unit_slot, entry, true, info.tables, pass.binder, pass.replacer)
+		        : SubstituteReorderedScan(unit_slot, entry, true, stored, info.tables, pass.binder, pass.replacer)) {
+			pass.cache->stats.subtree_hits++;
+			pass.replaced = true;
+			return PaginationRewrite::SERVED;
+		}
+	}
+	if (!may_write || !AdmitPaginationWrite(*pass.cache, pass.settings, info, hash) ||
+	    !pass.cache->Admissible(info.tables, pass.snapshot)) {
+		return PaginationRewrite::NONE;
+	}
+	auto prefix = PrefixRows(need, existing_rows, EntryCapRows(pass.settings, under_delim_lhs),
+	                         pass.settings.entry_cap_bytes, RecyclerEstimateRowWidth(unit_slot->types));
+	if (prefix < need) {
+		// the prefix could not even cover this page: leave the query as M5 plans it
+		return PaginationRewrite::NONE;
+	}
+	auto spec = RecyclerWriteSpec::Make(RecyclerEntryKind::PAGINATION, hash, std::move(canonical), true,
+	                                    info.est_leaf_rows, site.tables, pass.settings);
+	spec.prefix_rows = prefix;
+	for (auto position : positions) {
+		ColumnIdentity column;
+		column.table = 0;
+		column.column = position;
+		spec.columns.push_back(column);
+	}
+	pass.cache->stats.writes_planned++;
+	WrapMaterialize(unit_slot, std::move(spec), pass.cache);
+	return PaginationRewrite::WRITING;
 }
 
 } // namespace duckdb

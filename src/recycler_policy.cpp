@@ -24,11 +24,18 @@ bool CanServe(const CachedEntry &entry, bool preserve_order) {
 	return entry.ordered || !preserve_order;
 }
 
+//! Rows an entry below a delim join's LHS may hold, whatever recycler_entry_cap_rows allows
+static constexpr idx_t DELIM_LHS_CAP_ROWS = 200000;
+
+idx_t EntryCapRows(const RecyclerSettings &settings, bool under_delim_lhs) {
+	return under_delim_lhs ? MinValue<idx_t>(settings.entry_cap_rows, DELIM_LHS_CAP_ROWS) : settings.entry_cap_rows;
+}
+
 //! Whether we trust the optimizer's cardinality estimate enough to materialize on first sight
 static bool SpeculationAllowed(const LogicalOperator &op, const NodeInfo &info, bool force_candidate) {
 	if (info.unreliable_estimate) {
-		// non-equality joins below make every estimate above them worthless (a self join with an inequality
-		// was 60x off in the workload); wait for a repeat before paying for a materialization
+		// non-equality joins below make every estimate above them worthless (a self join with an inequality was
+		// estimated 60x off in the IMDB benchmark); wait for a repeat before paying for a materialization
 		return false;
 	}
 	switch (op.type) {
@@ -59,8 +66,7 @@ bool AdmitSubtreeWrite(ClientContext &context, const RecyclerCache &cache, const
 	}
 	auto width = RecyclerEstimateRowWidth(op.types);
 	auto est_bytes = est_out * width;
-	auto cap_rows = under_delim_lhs ? MinValue<idx_t>(settings.entry_cap_rows, 200000) : settings.entry_cap_rows;
-	if (est_out > cap_rows || est_bytes > settings.entry_cap_bytes) {
+	if (est_out > EntryCapRows(settings, under_delim_lhs) || est_bytes > settings.entry_cap_bytes) {
 		return false;
 	}
 	auto seen_before = cache.Seen(info.hash) > 1;

@@ -89,14 +89,14 @@ static optional_ptr<TableCatalogEntry> WriteTarget(LogicalOperator &root) {
 	}
 }
 
-//! Statements that may change state the cache does not track and that modify no database the cache can stamp
-//! (ATTACH, DETACH, LOAD, ...): drop everything we cached
 //! Statements that change this connection's settings: the cached copy is dropped once they ran (QueryEnd)
 static bool IsSettingsRoot(LogicalOperatorType type) {
 	return type == LogicalOperatorType::LOGICAL_SET || type == LogicalOperatorType::LOGICAL_RESET ||
 	       type == LogicalOperatorType::LOGICAL_PRAGMA;
 }
 
+//! Statements that may change state the cache does not track and that modify no database the cache can stamp
+//! (ATTACH, DETACH, LOAD, ...): drop everything we cached
 static bool IsModifyingRoot(LogicalOperatorType type) {
 	switch (type) {
 	case LogicalOperatorType::LOGICAL_ALTER:
@@ -173,51 +173,6 @@ static unique_ptr<LogicalOperator> *FindQueryRoot(unique_ptr<LogicalOperator> &p
 	}
 	return &plan;
 }
-
-//===----------------------------------------------------------------------===//
-// Pre-optimize: nested-block hits
-//===----------------------------------------------------------------------===//
-struct BlockMatcher {
-	BlockMatcher(Binder &binder, RecyclerCache &cache, const RecyclerClientState &client, PlanSignatures &sig,
-	             bool preserve_order)
-	    : binder(binder), cache(cache), settings(client.settings), snapshot(client.snapshot), sig(sig),
-	      preserve_order(preserve_order) {
-	}
-
-	Binder &binder;
-	RecyclerCache &cache;
-	const RecyclerSettings &settings;
-	const TableSnapshot &snapshot;
-	PlanSignatures &sig;
-	bool preserve_order;
-	ColumnBindingReplacer replacer;
-	bool replaced = false;
-
-	void Walk(unique_ptr<LogicalOperator> &slot) {
-		auto &op = *slot;
-		if (AsRecyclerOperator(op)) {
-			return;
-		}
-		auto consumer = CteConsumerSlot(op);
-		if (consumer) {
-			Walk(*consumer);
-			return;
-		}
-		auto &info = sig.Get(op);
-		if (info.Cacheable() && info.est_leaf_rows >= settings.min_input_rows && op.children.size() > 0) {
-			auto entry = cache.Lookup(RecyclerEntryKind::WHOLE_RESULT, info, sig, op, snapshot);
-			if (entry && CanServe(*entry, preserve_order) &&
-			    SubstituteScan(slot, entry, entry->ordered, info.tables, binder, replacer)) {
-				cache.stats.block_hits++;
-				replaced = true;
-				return;
-			}
-		}
-		for (auto &child : op.children) {
-			Walk(child);
-		}
-	}
-};
 
 //===----------------------------------------------------------------------===//
 // Pre-optimize: the hook
@@ -309,20 +264,32 @@ static bool ServeOrPlanWholeResult(OptimizerExtensionInput &input, unique_ptr<Lo
 
 //! Nested blocks: sub-queries below the root that equal an earlier whole query
 static void ServeNestedBlocks(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan, LogicalOperator &root,
-                              RecyclerCache &cache, const RecyclerClientState &client, PlanSignatures &sig,
+                              RecyclerState &state, const RecyclerClientState &client, PlanSignatures &sig,
                               bool preserve_order) {
-	BlockMatcher matcher(input.optimizer.binder, cache, client, sig, preserve_order);
+	PlanPass pass(input.context, input.optimizer.binder, state.cache, client.settings, sig, client.snapshot);
+	auto serve = [&](unique_ptr<LogicalOperator> &slot) {
+		auto &op = *slot;
+		auto &info = sig.Get(op);
+		if (!info.Cacheable() || info.est_leaf_rows < pass.settings.min_input_rows || op.children.empty()) {
+			return false;
+		}
+		auto entry = pass.cache->Lookup(RecyclerEntryKind::WHOLE_RESULT, info, sig, op, pass.snapshot);
+		if (!entry || !CanServe(*entry, preserve_order) ||
+		    !SubstituteScan(slot, entry, entry->ordered, info.tables, pass.binder, pass.replacer)) {
+			return false;
+		}
+		pass.cache->stats.block_hits++;
+		pass.replaced = true;
+		return true;
+	};
 	for (auto &child : root.children) {
-		matcher.Walk(child);
+		WalkBoundPlan(child, serve);
 	}
-	if (matcher.replaced) {
-		matcher.replacer.VisitOperator(*plan);
-	}
+	pass.ApplyReplacements(*plan);
 }
 
 //! The cache's part of the pre hook: announcements, hits and the markers of admissible misses
-static void RecyclePreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan,
-                               RecyclerState &state) {
+static void CachePreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan, RecyclerState &state) {
 	auto &cache = *state.cache;
 	auto &context = input.context;
 	ScopedTimer timer(cache.stats.pre_ns);
@@ -368,7 +335,7 @@ static void RecyclePreOptimize(OptimizerExtensionInput &input, unique_ptr<Logica
 		}
 	}
 	if (settings.blocks) {
-		ServeNestedBlocks(input, plan, root, cache, client, sig, preserve_order);
+		ServeNestedBlocks(input, plan, root, state, client, sig, preserve_order);
 	}
 	if (settings.subsumption && !preserve_order) {
 		// block results are written by a parallel sink, so their row order is arbitrary: only usable when the
@@ -382,7 +349,7 @@ void RecyclerPreOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOpera
 	if (!state) {
 		return;
 	}
-	RecyclePreOptimize(input, plan, *state);
+	CachePreOptimize(input, plan, *state);
 	// after every key was taken and every marker planted: the keys of this statement and of the ones it may serve
 	// are those of the plan as bound, and the rewrite below is the same for every statement of a shape, so a payer
 	// and the queries it serves still render alike. Independent of the gate above: a statement the cache declines
@@ -429,7 +396,7 @@ void RecyclerOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator
 	}
 	client.active = false;
 	client.profiled = QueryProfiler::Get(context).IsEnabled();
-	auto settings = client.settings;
+	auto &settings = client.settings;
 
 	auto root_slot = FindQueryRoot(plan);
 	if (!root_slot || AsRecyclerOperator(**root_slot)) {
@@ -447,6 +414,7 @@ void RecyclerOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator
 		plan->ResolveOperatorTypes();
 		sig.Analyze(**root_slot);
 	} catch (std::exception &) {
+		cache->stats.skip_analyze_failed++;
 		client.Reset();
 		return;
 	}

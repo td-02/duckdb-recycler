@@ -4,6 +4,7 @@
 //===----------------------------------------------------------------------===//
 #include "recycler_operators.hpp"
 
+#include "duckdb/optimizer/column_binding_replacer.hpp"
 #include "duckdb/planner/column_binding_map.hpp"
 
 #include <unordered_set>
@@ -11,7 +12,8 @@
 namespace duckdb {
 
 class Binder;
-class ColumnBindingReplacer;
+class ClientContext;
+class PlanSignatures;
 
 using binding_set_t = std::unordered_set<ColumnBinding, ColumnBindingHashFunction, ColumnBindingEquality>;
 
@@ -54,5 +56,53 @@ unique_ptr<LogicalOperator> *CteConsumerSlot(LogicalOperator &op);
 //! Resolve the stored columns of every planted block marker below `slot` from its (pruned and reordered) child;
 //! a marker whose child produces no plain base column is removed again
 void ResolveBlockColumns(unique_ptr<LogicalOperator> &slot);
+
+//! What every pass over a plan works with, and the binding replacements its substitutions record: a substituted
+//! subtree gets new bindings, which the operators above it learn once the pass is done (ApplyReplacements)
+struct PlanPass {
+	PlanPass(ClientContext &context, Binder &binder, shared_ptr<RecyclerCache> cache, const RecyclerSettings &settings,
+	         PlanSignatures &sig, const TableSnapshot &snapshot)
+	    : context(context), binder(binder), cache(std::move(cache)), settings(settings), sig(sig), snapshot(snapshot) {
+	}
+
+	ClientContext &context;
+	Binder &binder;
+	shared_ptr<RecyclerCache> cache;
+	const RecyclerSettings &settings;
+	PlanSignatures &sig;
+	const TableSnapshot &snapshot;
+	ColumnBindingReplacer replacer;
+	//! Some subtree was substituted, so `replacer` holds replacements
+	bool replaced = false;
+
+	//! Rebinds every operator of `plan` that reads a substituted subtree
+	void ApplyReplacements(LogicalOperator &plan) {
+		if (replaced) {
+			replacer.VisitOperator(plan);
+		}
+	}
+};
+
+//! Visits the bound plan top-down, as the pre-optimize passes do: the recycler's own operators are skipped, a CTE is
+//! entered through its consumer side only (CteConsumerSlot), and at every other operator `visit(slot)` decides; when
+//! it returns true it handled the slot, and the subtree below is not walked
+template <class VISIT>
+void WalkBoundPlan(unique_ptr<LogicalOperator> &slot, VISIT &&visit) {
+	auto &op = *slot;
+	if (AsRecyclerOperator(op)) {
+		return;
+	}
+	auto consumer = CteConsumerSlot(op);
+	if (consumer) {
+		WalkBoundPlan(*consumer, visit);
+		return;
+	}
+	if (visit(slot)) {
+		return;
+	}
+	for (auto &child : op.children) {
+		WalkBoundPlan(child, visit);
+	}
+}
 
 } // namespace duckdb

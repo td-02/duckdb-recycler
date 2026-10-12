@@ -9,7 +9,6 @@
 #include "recycler_policy.hpp"
 #include "recycler_rewrite.hpp"
 
-#include "duckdb/optimizer/column_binding_replacer.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -60,51 +59,37 @@ public:
 	bool opaque_parent = false;
 };
 
-struct SubsumptionPass {
+struct SubsumptionPass : PlanPass {
 	SubsumptionPass(ClientContext &context, Binder &binder, shared_ptr<RecyclerCache> cache,
 	                const RecyclerSettings &settings, PlanSignatures &sig, const TableSnapshot &snapshot,
 	                LogicalOperator &plan)
-	    : context(context), binder(binder), cache(std::move(cache)), settings(settings), sig(sig), snapshot(snapshot),
-	      plan(plan) {
+	    : PlanPass(context, binder, std::move(cache), settings, sig, snapshot), plan(plan) {
 	}
 
-	ClientContext &context;
-	Binder &binder;
-	shared_ptr<RecyclerCache> cache;
-	const RecyclerSettings &settings;
-	PlanSignatures &sig;
-	const TableSnapshot &snapshot;
+	//! The whole plan, whose references outside a block decide which of the block's columns a hit must provide
 	LogicalOperator &plan;
-	ColumnBindingReplacer replacer;
-	bool replaced = false;
 
-	void Walk(unique_ptr<LogicalOperator> &slot) {
+	//! At an SPJ block (a cacheable FILTER whose shape ComputeBlockShape recognizes): serve it from a wider cached
+	//! block, or plant a marker on an admissible miss. True when the slot was handled.
+	bool Visit(unique_ptr<LogicalOperator> &slot) {
 		auto &op = *slot;
-		if (AsRecyclerOperator(op)) {
-			return;
+		if (op.type != LogicalOperatorType::LOGICAL_FILTER || !sig.Get(op).Cacheable()) {
+			return false;
 		}
-		auto consumer = CteConsumerSlot(op);
-		if (consumer) {
-			Walk(*consumer);
-			return;
+		auto shape = ComputeBlockShape(context, op, sig);
+		if (!shape.ok) {
+			return false;
 		}
-		if (op.type == LogicalOperatorType::LOGICAL_FILTER && sig.Get(op).Cacheable()) {
-			auto shape = ComputeBlockShape(context, op, sig);
-			if (shape.ok) {
-				auto &tables = sig.Get(op).tables;
-				if (TryHit(slot, shape, tables)) {
-					replaced = true;
-					return;
-				}
-				if (AdmitBlockWrite(*cache, settings, shape) && cache->Admissible(tables, snapshot)) {
-					Plant(slot, shape);
-					return;
-				}
-			}
+		auto &tables = sig.Get(op).tables;
+		if (TryHit(slot, shape, tables)) {
+			replaced = true;
+			return true;
 		}
-		for (auto &child : op.children) {
-			Walk(child);
+		if (AdmitBlockWrite(*cache, settings, shape) && cache->Admissible(tables, snapshot)) {
+			Plant(slot, shape);
+			return true;
 		}
+		return false;
 	}
 
 	void Plant(unique_ptr<LogicalOperator> &slot, BlockShape &shape) {
@@ -259,10 +244,8 @@ void ServeSubsumedBlocks(OptimizerExtensionInput &input, unique_ptr<LogicalOpera
                          const RecyclerClientState &client, PlanSignatures &sig) {
 	SubsumptionPass pass(input.context, input.optimizer.binder, state.cache, client.settings, sig, client.snapshot,
 	                     *plan);
-	pass.Walk(root_slot);
-	if (pass.replaced) {
-		pass.replacer.VisitOperator(*plan);
-	}
+	WalkBoundPlan(root_slot, [&](unique_ptr<LogicalOperator> &slot) { return pass.Visit(slot); });
+	pass.ApplyReplacements(*plan);
 }
 
 } // namespace duckdb

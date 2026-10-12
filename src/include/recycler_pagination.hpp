@@ -2,29 +2,34 @@
 //===----------------------------------------------------------------------===//
 // recycler_pagination.hpp - LIMIT/OFFSET pages over one sorted result (M6)
 //===----------------------------------------------------------------------===//
+#include "recycler_rewrite.hpp"
 #include "recycler_state.hpp"
-#include "recycler_signature.hpp"
 
 namespace duckdb {
 
-class LogicalOrder;
+class PlanSignatures;
 
-//! Pre hook: records the bound plan's single eligible pagination in `client.pagination_site`
+//! Pre hook: records the bound plan's single eligible pagination in `client.pagination_site`. Its key and its
+//! total-order proof come from the bound plan, before any rewrite changes what lies below the ORDER BY.
 void DetectPagination(RecyclerClientState &client, PlanSignatures &sig, LogicalOperator &root);
+
 //! Number of pagination sites below `op`; `first` receives the first LIMIT found
 idx_t CountPaginationSites(LogicalOperator &op, LogicalOperator **first);
-//! The slot of the ORDER BY under a pagination LIMIT `op`, with its constants; nullptr when `op` is none
-unique_ptr<LogicalOperator> *MatchPagination(LogicalOperator &op, idx_t &limit_rows, idx_t &offset_rows);
-//! Direction and NULL order of every ORDER BY key
-string OrderSpec(const LogicalOrder &order);
-//! The cache key of a pagination whose optimized unit is `unit`
-string PaginationCanonical(const PaginationSite &site, const LogicalOrder &order, const LogicalOperator &unit);
-SigHash HashPaginationKey(const string &canonical);
-//! The bound ORDER BY output each column of the optimized `unit` carries; false when not provable
-bool UnitPositions(LogicalOperator &unit, idx_t projection_index, vector<idx_t> &positions);
-//! The stored column of `entry` carrying each of `positions`; false when the entry holds other columns
-bool StoredColumns(const CachedEntry &entry, const vector<idx_t> &positions, vector<idx_t> &stored);
-//! Rows of the sorted result to store for a page that needs `need` leading rows
-idx_t PrefixRows(idx_t need, idx_t existing_rows, idx_t cap_rows, idx_t cap_bytes, idx_t row_width);
+
+//! What RewritePagination did at a LIMIT
+enum class PaginationRewrite : uint8_t {
+	//! The LIMIT is not the site, or its sorted prefix is neither served nor written: the subtree walk goes on
+	NONE,
+	//! The unit below the LIMIT now scans a cached prefix
+	SERVED,
+	//! The unit below the LIMIT is wrapped in a writer of its sorted prefix (slot -> LIMIT -> writer -> unit)
+	WRITING
+};
+
+//! Post hook, at the LIMIT in `slot`: the sorted rows below the pagination site's LIMIT are the same for every page,
+//! so they are the cache unit and every page only skips and scans its own slice. The key comes from the bound plan
+//! (`site`); the optimized ORDER_BY must still be that site. A write is planned only when `may_write`.
+PaginationRewrite RewritePagination(PlanPass &pass, unique_ptr<LogicalOperator> &slot, const PaginationSite &site,
+                                    bool may_write, bool under_delim_lhs);
 
 } // namespace duckdb
