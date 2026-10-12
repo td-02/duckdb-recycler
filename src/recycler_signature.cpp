@@ -89,6 +89,28 @@ public:
 		U64(h.h1);
 		U64(h.h2);
 	}
+	//! A list of indexes (a projection map, column ids, a grouping set), its length first
+	template <class LIST>
+	void Indexes(const LIST &list) {
+		U64(list.size());
+		for (auto idx : list) {
+			U64(idx);
+		}
+	}
+	//! A list of types, its length first
+	void Types(const vector<LogicalType> &types) {
+		U64(types.size());
+		for (auto &type : types) {
+			Str(type.ToString());
+		}
+	}
+	//! A list of strings, its length first
+	void Strings(const vector<string> &strings) {
+		U64(strings.size());
+		for (auto &str : strings) {
+			Str(str);
+		}
+	}
 };
 
 class PlanSignatures::HashSink : public PlanSignatures::Sink {
@@ -544,10 +566,7 @@ void PlanSignatures::RenderExpression(const Expression &expr, const Frame &frame
 		RefuseFunction(func, info);
 		sink.Str(func.function.name);
 		sink.Bool(func.is_operator);
-		sink.U64(func.children.size());
-		for (auto &child : func.children) {
-			RenderExpression(*child, frame, sink, info);
-		}
+		RenderExpressions(func.children, frame, sink, info);
 		RenderBindData(func, func.function, func.bind_info, sink, info);
 		break;
 	}
@@ -558,22 +577,11 @@ void PlanSignatures::RenderExpression(const Expression &expr, const Frame &frame
 		}
 		sink.Str(aggr.function.name);
 		sink.U8(static_cast<uint8_t>(aggr.aggr_type));
-		sink.U64(aggr.children.size());
-		for (auto &child : aggr.children) {
-			RenderExpression(*child, frame, sink, info);
-		}
-		sink.Bool(aggr.filter != nullptr);
-		if (aggr.filter) {
-			RenderExpression(*aggr.filter, frame, sink, info);
-		}
+		RenderExpressions(aggr.children, frame, sink, info);
+		RenderOptionalExpression(aggr.filter, frame, sink, info);
 		sink.Bool(aggr.order_bys != nullptr);
 		if (aggr.order_bys) {
-			sink.U64(aggr.order_bys->orders.size());
-			for (auto &order : aggr.order_bys->orders) {
-				sink.U8(static_cast<uint8_t>(order.type));
-				sink.U8(static_cast<uint8_t>(order.null_order));
-				RenderExpression(*order.expression, frame, sink, info);
-			}
+			RenderOrders(aggr.order_bys->orders, frame, sink, info);
 		}
 		RenderBindData(aggr, aggr.function, aggr.bind_info, sink, info);
 		break;
@@ -591,19 +599,11 @@ void PlanSignatures::RenderExpression(const Expression &expr, const Frame &frame
 		break;
 	}
 	case ExpressionClass::BOUND_CONJUNCTION: {
-		auto &conj = expr.Cast<BoundConjunctionExpression>();
-		sink.U64(conj.children.size());
-		for (auto &child : conj.children) {
-			RenderExpression(*child, frame, sink, info);
-		}
+		RenderExpressions(expr.Cast<BoundConjunctionExpression>().children, frame, sink, info);
 		break;
 	}
 	case ExpressionClass::BOUND_OPERATOR: {
-		auto &op = expr.Cast<BoundOperatorExpression>();
-		sink.U64(op.children.size());
-		for (auto &child : op.children) {
-			RenderExpression(*child, frame, sink, info);
-		}
+		RenderExpressions(expr.Cast<BoundOperatorExpression>().children, frame, sink, info);
 		break;
 	}
 	case ExpressionClass::BOUND_CASE: {
@@ -635,6 +635,32 @@ void PlanSignatures::RenderExpression(const Expression &expr, const Frame &frame
 	}
 }
 
+void PlanSignatures::RenderExpressions(const vector<unique_ptr<Expression>> &expressions, const Frame &frame,
+                                       Sink &sink, NodeInfo &info) const {
+	sink.U64(expressions.size());
+	for (auto &expr : expressions) {
+		RenderExpression(*expr, frame, sink, info);
+	}
+}
+
+void PlanSignatures::RenderOptionalExpression(const unique_ptr<Expression> &expr, const Frame &frame, Sink &sink,
+                                              NodeInfo &info) const {
+	sink.Bool(expr != nullptr);
+	if (expr) {
+		RenderExpression(*expr, frame, sink, info);
+	}
+}
+
+void PlanSignatures::RenderOrders(const vector<BoundOrderByNode> &orders, const Frame &frame, Sink &sink,
+                                  NodeInfo &info) const {
+	sink.U64(orders.size());
+	for (auto &order : orders) {
+		sink.U8(static_cast<uint8_t>(order.type));
+		sink.U8(static_cast<uint8_t>(order.null_order));
+		RenderExpression(*order.expression, frame, sink, info);
+	}
+}
+
 //===----------------------------------------------------------------------===//
 // Operators
 //===----------------------------------------------------------------------===//
@@ -647,30 +673,187 @@ void PlanSignatures::RenderJoin(const LogicalComparisonJoin &join, const Frame &
 		RenderExpression(*cond.left, frame, sink, info);
 		RenderExpression(*cond.right, frame, sink, info);
 	}
-	sink.U64(join.left_projection_map.size());
-	for (auto idx : join.left_projection_map) {
-		sink.U64(idx);
-	}
-	sink.U64(join.right_projection_map.size());
-	for (auto idx : join.right_projection_map) {
-		sink.U64(idx);
-	}
+	sink.Indexes(join.left_projection_map);
+	sink.Indexes(join.right_projection_map);
 	if (join.join_type == JoinType::MARK) {
 		RenderOwnIndex(join.mark_index, frame, sink);
 	}
-	sink.U64(join.mark_types.size());
-	for (auto &type : join.mark_types) {
-		sink.Str(type.ToString());
-	}
-	sink.U64(join.duplicate_eliminated_columns.size());
-	for (auto &expr : join.duplicate_eliminated_columns) {
-		RenderExpression(*expr, frame, sink, info);
-	}
+	sink.Types(join.mark_types);
+	RenderExpressions(join.duplicate_eliminated_columns, frame, sink, info);
 	sink.Bool(join.delim_flipped);
-	sink.Bool(join.predicate != nullptr);
-	if (join.predicate) {
-		RenderExpression(*join.predicate, frame, sink, info);
+	RenderOptionalExpression(join.predicate, frame, sink, info);
+}
+
+void PlanSignatures::RenderGet(const LogicalGet &get, const Frame &frame, Sink &sink, NodeInfo &info) const {
+	auto table = get.GetTable();
+	if (!table) {
+		Refuse(info, RefusalReason::TABLE_FUNCTION);
+		return;
 	}
+	if (table->temporary) {
+		// a temp table is private to its connection: two connections with a same-named, same-shaped temp table are
+		// keyed alike (temp.main.t) but hold different rows
+		Refuse(info, RefusalReason::TEMPORARY_TABLE);
+	} else if (!table->catalog.IsDuckCatalog()) {
+		// tables of attached foreign catalogs (SQLite, Postgres, ...) change outside DuckDB's transactions, so no
+		// invalidation signal exists for them
+		Refuse(info, RefusalReason::FOREIGN_CATALOG);
+	}
+	if (get.extra_info.sample_options) {
+		Refuse(info, RefusalReason::SAMPLED_SCAN);
+		info.nondeterministic = true;
+	}
+	if (!get.projected_input.empty() || !get.children.empty() || get.ordinality_idx.IsValid() ||
+	    get.row_group_order_options) {
+		Refuse(info, RefusalReason::SCAN_OPTIONS);
+	}
+	RenderOwnIndex(get.table_index, frame, sink);
+	sink.Str(get.function.name);
+	sink.Str(table->catalog.GetName());
+	sink.Str(table->schema.name);
+	sink.Str(table->name);
+	if (!shape_mode) {
+		// the shape of a block does not depend on which columns a query happens to reference
+		sink.U64(get.GetColumnIds().size());
+		for (auto &col : get.GetColumnIds()) {
+			RenderColumnIndex(col, sink);
+		}
+		sink.Indexes(get.projection_ids);
+	}
+	sink.U64(get.table_filters.filters.size());
+	for (auto &entry : get.table_filters.filters) {
+		sink.U64(entry.first);
+		sink.U8(static_cast<uint8_t>(entry.second->filter_type));
+		sink.Str(entry.second->ToString("c"));
+		AnalyzeTableFilter(*entry.second, sink, info);
+	}
+	if (get.dynamic_filters) {
+		auto owners = dynamic_owners.find(get.dynamic_filters.get());
+		if (owners == dynamic_owners.end()) {
+			info.runtime_filtered = true;
+		} else {
+			info.pending_dynamic_owners.insert(info.pending_dynamic_owners.end(), owners->second.begin(),
+			                                   owners->second.end());
+		}
+	}
+}
+
+void PlanSignatures::RenderAggregate(const LogicalAggregate &aggr, const Frame &frame, Sink &sink,
+                                     NodeInfo &info) const {
+	RenderOwnIndex(aggr.group_index, frame, sink);
+	RenderOwnIndex(aggr.aggregate_index, frame, sink);
+	sink.Bool(aggr.groupings_index != DConstants::INVALID_INDEX);
+	if (aggr.groupings_index != DConstants::INVALID_INDEX) {
+		RenderOwnIndex(aggr.groupings_index, frame, sink);
+	}
+	RenderExpressions(aggr.groups, frame, sink, info);
+	RenderExpressions(aggr.expressions, frame, sink, info);
+	sink.U64(aggr.grouping_sets.size());
+	for (auto &set : aggr.grouping_sets) {
+		sink.Indexes(set);
+	}
+	sink.U64(aggr.grouping_functions.size());
+	for (auto &function : aggr.grouping_functions) {
+		sink.Indexes(function);
+	}
+	sink.U8(static_cast<uint8_t>(aggr.distinct_validity));
+}
+
+void PlanSignatures::RenderFilter(const LogicalFilter &filter, const Frame &frame, Sink &sink, NodeInfo &info) const {
+	if (shape_mode && &filter == block_root) {
+		// the parameterized conjuncts are the block's constraints, not part of its shape
+		sink.Strings(root_conjuncts);
+	} else {
+		RenderExpressions(filter.expressions, frame, sink, info);
+	}
+	sink.Indexes(filter.projection_map);
+}
+
+void PlanSignatures::RenderLimit(const LogicalLimit &limit, Sink &sink, NodeInfo &info) const {
+	const BoundLimitNode *nodes[2] = {&limit.limit_val, &limit.offset_val};
+	for (auto node : nodes) {
+		sink.U8(static_cast<uint8_t>(node->Type()));
+		switch (node->Type()) {
+		case LimitNodeType::UNSET:
+			break;
+		case LimitNodeType::CONSTANT_VALUE:
+			sink.U64(node->GetConstantValue());
+			break;
+		case LimitNodeType::CONSTANT_PERCENTAGE: {
+			double pct = node->GetConstantPercentage();
+			sink.Write(&pct, sizeof(pct));
+			break;
+		}
+		default:
+			Refuse(info, RefusalReason::EXPRESSION);
+			break;
+		}
+	}
+}
+
+//! Rows of an inlined constant collection (an IN list, VALUES) above which the collection is refused rather than
+//! rendered value by value
+static constexpr idx_t MAX_RENDERED_COLLECTION_ROWS = 4096;
+
+void PlanSignatures::RenderColumnDataGet(const LogicalColumnDataGet &get, const Frame &frame, Sink &sink,
+                                         NodeInfo &info) const {
+	RenderOwnIndex(get.table_index, frame, sink);
+	sink.Types(get.chunk_types);
+	if (!get.collection) {
+		Refuse(info, RefusalReason::OPERATOR);
+		return;
+	}
+	auto &collection = *get.collection;
+	if (collection.Count() > MAX_RENDERED_COLLECTION_ROWS) {
+		Refuse(info, RefusalReason::CONSTANT_COLLECTION);
+		return;
+	}
+	sink.U64(collection.Count());
+	ColumnDataScanState scan_state;
+	collection.InitializeScan(scan_state);
+	DataChunk chunk;
+	collection.InitializeScanChunk(chunk);
+	while (collection.Scan(scan_state, chunk)) {
+		for (idx_t row = 0; row < chunk.size(); row++) {
+			for (idx_t col = 0; col < chunk.ColumnCount(); col++) {
+				auto value = chunk.GetValue(col, row);
+				sink.Bool(value.IsNull());
+				if (!value.IsNull()) {
+					sink.Str(value.ToString());
+				}
+			}
+		}
+	}
+}
+
+void PlanSignatures::RenderRecyclerOperator(const LogicalOperator &op, const Frame &frame, Sink &sink,
+                                            NodeInfo &info) const {
+	auto ours = AsRecyclerOperator(op);
+	if (!ours) {
+		Refuse(info, RefusalReason::OPERATOR);
+		return;
+	}
+	if (ours->kind == RecyclerOperatorKind::MATERIALIZE) {
+		// a planted block marker is a transparent wrapper around its child
+		sink.Tag("RMAT");
+		return;
+	}
+	auto &scan = op.Cast<LogicalRecyclerScan>();
+	RenderOwnIndex(scan.table_index, frame, sink);
+	sink.Hash(scan.entry->hash);
+	if (scan.entry->kind == RecyclerEntryKind::BLOCK) {
+		// a block entry's hash is its shape's, which several entries of different stored columns share (StoreBlock
+		// keeps one per canonical/conjuncts/columns): render what tells them apart, or two scans of different stored
+		// results render alike
+		sink.Str(scan.entry->canonical);
+		sink.Strings(scan.entry->conjuncts);
+		sink.U64(scan.entry->columns.size());
+		for (auto &column : scan.entry->columns) {
+			sink.U64(column.table);
+			sink.U64(column.column);
+		}
+	}
+	sink.Indexes(scan.column_ids);
 }
 
 void PlanSignatures::RenderNode(const LogicalOperator &op, const Frame &frame, Sink &sink, NodeInfo &info,
@@ -679,64 +862,9 @@ void PlanSignatures::RenderNode(const LogicalOperator &op, const Frame &frame, S
 	sink.Str(salt);
 	sink.U8(static_cast<uint8_t>(op.type));
 	switch (op.type) {
-	case LogicalOperatorType::LOGICAL_GET: {
-		auto &get = op.Cast<LogicalGet>();
-		auto table = get.GetTable();
-		if (!table) {
-			Refuse(info, RefusalReason::TABLE_FUNCTION);
-			break;
-		}
-		if (table->temporary) {
-			// a temp table is private to its connection: two connections with a same-named, same-shaped temp table
-			// are keyed alike (temp.main.t) but hold different rows
-			Refuse(info, RefusalReason::TEMPORARY_TABLE);
-		} else if (!table->catalog.IsDuckCatalog()) {
-			// tables of attached foreign catalogs (SQLite, Postgres, ...) change outside DuckDB's transactions, so
-			// no invalidation signal exists for them
-			Refuse(info, RefusalReason::FOREIGN_CATALOG);
-		}
-		if (get.extra_info.sample_options) {
-			Refuse(info, RefusalReason::SAMPLED_SCAN);
-			info.nondeterministic = true;
-		}
-		if (!get.projected_input.empty() || !get.children.empty() || get.ordinality_idx.IsValid() ||
-		    get.row_group_order_options) {
-			Refuse(info, RefusalReason::SCAN_OPTIONS);
-		}
-		RenderOwnIndex(get.table_index, frame, sink);
-		sink.Str(get.function.name);
-		sink.Str(table->catalog.GetName());
-		sink.Str(table->schema.name);
-		sink.Str(table->name);
-		if (!shape_mode) {
-			// the shape of a block does not depend on which columns a query happens to reference
-			sink.U64(get.GetColumnIds().size());
-			for (auto &col : get.GetColumnIds()) {
-				RenderColumnIndex(col, sink);
-			}
-			sink.U64(get.projection_ids.size());
-			for (auto idx : get.projection_ids) {
-				sink.U64(idx);
-			}
-		}
-		sink.U64(get.table_filters.filters.size());
-		for (auto &entry : get.table_filters.filters) {
-			sink.U64(entry.first);
-			sink.U8(static_cast<uint8_t>(entry.second->filter_type));
-			sink.Str(entry.second->ToString("c"));
-			AnalyzeTableFilter(*entry.second, sink, info);
-		}
-		if (get.dynamic_filters) {
-			auto owners = dynamic_owners.find(get.dynamic_filters.get());
-			if (owners == dynamic_owners.end()) {
-				info.runtime_filtered = true;
-			} else {
-				info.pending_dynamic_owners.insert(info.pending_dynamic_owners.end(), owners->second.begin(),
-				                                   owners->second.end());
-			}
-		}
+	case LogicalOperatorType::LOGICAL_GET:
+		RenderGet(op.Cast<LogicalGet>(), frame, sink, info);
 		break;
-	}
 	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
 	case LogicalOperatorType::LOGICAL_DELIM_JOIN:
 		RenderJoin(op.Cast<LogicalComparisonJoin>(), frame, sink, info);
@@ -745,181 +873,53 @@ void PlanSignatures::RenderNode(const LogicalOperator &op, const Frame &frame, S
 		auto &join = op.Cast<LogicalAnyJoin>();
 		sink.U8(static_cast<uint8_t>(join.join_type));
 		RenderExpression(*join.condition, frame, sink, info);
-		sink.U64(join.left_projection_map.size());
-		for (auto idx : join.left_projection_map) {
-			sink.U64(idx);
-		}
-		sink.U64(join.right_projection_map.size());
-		for (auto idx : join.right_projection_map) {
-			sink.U64(idx);
-		}
+		sink.Indexes(join.left_projection_map);
+		sink.Indexes(join.right_projection_map);
 		break;
 	}
 	case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
 		break;
-	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
-		auto &aggr = op.Cast<LogicalAggregate>();
-		RenderOwnIndex(aggr.group_index, frame, sink);
-		RenderOwnIndex(aggr.aggregate_index, frame, sink);
-		sink.Bool(aggr.groupings_index != DConstants::INVALID_INDEX);
-		if (aggr.groupings_index != DConstants::INVALID_INDEX) {
-			RenderOwnIndex(aggr.groupings_index, frame, sink);
-		}
-		sink.U64(aggr.groups.size());
-		for (auto &group : aggr.groups) {
-			RenderExpression(*group, frame, sink, info);
-		}
-		sink.U64(aggr.expressions.size());
-		for (auto &expr : aggr.expressions) {
-			RenderExpression(*expr, frame, sink, info);
-		}
-		sink.U64(aggr.grouping_sets.size());
-		for (auto &set : aggr.grouping_sets) {
-			sink.U64(set.size());
-			for (auto idx : set) {
-				sink.U64(idx);
-			}
-		}
-		sink.U64(aggr.grouping_functions.size());
-		for (auto &gf : aggr.grouping_functions) {
-			sink.U64(gf.size());
-			for (auto idx : gf) {
-				sink.U64(idx);
-			}
-		}
-		sink.U8(static_cast<uint8_t>(aggr.distinct_validity));
+	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
+		RenderAggregate(op.Cast<LogicalAggregate>(), frame, sink, info);
 		break;
-	}
 	case LogicalOperatorType::LOGICAL_PROJECTION: {
 		auto &proj = op.Cast<LogicalProjection>();
 		RenderOwnIndex(proj.table_index, frame, sink);
-		sink.U64(proj.expressions.size());
-		for (auto &expr : proj.expressions) {
-			RenderExpression(*expr, frame, sink, info);
-		}
+		RenderExpressions(proj.expressions, frame, sink, info);
 		break;
 	}
-	case LogicalOperatorType::LOGICAL_FILTER: {
-		auto &filter = op.Cast<LogicalFilter>();
-		if (shape_mode && &op == block_root) {
-			// the parameterized conjuncts are the block's constraints, not part of its shape
-			sink.U64(root_conjuncts.size());
-			for (auto &conjunct : root_conjuncts) {
-				sink.Str(conjunct);
-			}
-		} else {
-			sink.U64(filter.expressions.size());
-			for (auto &expr : filter.expressions) {
-				RenderExpression(*expr, frame, sink, info);
-			}
-		}
-		sink.U64(filter.projection_map.size());
-		for (auto idx : filter.projection_map) {
-			sink.U64(idx);
-		}
+	case LogicalOperatorType::LOGICAL_FILTER:
+		RenderFilter(op.Cast<LogicalFilter>(), frame, sink, info);
 		break;
-	}
 	case LogicalOperatorType::LOGICAL_ORDER_BY: {
 		auto &order = op.Cast<LogicalOrder>();
-		sink.U64(order.orders.size());
-		for (auto &o : order.orders) {
-			sink.U8(static_cast<uint8_t>(o.type));
-			sink.U8(static_cast<uint8_t>(o.null_order));
-			RenderExpression(*o.expression, frame, sink, info);
-		}
-		sink.U64(order.projection_map.size());
-		for (auto idx : order.projection_map) {
-			sink.U64(idx);
-		}
+		RenderOrders(order.orders, frame, sink, info);
+		sink.Indexes(order.projection_map);
 		break;
 	}
 	case LogicalOperatorType::LOGICAL_TOP_N: {
 		auto &topn = op.Cast<LogicalTopN>();
-		sink.U64(topn.orders.size());
-		for (auto &o : topn.orders) {
-			sink.U8(static_cast<uint8_t>(o.type));
-			sink.U8(static_cast<uint8_t>(o.null_order));
-			RenderExpression(*o.expression, frame, sink, info);
-		}
+		RenderOrders(topn.orders, frame, sink, info);
 		sink.U64(topn.limit);
 		sink.U64(topn.offset);
 		break;
 	}
-	case LogicalOperatorType::LOGICAL_LIMIT: {
-		auto &limit = op.Cast<LogicalLimit>();
-		const BoundLimitNode *nodes[2] = {&limit.limit_val, &limit.offset_val};
-		for (auto node : nodes) {
-			sink.U8(static_cast<uint8_t>(node->Type()));
-			switch (node->Type()) {
-			case LimitNodeType::UNSET:
-				break;
-			case LimitNodeType::CONSTANT_VALUE:
-				sink.U64(node->GetConstantValue());
-				break;
-			case LimitNodeType::CONSTANT_PERCENTAGE: {
-				double pct = node->GetConstantPercentage();
-				sink.Write(&pct, sizeof(pct));
-				break;
-			}
-			default:
-				Refuse(info, RefusalReason::EXPRESSION);
-				break;
-			}
-		}
+	case LogicalOperatorType::LOGICAL_LIMIT:
+		RenderLimit(op.Cast<LogicalLimit>(), sink, info);
 		break;
-	}
 	case LogicalOperatorType::LOGICAL_DISTINCT: {
 		auto &distinct = op.Cast<LogicalDistinct>();
 		sink.U8(static_cast<uint8_t>(distinct.distinct_type));
-		sink.U64(distinct.distinct_targets.size());
-		for (auto &expr : distinct.distinct_targets) {
-			RenderExpression(*expr, frame, sink, info);
-		}
+		RenderExpressions(distinct.distinct_targets, frame, sink, info);
 		sink.Bool(distinct.order_by != nullptr);
 		if (distinct.order_by) {
-			sink.U64(distinct.order_by->orders.size());
-			for (auto &o : distinct.order_by->orders) {
-				sink.U8(static_cast<uint8_t>(o.type));
-				sink.U8(static_cast<uint8_t>(o.null_order));
-				RenderExpression(*o.expression, frame, sink, info);
-			}
+			RenderOrders(distinct.order_by->orders, frame, sink, info);
 		}
 		break;
 	}
-	case LogicalOperatorType::LOGICAL_CHUNK_GET: {
-		auto &cdg = op.Cast<LogicalColumnDataGet>();
-		RenderOwnIndex(cdg.table_index, frame, sink);
-		sink.U64(cdg.chunk_types.size());
-		for (auto &type : cdg.chunk_types) {
-			sink.Str(type.ToString());
-		}
-		if (!cdg.collection) {
-			Refuse(info, RefusalReason::OPERATOR);
-			break;
-		}
-		auto &collection = *cdg.collection;
-		if (collection.Count() > 4096) {
-			Refuse(info, RefusalReason::CONSTANT_COLLECTION);
-			break;
-		}
-		sink.U64(collection.Count());
-		ColumnDataScanState scan_state;
-		collection.InitializeScan(scan_state);
-		DataChunk chunk;
-		collection.InitializeScanChunk(chunk);
-		while (collection.Scan(scan_state, chunk)) {
-			for (idx_t row = 0; row < chunk.size(); row++) {
-				for (idx_t col = 0; col < chunk.ColumnCount(); col++) {
-					auto value = chunk.GetValue(col, row);
-					sink.Bool(value.IsNull());
-					if (!value.IsNull()) {
-						sink.Str(value.ToString());
-					}
-				}
-			}
-		}
+	case LogicalOperatorType::LOGICAL_CHUNK_GET:
+		RenderColumnDataGet(op.Cast<LogicalColumnDataGet>(), frame, sink, info);
 		break;
-	}
 	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE: {
 		auto &cte = op.Cast<LogicalMaterializedCTE>();
 		RenderOwnIndex(cte.table_index, frame, sink);
@@ -935,39 +935,25 @@ void PlanSignatures::RenderNode(const LogicalOperator &op, const Frame &frame, S
 		RenderOwnIndex(ref.table_index, frame, sink);
 		// the referenced CTE must be part of the subtree for the result to be self-contained
 		RenderBinding(ColumnBinding(ref.cte_index, 0), frame, sink, info);
-		sink.U64(ref.chunk_types.size());
-		for (auto &type : ref.chunk_types) {
-			sink.Str(type.ToString());
-		}
+		sink.Types(ref.chunk_types);
 		break;
 	}
 	case LogicalOperatorType::LOGICAL_DELIM_GET: {
-		auto &dg = op.Cast<LogicalDelimGet>();
-		RenderOwnIndex(dg.table_index, frame, sink);
-		sink.U64(dg.chunk_types.size());
-		for (auto &type : dg.chunk_types) {
-			sink.Str(type.ToString());
-		}
+		auto &delim_get = op.Cast<LogicalDelimGet>();
+		RenderOwnIndex(delim_get.table_index, frame, sink);
+		sink.Types(delim_get.chunk_types);
 		break;
 	}
-	case LogicalOperatorType::LOGICAL_DUMMY_SCAN: {
-		auto &dummy = op.Cast<LogicalDummyScan>();
-		RenderOwnIndex(dummy.table_index, frame, sink);
+	case LogicalOperatorType::LOGICAL_DUMMY_SCAN:
+		RenderOwnIndex(op.Cast<LogicalDummyScan>().table_index, frame, sink);
 		break;
-	}
 	case LogicalOperatorType::LOGICAL_EXPRESSION_GET: {
-		auto &eg = op.Cast<LogicalExpressionGet>();
-		RenderOwnIndex(eg.table_index, frame, sink);
-		sink.U64(eg.expr_types.size());
-		for (auto &type : eg.expr_types) {
-			sink.Str(type.ToString());
-		}
-		sink.U64(eg.expressions.size());
-		for (auto &row : eg.expressions) {
-			sink.U64(row.size());
-			for (auto &expr : row) {
-				RenderExpression(*expr, frame, sink, info);
-			}
+		auto &expression_get = op.Cast<LogicalExpressionGet>();
+		RenderOwnIndex(expression_get.table_index, frame, sink);
+		sink.Types(expression_get.expr_types);
+		sink.U64(expression_get.expressions.size());
+		for (auto &row : expression_get.expressions) {
+			RenderExpressions(row, frame, sink, info);
 		}
 		break;
 	}
@@ -990,41 +976,9 @@ void PlanSignatures::RenderNode(const LogicalOperator &op, const Frame &frame, S
 		}
 		break;
 	}
-	case LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR: {
-		auto ours = AsRecyclerOperator(op);
-		if (!ours) {
-			Refuse(info, RefusalReason::OPERATOR);
-			break;
-		}
-		if (ours->kind == RecyclerOperatorKind::MATERIALIZE) {
-			// a planted block marker is a transparent wrapper around its child
-			sink.Tag("RMAT");
-			break;
-		}
-		auto &scan = op.Cast<LogicalRecyclerScan>();
-		RenderOwnIndex(scan.table_index, frame, sink);
-		sink.Hash(scan.entry->hash);
-		if (scan.entry->kind == RecyclerEntryKind::BLOCK) {
-			// a block entry's hash is its shape's, which several entries of different stored columns share
-			// (StoreBlock keeps one per canonical/conjuncts/columns): render what tells them apart, or two
-			// scans of different stored results render alike
-			sink.Str(scan.entry->canonical);
-			sink.U64(scan.entry->conjuncts.size());
-			for (auto &conjunct : scan.entry->conjuncts) {
-				sink.Str(conjunct);
-			}
-			sink.U64(scan.entry->columns.size());
-			for (auto &column : scan.entry->columns) {
-				sink.U64(column.table);
-				sink.U64(column.column);
-			}
-		}
-		sink.U64(scan.column_ids.size());
-		for (auto col : scan.column_ids) {
-			sink.U64(col);
-		}
+	case LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR:
+		RenderRecyclerOperator(op, frame, sink, info);
 		break;
-	}
 	case LogicalOperatorType::LOGICAL_SAMPLE:
 		info.nondeterministic = true;
 		Refuse(info, RefusalReason::SAMPLED_SCAN);
@@ -1036,10 +990,7 @@ void PlanSignatures::RenderNode(const LogicalOperator &op, const Frame &frame, S
 	// output types (a block's output columns depend on what the query references, so not in shape mode)
 	if (!shape_mode) {
 		sink.Tag("T");
-		sink.U64(op.types.size());
-		for (auto &type : op.types) {
-			sink.Str(type.ToString());
-		}
+		sink.Types(op.types);
 	}
 	// children
 	sink.U64(op.children.size());

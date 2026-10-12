@@ -386,6 +386,43 @@ void RecyclerCache::ForgetCommits(idx_t catalog, const DuckTransactionManager &m
 	Forget(catalog_versions, manager.LowestActiveStart());
 }
 
+bool RecyclerCache::Insert(const shared_ptr<CachedEntry> &entry, idx_t budget_bytes,
+                           const shared_ptr<CachedEntry> &replaced) {
+	if (!Fresh(entry->tables)) {
+		stats.blocked_by_version++;
+		stats.store_rejected++;
+		return false;
+	}
+	if (replaced) {
+		// the replaced entry leaves the maps, the accounting and `dependents` while room is made; replacing it is not
+		// an eviction, and the caller's reference keeps it alive for running plans and for the restore below
+		Erase(*replaced);
+	}
+	if (!MakeRoom(*entry, budget_bytes)) {
+		if (replaced) {
+			// nothing changed for readers: the replaced entry is back, with its bytes and dependents
+			Publish(replaced);
+		}
+		stats.store_rejected++;
+		return false;
+	}
+	entry->stored_at = NextSequence();
+	entry->last_used = entry->stored_at;
+	Publish(entry);
+	switch (entry->kind) {
+	case RecyclerEntryKind::WHOLE_RESULT:
+		stats.whole_stores++;
+		break;
+	case RecyclerEntryKind::BLOCK:
+		stats.block_stores++;
+		break;
+	default:
+		stats.subtree_stores++;
+		break;
+	}
+	return true;
+}
+
 bool RecyclerCache::Store(shared_ptr<CachedEntry> entry, idx_t budget_bytes) {
 	std::lock_guard<std::mutex> guard(lock);
 	auto &map = Map(entry->kind);
@@ -394,24 +431,7 @@ bool RecyclerCache::Store(shared_ptr<CachedEntry> entry, idx_t budget_bytes) {
 		stats.store_rejected++;
 		return false;
 	}
-	if (!Fresh(entry->tables)) {
-		stats.blocked_by_version++;
-		stats.store_rejected++;
-		return false;
-	}
-	if (!MakeRoom(*entry, budget_bytes)) {
-		stats.store_rejected++;
-		return false;
-	}
-	entry->stored_at = NextSequence();
-	entry->last_used = entry->stored_at;
-	Publish(entry);
-	if (entry->kind == RecyclerEntryKind::WHOLE_RESULT) {
-		stats.whole_stores++;
-	} else {
-		stats.subtree_stores++;
-	}
-	return true;
+	return Insert(entry, budget_bytes, nullptr);
 }
 
 shared_ptr<CachedEntry> RecyclerCache::LookupPagination(const SigHash &hash, const string &canonical,
@@ -459,32 +479,10 @@ bool RecyclerCache::StorePagination(shared_ptr<CachedEntry> entry, idx_t budget_
 			stats.store_rejected++;
 			return false;
 		}
-	}
-	if (!Fresh(entry->tables)) {
-		stats.blocked_by_version++;
-		stats.store_rejected++;
-		return false;
-	}
-	if (older) {
 		// the family keeps its reuse history, so that growing does not make it a cold eviction candidate
 		entry->hits = older->hits.load();
-		// the older entry leaves the maps, the accounting and `dependents` while room is made; replacing it is not an
-		// eviction, and `older` keeps it alive for running plans and for the restore below
-		Erase(*older);
 	}
-	if (!MakeRoom(*entry, budget_bytes)) {
-		if (older) {
-			// nothing changed for readers: the older prefix is back, with its bytes and dependents
-			Publish(older);
-		}
-		stats.store_rejected++;
-		return false;
-	}
-	entry->stored_at = NextSequence();
-	entry->last_used = entry->stored_at;
-	Publish(entry);
-	stats.subtree_stores++;
-	return true;
+	return Insert(entry, budget_bytes, older);
 }
 
 bool RecyclerCache::StoreBlock(shared_ptr<CachedEntry> entry, idx_t budget_bytes) {
@@ -499,21 +497,8 @@ bool RecyclerCache::StoreBlock(shared_ptr<CachedEntry> entry, idx_t budget_bytes
 			}
 		}
 	}
-	if (!Fresh(entry->tables)) {
-		stats.blocked_by_version++;
-		stats.store_rejected++;
-		return false;
-	}
-	// MakeRoom may evict the other blocks of this shape and erase their list
-	if (!MakeRoom(*entry, budget_bytes)) {
-		stats.store_rejected++;
-		return false;
-	}
-	entry->stored_at = NextSequence();
-	entry->last_used = entry->stored_at;
-	Publish(entry);
-	stats.block_stores++;
-	return true;
+	// Insert may evict the other blocks of this shape and erase their list: `shape` is not used past this point
+	return Insert(entry, budget_bytes, nullptr);
 }
 
 vector<shared_ptr<CachedEntry>> RecyclerCache::LookupBlocks(const SigHash &hash) const {
