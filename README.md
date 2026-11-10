@@ -1,213 +1,130 @@
-# DSA - Assignment 2
+# duckdb-recycler
 
-Recent work showed that analytical workloads often have repeating queries: on half of all Amazon Redshift clusters, 80% of queries are repeats of an earlier one. Unfortunately, standard database benchmarks such as TPC-H and TPC-DS contain no repeats.[^1] 
-Repeating queries could come from, for example, a dashboard that issues the same or similar queries again, or, more recently, also data agents that incrementally explore a dataset. Consider this trivial example in DuckDB (note that query plans are read bottom-up):
+A DuckDB extension that **recycles query results**. It notices when a query repeats all or part of an earlier one
+and serves that part from cache instead of computing it again. Dashboards, BI tools and data agents that explore a
+dataset step by step all send this kind of overlapping workload.
 
-<p align="center">
-        <img src="./example.png" height=400 alt="Query Recycling Example" style="{max-height: 250px}">
-</p>
+Built against **DuckDB v1.5.5**. The loadable binary is named `waddle` (a name kept from the course template it
+started from); everything it adds is prefixed `recycler_`.
 
-A naive approach to leverage query reuse (also called "query recycling") would be to materialize (and cache) the result from the SEQ_SCAN on QUERY 1. Then, you might be able to detect that QUERY 2 can use your cached intermediate result rather than executing the operator again. The database system now avoids evaluating the predicate and accessing data from main storage (potentially in the Cloud or on slower units if in-memory DuckDB is not being used).
+## Results
 
-However, you have to think that this can lead to several downsides:
-- Naively materializing all query results will fill your memory fast (the most precious resource for query processing).
-- It can also affect query processing: Sometimes DuckDB might avoid full materialization in certain query phases, which might incur slowdowns if you enforce materialization.
-- There are many other intricacies with query recycling. Discovering and tackling them is part of your assignment.
+On the public workload (149 queries over the IMDB / JOB dataset, the set run twice; `threads = 6`,
+`memory_limit = '8000MB'`, `preserve_insertion_order = false`). Every answer matches vanilla DuckDB.
 
-Currently, DuckDB is not very optimized for these repeated workloads. It is your job to change that by writing a DuckDB extension! ⚡
-[^1]: Saxena et al., [*Why TPC Is Not Enough: An Analysis of the Amazon Redshift Fleet*](https://www.vldb.org/pvldb/vol17/p3694-saxena.pdf), PVLDB 17(11), 2024.
+| Configuration | Geomean per query | Total |
+|---|---:|---:|
+| Vanilla DuckDB 1.5.5 | 35.7 ms | 24.4 s |
+| EXISTS rewrite only | 16.8 ms | 6.4 s |
+| Result cache only | 9.5 ms | 12.9 s |
+| **Both (default)** | **6.4 ms** | **4.4 s** |
 
-The following literature on query recycling will help you with your assignment. They are ordered by relevance:
-- Nagel, F., Boncz, P., & Viglas, S. D. (2013, April). [Recycling in pipelined query evaluation.](https://ieeexplore.ieee.org/stamp/stamp.jsp?arnumber=6544837) In 2013 IEEE 29th International Conference on Data Engineering (ICDE) (pp. 338-349). IEEE.
-- Dursun, K., Binnig, C., Çetintemel, U., & Kraska, T. (2017, May). [Revisiting reuse in main memory database systems.](https://dl.acm.org/doi/pdf/10.1145/3035918.3035957) In Proceedings of the 2017 ACM International Conference on Management of Data (pp. 1275-1289).
-- Zhou, J., Larson, P. A., Freytag, J. C., & Lehner, W. (2007, June). [Efficient exploitation of similar subexpressions for query processing](https://dl.acm.org/doi/pdf/10.1145/1247480.1247540). In Proceedings of the 2007 ACM SIGMOD international conference on Management of data (pp. 533-544).
-- Jindal, A., Karanasos, K., Rao, S., & Patel, H. (2018). [Selecting subexpressions to materialize at datacenter scale](https://alekh.org/papers/p800-jindal.pdf). Proceedings of the VLDB Endowment, 11(7), 800-812.
+All four rows are the same binary, measured on one machine in one session (2026-10-07); the middle rows turn a feature off.
 
-## Getting started
+## How it works
 
-Press **Use this template → Create a new repository** (top-right of the GitHub page, green button) and set it to **Private**.
-Do not fork: a fork of a public repository cannot be made private. Then invite
-your team members to it as collaborators.
+The extension adds two optimizer hooks (`src/recycler_hooks.cpp`) and two physical operators, `RECYCLER_SCAN`
+(reads a cached result) and `RECYCLER_MATERIALIZE` (stores a result while passing it on).
 
-Clone your repo with its submodules, otherwise it will be missing duckdb and can't test your extension.
+- **Whole-result reuse.** Each bound plan gets a canonical structural signature (`src/recycler_signature.cpp`).
+  A repeat of an earlier query, or a nested block equal to one, is answered straight from the cache.
+- **Subtree reuse.** After DuckDB's own optimizers run, joins, aggregates, DISTINCTs and CTE definitions are
+  candidates. Exact hits become a `RECYCLER_SCAN`. Misses worth keeping (large input, output much smaller,
+  within size limits) are wrapped in a `RECYCLER_MATERIALIZE`.
+- **Predicate subsumption.** A block whose range predicates (`<`, `BETWEEN`, `IS NOT NULL`, ...) are implied by a
+  cached block is served from that block, with a residual filter on top.
+- **Ordered pagination.** Repeated `ORDER BY ... LIMIT n OFFSET m` pages over the same input share one cached
+  sorted prefix instead of sorting again for each page.
+- **Correlated EXISTS rewrite** (`src/recycler_exists.cpp`). `[NOT] EXISTS` subqueries become plain MARK joins
+  that DuckDB's join order optimizer can place by cost, instead of delim joins that lock the FROM order in place.
+
+### Correctness
+
+Results must equal vanilla DuckDB's, so the cache is conservative:
+
+- Keys cover the exact bound plan, including types and the session settings that change results at run time
+  (`TimeZone`, `Calendar`, `default_order`, ...).
+- Nothing is cached that uses volatile or session-dependent functions, parameters, table functions, temporary
+  tables, attached non-DuckDB catalogs, or `LIMIT` without `ORDER BY`.
+- Any statement that changes data or the catalog clears the cache, and nothing is cached or served inside a
+  transaction that has written.
+- Memory is bounded: cached data lives in DuckDB's buffer manager, and benefit-density eviction keeps the cache
+  under `min(recycler_budget_mb, memory_limit / 4)`.
+
+The full design, with the reasoning behind each rule, is in [`docs/SOLUTION_PLAN.md`](docs/SOLUTION_PLAN.md).
+
+## Build
 
 ```sh
-git clone --recurse-submodules https://github.com/<you>/<your-repo>.git
-cd <your-repo>
+git clone --recurse-submodules https://github.com/td-02/duckdb-recycler.git
+cd duckdb-recycler
+make release
 ```
 
-**Register your team and install the grader's GitHub App:** 
-It will give us read access to each repository it is installed for, so only install it for the repo you want to be graded for. 
+This produces `build/release/duckdb` (a shell with the extension linked in) and
+`build/release/extension/waddle/waddle.duckdb_extension` (the loadable binary).
 
-```sh
-python3 ./scripts/assignment-setup.py
-```
+To load it into a stock DuckDB 1.5.5:
 
-The script writes `team.json`, asks when your CI should build, commits both, and opens the grader's GitHub App to install. The App reads every repository it is installed for, so install it only for your assignment repository. 
-**We can't evaluate your submission without the App** - there is no separate sign-up.
-
-# Task 
-
-You will be given a stream of SQL queries that are run against the IMDB
-database. Your task is to write a DuckDB extension that optimizes the queries.
-
-There is a public and a private query set. The public set is in `benchmark/` of this template and is yours to develop against. The private set is ... private, and will be used for the leaderboard; it uses the similar query patterns, and is what actually ranks you.
-
-Each set is a directory of `.sql` files, **one statement per file**, named `q0000.sql` upwards. They are run **in filename order**, `q0000` first - the order is part of the workload. 
-
-When running the benchmark for the leaderboard, we will use the following settings:
 ```sql
-SET threads = 6;
-SET memory_limit = '8000MB';
-SET preserve_insertion_order = false;
+-- start duckdb with -unsigned, or SET allow_unsigned_extensions = true
+LOAD 'build/release/extension/waddle/waddle.duckdb_extension';
 ```
 
-The set runs **twice**. A run scores the **geometric mean** of its query times, and the **faster run counts**.
+## Usage
 
-> [!WARNING]
-> **Wrong answers rank before speed.** Every result must match what vanilla DuckDB returns. A run that answers something incorrectly is still timed and still shown on the leaderboard, but the board is sorted by **wrong answers first and time second**: every team that answered the whole set stands above every team that did not, and among those that got something wrong, fewer wrong stands higher.
->
-> So no amount of speed buys correctness back - one wrong answer puts you below the slowest team that got them all right. The leaderboard shows how many you got wrong and names the first of them; hovering that tells you why it was rejected. If you have an earlier run that answered everything, that run is the one you are ranked on.
+The recycler is on as soon as the extension loads. To see what it is doing:
 
-> [!WARNING]
-> To accurately measure runtime, **we wrap queries around an `EXPLAIN ANALYZE`**. You must ensure your solution is correct in this scenario.
-
-Grading runs nightly, but **your CI is responsible for building.** The grader benchmarks the binary from your last successful CI build, so the commit it grades is the newest one you have *built* - not necessarily your latest commit. The leaderboard shows which one it used.
-
-No push triggers a build by default: start a build yourself from the Actions tab on the GitHub page (*Run workflow*), or turn on building every push to `main` when running `assignment-setup.py`. A build costs about 33 of the 2000 free Actions minutes a private repository gets per month, so if you want to build every push, make sure your team has enough minutes.
-
-### Download Datasets
-
-The queries in `benchmark/` run against the IMDB (JOB) dataset, which is not in this repository. Download it once:
-
-```sh
-python3 ./scripts/download-imdb.py
-duckdb data/imdb.duckdb < benchmark/q0000.sql
+```sql
+SELECT * FROM recycler_stats();     -- hits, misses, bytes, budget
+SELECT * FROM recycler_entries();   -- what is cached right now
+SELECT * FROM recycler_history();   -- what is known about each signature
+PRAGMA recycler_clear;              -- empty the cache
 ```
 
-`scripts/imdb_schema.sql` is the schema those queries are written against. It is the same schema that will be used for the leaderboard.
+Settings (all `SET`-able per connection):
 
-### Building and Testing
-
-```sh
-make          # -> build/release/duckdb and build/release/extension/
-IMDB_DATA=1 make test     # the SQL tests in test/sql
-```
-
-`IMDB_DATA=1 make test` runs `test/sql/benchmark.test`, which loads your extension and runs every query in `benchmark/` against `data/imdb.duckdb`, comparing each result against what vanilla DuckDB returns. `IMDB_DATA=1` prevents the test from running in the CI (as the data is not available there) 
-
-`docs/README.md` is the upstream extension-template documentation - CLion setup, debugging, submodules.
-
-
-### Benchmarking locally
-
-```sh
-make benchmark                                     # the public workload in benchmark/
-make benchmark BENCH_ARGS="--runs 3 --slowest 20"  # `--help` lists the flags
-```
-
-It prints the total and the geometric mean of each run, and simulates the
-evaluator as closely as it can: same binary, same budget, same repeats, same
-score. It does not check your answers, and one wrong answer ranks you below
-every team that has none - `IMDB_DATA=1 make test` is what checks them.
-
-
-### What you may and may not change
-
-**We will use DuckDB v1.5.5 to benchmark your extension, so you must build against that version.**
-
-DuckDB is pinned to v1.5.5 by `duckdb_version` in
-`.github/workflows/MainDistributionPipeline.yml`, which is what your CI checks the `duckdb/` submodule out to. An extension only loads into the version it was built against, so a binary built against anything else cannot be benchmarked at all.
-
-Please don't rename your extension, as this will (potentially) break the grader.
-
-| File or directory  | What you can do |
+| Setting | What it controls |
 |---|---|
-| `src/`, `test/` | yours - this is the assignment |
-| `benchmark/` | yours to run against locally. The grader benchmarks its own copy, so editing these changes nothing |
-| `CMakeLists.txt` | fine to edit to add source files; the change is logged |
-| `Makefile`, `extension_config.cmake`, `vcpkg.json` | these feed the **DuckDB** build, not just yours. Changes are flagged for review |
-| `.github/workflows/` | how your binary comes to exist. Changing `duckdb_version` or `uses` is flagged, and breaks your submission |
-| `duckdb/` | changing it gains you nothing: your extension is benchmarked inside a DuckDB the grader built at the pinned commit, never one from your tree |
+| `recycler_enabled` | master switch for caching |
+| `recycler_whole_result`, `recycler_subtrees`, `recycler_blocks` | which kinds of results are cached |
+| `recycler_subsumption`, `recycler_pagination` | predicate subsumption, pagination prefixes |
+| `recycler_exists_rewrite` | the correlated EXISTS rewrite |
+| `recycler_budget_mb`, `recycler_entry_cap_mb`, `recycler_entry_cap_rows` | memory budget and per-entry caps |
+| `recycler_min_input_rows`, `recycler_speculate_mb`, `recycler_compact_rows` | when a miss is worth storing |
 
-### Useful Resources
-- A DuckDB extension that **inspects and rewrites a query plan**: https://github.com/Noorts/PDXearch. PDXearch adds Vector Search capabilities to DuckDB. It rewrites a query plan by detecting a certain pattern in it. See [here](https://github.com/Noorts/PDXearch/blob/main/src/index/search/pdxearch_scan_optimizer.cpp#L30) for a fully detailed example. This would be useful if you want to add intermediate steps within a query plan.
-- A DuckDB extension that **creates a new operator** `ST_Intersects` to do spatial joins: https://duckdb.org/2025/08/08/spatial-joins, https://github.com/duckdb/duckdb-spatial.
-- A DuckDB extension that does Incremental View Maintenance: https://github.com/ila/openivm. Lets you define a materialized view.
-- A DuckDB extension that **adds a new scalar function**. This repository is exactly that! It adds an operator named `waddle`.
-- DuckDB Extension Development Workshop – Part 1: https://www.youtube.com/watch?v=Lz0E42yQjw8
-- DuckDB Extension Development Workshop – Part 2: https://www.youtube.com/watch?v=jo-G2akmjJM
+## Testing and benchmarking
 
-### Troubleshooting
+```sh
+make test_release                         # SQL tests, including test/sql/recycler/
+python3 ./scripts/download-imdb.py        # fetch the IMDB dataset into data/
+IMDB_DATA=1 make test_release             # also checks every benchmark query against vanilla
+python3 ./scripts/recycler_diff.py        # differential check over the workload in several orders
+make benchmark                            # time the workload in benchmark/
+```
 
-#### 1. `push failed error` in `assignment-setup.py`
+CI (`.github/workflows/tests.yml`, described in [`docs/CI.md`](docs/CI.md)) builds in release, debug, ASan/UBSan
+and TSan, runs the recycler suites, loads the binary into the PyPI `duckdb==1.5.5` wheel, and checks formatting.
 
-Something went wrong while the script tried to push the changes to the repository. Perhaps you have not configured your GitHub credentials or your token has expired / lack permissions.  
-**Solution**: Push manually to your repository. Make sure you have a GitHub token that allows workflows execution.
+## Repository layout
 
+| Path | Contents |
+|---|---|
+| `src/` | extension sources: hooks, signatures, cache, policy, rewrites, operators, table functions |
+| `test/sql/recycler/` | sqllogictest suites (invalidation, settings, concurrency, memory, types, ...) |
+| `benchmark/` | the public query workload, one statement per file, run in filename order |
+| `scripts/` | dataset download, benchmark runner, differential checker, score gate |
+| `docs/` | design plan, CI notes, upstream extension-template docs |
 
-## The query recycler (this repository's extension)
+## Background
 
-The extension keeps the template's `waddle` scalar function and adds a query recycler that runs as an
-optimizer extension with two hooks (`src/recycler_hooks.cpp`):
+This project began as Assignment 2 of a Data System Architecture course: make repeated analytical workloads
+faster in DuckDB without ever changing an answer. Background reading:
 
-* **Pre-optimize** (bound plan, before any built-in optimizer). The plan gets a canonical structural
-  signature (`src/recycler_signature.cpp`: table indexes renumbered in pre-order, every operator and
-  expression field rendered, IN-list constants hashed, unknown constructs refused). A match against an
-  earlier *whole result* replaces the plan with a `RECYCLER_SCAN`; a nested query block equal to an
-  earlier whole query (e.g. `SELECT * FROM (<earlier query>) d WHERE ...`) is replaced the same way,
-  before filter pushdown can rewrite it.
-* **Post-optimize** (after all built-in optimizers). Joins, aggregates, DISTINCTs and CTE definitions are
-  candidate subtrees; the whole `DELIM_JOIN` of a correlated `EXISTS` is treated as one unit. Exact hits are
-  replaced by a `RECYCLER_SCAN`; admissible misses (estimated input >= `recycler_min_input_rows`, output
-  at most half the input, size caps, speculation only for small estimates or repeats) are wrapped in a
-  `RECYCLER_MATERIALIZE` that stores the result while re-emitting it, one per root-to-leaf path. The
-  complete query result is stored too, in the order it was produced.
+- Saxena et al., [*Why TPC Is Not Enough: An Analysis of the Amazon Redshift Fleet*](https://www.vldb.org/pvldb/vol17/p3694-saxena.pdf), PVLDB 2024
+- Nagel, Boncz, Viglas, [*Recycling in Pipelined Query Evaluation*](https://ieeexplore.ieee.org/stamp/stamp.jsp?arnumber=6544837), ICDE 2013
+- Dursun et al., [*Revisiting Reuse in Main Memory Database Systems*](https://dl.acm.org/doi/pdf/10.1145/3035918.3035957), SIGMOD 2017
 
-* **Predicate subsumption** (M5). At the pre-optimize hook every multi-table FROM/WHERE block gets a *shape*:
-  its structure with columns rendered by physical id and with range predicates on base columns
-  (`col <op> constant`, `BETWEEN`, `IS NOT NULL`) lifted out as constraints. The first query with a shape plants
-  a `RECYCLER_MATERIALIZE` marker that stores the block's rows (its constrained columns are kept alive through
-  column pruning). A later block with the same shape whose constraints imply the stored ones, and whose needed
-  columns are all stored, is replaced by a column-subset `RECYCLER_SCAN` plus a residual filter with its own
-  predicates (e.g. `production_year IS NOT NULL` stored, `BETWEEN 1998 AND 2003` served). Active only when
-  `preserve_insertion_order` is false; `SET recycler_subsumption = false` disables it.
+## License
 
-* **Ordered pagination** (M6). Repeated `ORDER BY ... LIMIT n OFFSET m` pages over the same input are served from the
-  leading rows of the sorted result, cached once (a `PAGINATION` entry holding `4 * (offset + limit)` rows, grown
-  geometrically when a later page needs more) instead of sorting again for every page. It applies only when
-  `offset + limit > 5000` and the ORDER BY is provably a total order (a primary key, group key or non-multiplying
-  join key among its sort keys); the key comes from the bound plan, so it also holds when M5 rewrote the plan below the
-  sort. `SET recycler_pagination = false` disables it (default `true`; it needs `recycler_subtrees`).
-
-Correctness rules: results are keyed on the exact bound/optimized structure including types; subtrees with
-volatile functions, parameters, table functions, temporary tables (private to their connection), tables of
-non-DuckDB catalogs (attached SQLite/Postgres/... databases change outside DuckDB's transactions), LIMIT
-without ORDER BY, runtime (dynamic) filters without an owning join (a Top-N's), or references into a delim join's
-other side are never cached; the runtime filters that joins above a subtree push into its scans are removed from
-those joins before the subtree is written (`stripped_runtime_filters`), so it stores all of its rows; any statement
-that modifies data or the catalog clears the cache, and nothing is cached or served inside a transaction that has
-written. The values of the result-affecting session settings `TimeZone`,
-`Calendar`, `ieee_floating_point_ops`, `default_order`, `default_null_order` and
-`scalar_subquery_error_on_multiple_rows` (the settings that change a result at execution time without changing the
-bound plan: ICU and the `list_sort` family read them into function bind data, the flag picks the division callback,
-and the hash table of a correlated scalar subquery's join reads the last one; `integer_division` is a parser option and
-an ORDER BY clause is resolved by the binder, so both already change the plan) are part of every key, so a statement is
-never served an entry computed under other values. Functions DuckDB declares consistent although their result depends on the session or the transaction
-are refused: `current_setting()`, whose bind data holds the value of whichever setting it names, `age()` with one
-argument, which measures from the transaction's start date, and ICU's `current_localtimestamp()` and
-`current_localtime()`, which hold the transaction's start. Cached collections are buffer-managed, except that an
-entry of at most `recycler_compact_rows` rows (8,192) is copied into memory allocated with its data when that takes
-less than its buffer blocks (at least one 256 KiB block per writer thread, however few the rows); the cache is
-bounded with benefit-density eviction by the smaller of `recycler_budget_mb` and a quarter of `memory_limit`, which a
-connection evaluates when it reloads its settings (after a SET, RESET or PRAGMA of its own) and `recycler_stats()`
-reports as `budget_bytes`.
-
-Settings: `recycler_enabled`, `recycler_whole_result`, `recycler_blocks`, `recycler_subtrees`, `recycler_subsumption`,
-`recycler_pagination` (default true; ordered pagination prefix reuse, requires `recycler_subtrees`),
-`recycler_budget_mb`, `recycler_entry_cap_mb`, `recycler_entry_cap_rows`, `recycler_min_input_rows`,
-`recycler_speculate_mb`, `recycler_compact_rows`. Introspection: `SELECT * FROM recycler_stats()`,
-`SELECT * FROM recycler_entries()`, `SELECT * FROM recycler_history()` (what is known about a signature whether or
-not its result is cached), `PRAGMA recycler_clear`. Tests: `test/sql/recycler/`. Differential check against vanilla
-over the whole workload in several orders: `python3 ./scripts/recycler_diff.py`. The design and roadmap are in
-`docs/SOLUTION_PLAN.md`.
+MIT, see [`LICENSE`](LICENSE).
